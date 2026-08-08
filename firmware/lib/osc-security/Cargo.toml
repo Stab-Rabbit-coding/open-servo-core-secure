@@ -1,0 +1,20 @@
+[package]
+name    = "osc-security"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# The message-plane authenticator for the osc-native bus
+# (`docs/security-architecture.md`). `no_std`, allocation-free, and free of any
+# hardware dependency: the servo, the host, and the integration sim all link the
+# same code, so a tag that verifies in a host test verifies on silicon.
+
+[dependencies]
+osc-protocol = { workspace = true }
+
+[features]
+default = []
+# Host/test-side helpers: tag *generation* for building authenticated frames.
+# Servos only ever verify inbound tags and generate reply tags, so the extra
+# builder surface stays out of the 57 KB board image unless asked for.
+host = []

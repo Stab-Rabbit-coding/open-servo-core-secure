@@ -126,6 +126,13 @@ impl<P: Providers> ServoBus<P> {
             // Feed first so the engine chews the covered span under the
             // dispatch body; the verdict then finds it settled.
             self.crc_feed(anchor, footprint);
+            // The message-plane fold rides the same window
+            // (`docs/security-architecture.md` sec 2.6): the hardware CRC is
+            // already chewing in the background, so the fold's software cost
+            // hides under the instruction's own remaining wire time at
+            // 0.5 M/1 M. Speculative like every other effect here -- a frame
+            // that fails CRC or its tag rolls the stream back at the verdict.
+            self.security_fold(anchor, footprint);
             let (staged, slot, table) =
                 match self
                     .dispatch_decoded(anchor, footprint, |req, ctx, h| d.dispatch(req, ctx, h))
@@ -164,6 +171,22 @@ impl<P: Providers> ServoBus<P> {
             }
             let len = self.ring.bytes().len();
             self.framer.on_frame_rejected(anchor, len);
+            self.security.rollback_stream();
+            return;
+        }
+        // The message-plane gate for the verdict-first classes -- which is
+        // where COMMIT and MGMT actually land (`verdict_first`), so this is
+        // the site that matters most: COMMIT is the apply instant the whole
+        // stream digest exists to protect (`docs/security-architecture.md`
+        // sec 2.1). Checked BEFORE dispatch, because a verdict-first op's
+        // effects cannot be staged and therefore cannot be reverted.
+        //
+        // No fold happens on this path: COMMIT must not enter the digest its
+        // own tag is computed over, and MGMT carries an inline tag instead
+        // (`Policy::folds_into_stream`).
+        if !self.auth_verify(anchor, footprint) {
+            self.framer.on_frame_verified();
+            self.security.rollback_stream();
             return;
         }
         self.framer.on_frame_verified();
@@ -192,10 +215,18 @@ impl<P: Providers> ServoBus<P> {
         }
     }
 
-    /// Verify a pending frame's CRC and resolve the verdict. Pass -> commit a
-    /// staged table effect (COMMIT) and sequence a staged reply (SEND); fail
-    /// (or spin miss) -> revert the write (REVERT), drop the reply
-    /// (DON'T-SEND), count, and rewind the ladder (sec 5.3 L1).
+    /// Verify a pending frame's CRC **and** its authenticity, then resolve the
+    /// verdict. Pass -> commit a staged table effect (COMMIT) and sequence a
+    /// staged reply (SEND); fail (or spin miss) -> revert the write (REVERT),
+    /// drop the reply (DON'T-SEND), count, and rewind the ladder (sec 5.3 L1).
+    ///
+    /// The two gates sit side by side because they answer different questions
+    /// about the same staged effects -- "did the wire corrupt this?" and "did
+    /// the host actually send it?" -- and both must pass before anything
+    /// applies (`docs/security-architecture.md` sec 0.2, sec 7.2). The CRC is
+    /// checked first: it is free (the hardware engine has already finished)
+    /// and it is the more probable failure, so a garbled frame never reaches
+    /// the MAC at all.
     #[cfg_attr(target_os = "none", unsafe(link_section = ".highcode"))]
     #[cfg_attr(target_os = "none", inline(never))]
     fn verify<D: Dispatch>(&mut self, p: Pending, d: &mut D) {
@@ -209,6 +240,26 @@ impl<P: Providers> ServoBus<P> {
             }
             let len = self.ring.bytes().len();
             self.framer.on_frame_rejected(p.anchor, len);
+            // The stream digest is speculative like everything else in the
+            // dispatch window: a frame that failed CRC was folded but never
+            // happened, so the cycle restarts rather than carrying a phantom.
+            self.security.rollback_stream();
+            return;
+        }
+        // The message-plane gate. A frame the policy does not require to be
+        // authenticated passes straight through, so an unsecured build and an
+        // unsecured servo behave exactly as before.
+        if !self.auth_verify(p.anchor, p.footprint) {
+            if p.table {
+                d.revert();
+            }
+            self.drop_staged();
+            self.security.rollback_stream();
+            // Deliberately NOT counted as a CRC failure and NOT rewinding the
+            // frame ladder: the frame was well-formed and correctly framed, so
+            // the resolver's position is trustworthy. Only its authority is
+            // in doubt, and that is counted separately in `auth_fail_count`.
+            self.framer.on_frame_verified();
             return;
         }
         self.framer.on_frame_verified();

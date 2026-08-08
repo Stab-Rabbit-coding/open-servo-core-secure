@@ -16,6 +16,7 @@ mocks = ["dep:mockall", "osc-protocol/software-crc"]
 osc-servo-core.workspace = true
 osc-log.workspace = true
 osc-protocol.workspace = true
+osc-security.workspace = true
 heapless.workspace = true
 mockall            = { version = "0.14", optional = true }
 

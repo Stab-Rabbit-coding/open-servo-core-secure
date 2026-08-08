@@ -137,6 +137,15 @@ pub enum ResultCode {
     Limit = 6,
     PredecessorSilent = 7,
     Hardware = 8,
+    /// The frame carried no valid AUTH trailer and policy required one
+    /// (`docs/security-architecture.md` sec 2.2). Covers a missing trailer, a
+    /// bad tag, and a replayed sequence alike: the three are indistinguishable
+    /// to a host that is behaving correctly, and separating them on the wire
+    /// would tell an attacker which of their guesses was closer.
+    Unauthenticated = 9,
+    /// Consecutive authentication failures tripped the lockout; effect-bearing
+    /// frames are refused until a successful re-key (sec 2.7).
+    SecurityLockout = 10,
 }
 
 impl ResultCode {
@@ -153,6 +162,8 @@ impl ResultCode {
             6 => Some(ResultCode::Limit),
             7 => Some(ResultCode::PredecessorSilent),
             8 => Some(ResultCode::Hardware),
+            9 => Some(ResultCode::Unauthenticated),
+            10 => Some(ResultCode::SecurityLockout),
             _ => None,
         }
     }
@@ -168,6 +179,17 @@ pub enum MgmtOp {
     Reboot = 0x04,
     Factory = 0x05,
     Cal = 0x06,
+    /// Open a session: `[epoch(2 LE), host_nonce(16)]`, replies with the
+    /// servo nonce and SE serial (`docs/security-architecture.md` sec 3).
+    SecInit = 0x07,
+    /// Deliver the wrapped group key: `[wrapped(16), tag(16)]` (sec 3).
+    SecKey = 0x08,
+    /// Attestation: `[challenge(32)]` -> ECDSA P-256 signature (sec 5.2).
+    /// ~520 ms; requires a bus-quiet window (sec 4.3).
+    SecAttest = 0x09,
+    /// Re-key under a fresh epoch. Also the documented remedy for a lockout
+    /// (sec 2.7). Requires a bus-quiet window.
+    SecRekey = 0x0A,
 }
 
 impl MgmtOp {
@@ -180,8 +202,25 @@ impl MgmtOp {
             0x04 => Some(MgmtOp::Reboot),
             0x05 => Some(MgmtOp::Factory),
             0x06 => Some(MgmtOp::Cal),
+            0x07 => Some(MgmtOp::SecInit),
+            0x08 => Some(MgmtOp::SecKey),
+            0x09 => Some(MgmtOp::SecAttest),
+            0x0A => Some(MgmtOp::SecRekey),
             _ => None,
         }
+    }
+
+    /// Does this sub-op drive the secure element, and therefore require a
+    /// bus-quiet window (`docs/security-architecture.md` sec 4.3)?
+    ///
+    /// ECC204 commands block for 20–500 ms [REF-SE-002], so these must never
+    /// be serviced inline with bus traffic.
+    #[inline]
+    pub const fn needs_quiet_window(self) -> bool {
+        matches!(
+            self,
+            MgmtOp::SecInit | MgmtOp::SecKey | MgmtOp::SecAttest | MgmtOp::SecRekey
+        )
     }
 }
 
@@ -197,8 +236,15 @@ impl Inst {
     pub const FLAG_HOLD: u8 = 1 << 0;
     /// Bit 0 on READ/GREAD: the payload names a profile slot (sec 5.2).
     pub const FLAG_PROFILE: u8 = Self::FLAG_HOLD;
-    // Bit 1 is reserved (0) in both layouts -- freed by the pad deletion,
-    // kept for future extensions (sec 3.1, sec 5).
+    /// Bit 1: the frame carries an AUTH trailer -- the last 5 payload bytes
+    /// are `SEQ ‖ TAG[4]` (`docs/security-architecture.md` sec 2.3). This is
+    /// the extension bit sec 3.1/sec 5 reserved; a frame without it is
+    /// byte-identical to the pre-security protocol.
+    ///
+    /// The flag says what a frame CARRIES, never what a servo REQUIRES:
+    /// enforcement is a servo-side policy register, because an attacker
+    /// chooses the flags in the frames they send.
+    pub const FLAG_AUTH: u8 = 1 << 1;
     pub const FLAG_NOREPLY: u8 = 1 << 2;
     pub const FLAG_PER_TARGET: u8 = 1 << 3;
 
@@ -217,6 +263,15 @@ impl Inst {
             b |= Self::ALERT_BIT;
         }
         Self(b)
+    }
+
+    /// A status frame carrying an AUTH trailer. Bit 1 is the same reserved
+    /// bit in the status layout as in the instruction layout, so replies and
+    /// commands signal authentication identically
+    /// (`docs/security-architecture.md` sec 2.3).
+    #[inline]
+    pub const fn status_authenticated(result: ResultCode, alert: bool) -> Self {
+        Self(Self::status(result, alert).0 | Self::FLAG_AUTH)
     }
 
     #[inline]
@@ -243,6 +298,16 @@ impl Inst {
     #[inline]
     pub const fn profile(self) -> bool {
         self.hold()
+    }
+
+    /// Does this frame carry an AUTH trailer (`FLAG_AUTH`)?
+    ///
+    /// Meaningful on instruction frames and on status frames alike: a servo
+    /// tags its replies under the same session key so the host can verify
+    /// telemetry integrity (`docs/security-architecture.md` sec 2.2).
+    #[inline]
+    pub const fn authenticated(self) -> bool {
+        self.0 & Self::FLAG_AUTH != 0
     }
 
     #[inline]
@@ -388,7 +453,58 @@ mod tests {
         assert_eq!(MgmtOp::from_byte(0x01), Some(MgmtOp::Enum));
         assert_eq!(MgmtOp::from_byte(0x05), Some(MgmtOp::Factory));
         assert_eq!(MgmtOp::from_byte(0x06), Some(MgmtOp::Cal));
-        assert_eq!(MgmtOp::from_byte(0x07), None);
+        assert_eq!(MgmtOp::from_byte(0x07), Some(MgmtOp::SecInit));
+        assert_eq!(MgmtOp::from_byte(0x0A), Some(MgmtOp::SecRekey));
+        assert_eq!(MgmtOp::from_byte(0x0B), None);
+    }
+
+    #[test]
+    fn only_the_sec_ops_need_a_quiet_window() {
+        for op in [MgmtOp::Enum, MgmtOp::Assign, MgmtOp::Save, MgmtOp::Reboot, MgmtOp::Factory, MgmtOp::Cal] {
+            assert!(!op.needs_quiet_window(), "{op:?}");
+        }
+        for op in [MgmtOp::SecInit, MgmtOp::SecKey, MgmtOp::SecAttest, MgmtOp::SecRekey] {
+            assert!(op.needs_quiet_window(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn auth_flag_is_bit_1_and_orthogonal() {
+        assert_eq!(Inst::FLAG_AUTH, 0b0000_0010);
+        let i = Inst::instruction(Opcode::Write, Inst::FLAG_AUTH | Inst::FLAG_HOLD);
+        assert!(i.authenticated());
+        assert!(i.hold());
+        assert!(!i.noreply());
+        assert!(!i.per_target());
+        assert_eq!(i.opcode(), Some(Opcode::Write));
+        // Absent by default -- an unauthenticated frame is byte-identical to
+        // the pre-security protocol.
+        assert!(!Inst::instruction(Opcode::Write, 0).authenticated());
+    }
+
+    #[test]
+    fn auth_flag_does_not_disturb_the_status_layout() {
+        let plain = Inst::status(ResultCode::Range, true);
+        let authed = Inst::status_authenticated(ResultCode::Range, true);
+        assert!(authed.is_status());
+        assert!(authed.authenticated());
+        assert!(!plain.authenticated());
+        // Result code and ALERT survive the extra bit untouched.
+        assert_eq!(authed.result(), plain.result());
+        assert_eq!(authed.alert(), plain.alert());
+        assert_eq!(authed.0, plain.0 | Inst::FLAG_AUTH);
+    }
+
+    #[test]
+    fn security_result_codes_round_trip() {
+        assert_eq!(ResultCode::from_bits(9), Some(ResultCode::Unauthenticated));
+        assert_eq!(ResultCode::from_bits(10), Some(ResultCode::SecurityLockout));
+        assert_eq!(ResultCode::from_bits(11), None);
+        // They must survive the status packing/unpacking round trip.
+        for rc in [ResultCode::Unauthenticated, ResultCode::SecurityLockout] {
+            assert_eq!(Inst::status(rc, false).result(), Some(rc));
+            assert_eq!(Inst::status_authenticated(rc, true).result(), Some(rc));
+        }
     }
 
     #[test]

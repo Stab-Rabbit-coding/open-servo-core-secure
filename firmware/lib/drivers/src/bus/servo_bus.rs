@@ -5,6 +5,7 @@
 //! deadlines onto the single tick-compare.
 
 use osc_protocol::wire::{Id, Opcode};
+use osc_security::{Policy, SecurityContext, SecurityState, SessionKeys};
 use osc_servo_core::traits::Dispatch;
 use osc_servo_core::{BaudRate, BootMode};
 
@@ -18,6 +19,7 @@ use crate::traits::bus::{Deadline, Providers, RxRing, UsartBaud, tick_reached};
 mod crc;
 mod reply;
 mod route;
+mod security;
 
 /// us-per-byte numerator: 10 bit-times/byte x 1e6 us/s. `tpb = TICKS_PER_US x
 /// this / baud` stays within u32 for all four operational rates.
@@ -43,6 +45,16 @@ const FRAMES_PER_WAKE: u32 = 16;
 pub struct LinkDiag {
     pub crc_fail_count: u32,
     pub framing_drop_count: u32,
+}
+
+/// Message-plane health counters (`docs/security-architecture.md` sec 2.7).
+///
+/// Deliberately separate from [`LinkDiag`]: a CRC failure means the wire is
+/// noisy, an auth failure means someone is talking who should not be, and
+/// folding them into one counter would hide the second inside the first.
+pub struct SecurityDiag {
+    pub auth_fail_count: u32,
+    pub replay_drop_count: u32,
 }
 
 /// A frame dispatched ahead of its CRC verdict -- the spine (sec 4): dispatch
@@ -85,6 +97,12 @@ pub struct ServoBus<P: Providers> {
     chain_at: Option<u32>,
     // Clock discipline (sec 9.3): MGMT CAL + drift tracker + trim loop.
     clock: ClockTracker,
+    // The message plane (`docs/security-architecture.md`): the stream digest,
+    // the replay window, the policy register and the session state. Folded at
+    // the covered checkpoint, gated at the verdict -- the two hooks in
+    // `security.rs`. An unsecured servo carries this at its `Unsecured`
+    // default and behaves exactly as the pre-security transport did.
+    security: SecurityContext,
 }
 
 /// Ticks per byte-time at `rate` on the transport clock. Each arm folds to a
@@ -142,6 +160,50 @@ impl<P: Providers> ServoBus<P> {
             framer_at: None,
             chain_at: None,
             clock: ClockTracker::new(<P::Deadline as Deadline>::CLOCK_TRIM_STEP_PPM),
+            // Boots Unsecured and PERMISSIVE (`docs/security-architecture.md`
+            // sec 4.2). Two separate decisions, both deliberate:
+            //
+            // - Unsecured, because no session exists until the SE handshake
+            //   runs. A servo that refuses to fly because a crypto chip did
+            //   not answer is a worse failure mode for an aircraft than one
+            //   that holds position and raises an alert.
+            // - Permissive (`Policy::OPEN`, not `Policy::FLIGHT`), because no
+            //   ECC204 is fitted on any board in this repository yet. A
+            //   `require_auth` default would reject every COMMIT on every
+            //   existing servo -- enforcement must arrive WITH the hardware,
+            //   not ahead of it.
+            //
+            // A flight build sets `Policy::FLIGHT` explicitly via
+            // `set_policy`. TODO.md sec 7.10 tracks making that impossible to
+            // forget.
+            security: SecurityContext::new(Policy::OPEN),
+        }
+    }
+
+    /// Install an SE-derived session (sec 3). Called from the main loop after
+    /// the bus-quiet boot handshake, never from an ISR.
+    pub fn install_session(&mut self, keys: SessionKeys) {
+        self.security.install(keys);
+    }
+
+    /// Set the enforcement policy. A flight build calls this with
+    /// [`Policy::FLIGHT`]; the constructor's default is permissive so that a
+    /// board with no secure element fitted behaves exactly as it did before
+    /// the security layer existed.
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.security.set_policy(policy);
+    }
+
+    /// Message-plane state, for the telemetry region's `status_flags`.
+    pub fn security_state(&self) -> SecurityState {
+        self.security.state()
+    }
+
+    /// Message-plane counters, mirrored into telemetry alongside [`LinkDiag`].
+    pub fn security_diag(&self) -> SecurityDiag {
+        SecurityDiag {
+            auth_fail_count: self.security.auth_fail_count,
+            replay_drop_count: self.security.replay_drop_count,
         }
     }
 

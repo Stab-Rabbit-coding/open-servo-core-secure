@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["control-table", "control-table-derive", "core", "drivers", "host", "integration", "log", "osc-protocol", "table-export", "units"]
+members = ["control-table", "control-table-derive", "core", "drivers", "host", "integration", "log", "osc-protocol", "osc-security", "table-export", "units"]
 
 [workspace.package]
 edition = "2024"
@@ -17,6 +17,7 @@ crc              = { version = "3", default-features = false }
 osc-units            = { path = "units" }
 osc-log              = { path = "log" }
 osc-protocol         = { path = "osc-protocol" }
+osc-security         = { path = "osc-security" }
 osc-servo-core             = { path = "core" }
 osc-servo-drivers          = { path = "drivers" }
 osc-host             = { path = "host" }

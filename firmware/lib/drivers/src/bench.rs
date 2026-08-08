@@ -81,9 +81,80 @@ impl TrimProbe {
     };
 }
 
+/// Message-plane probe (`docs/security-architecture.md` §2.6, §7.4).
+///
+/// The architecture's timing claims are **analytical, not measured** -- no
+/// Rust toolchain was available when it was written, and this repository's
+/// convention is that timing facts come from silicon ([F1]-[F15]). This probe
+/// is how that gap gets closed: dump it by symbol address over the debug link
+/// after a hot-loop run and the fold cost, the verdict mix and the lockout
+/// behaviour all fall out of the counters.
+///
+/// The number the design hangs on is **fold cost per hot-loop cycle**. The
+/// analytical estimate is ~34 µs for a ~70-byte cycle (~42 HalfSipHash rounds
+/// at ~26 instructions each, ~1.5 CPI at 48 MHz), which by the transport's
+/// measured tick-loss relation (§2 of `osc-servo-transport.md`: loss ~= 1.2-1.4x
+/// transport-HIGH duty) should cost ~4-5% additional kernel tick coalescing at
+/// a 1 kHz bus cycle. `fold_cycles / folds` against `fold_bytes / folds` is
+/// the direct measurement; if it lands materially over the estimate, the
+/// documented levers are the split feed, HalfSipHash-1-3, or policy narrowing.
+#[repr(C)]
+pub struct SecProbe {
+    /// Frames folded into the stream digest.
+    pub folds: u32,
+    /// Bytes folded -- with `folds`, gives bytes/frame for the cost model.
+    pub fold_bytes: u32,
+    /// Cycle counter accumulated across folds, when the chip supplies one.
+    pub fold_cycles: u32,
+    /// Verdicts rendered, and their breakdown.
+    pub verdicts: u32,
+    pub pass: u32,
+    pub missing: u32,
+    pub bad_tag: u32,
+    pub replay: u32,
+    pub no_session: u32,
+    pub locked_out: u32,
+    /// Frames refused because their covered span exceeded the in-place
+    /// authentication buffer. Should be zero under the intended hot loop; a
+    /// nonzero value means `AUTH_SPAN_MAX` is mis-sized for the deployment.
+    pub oversize: u32,
+}
+
+impl SecProbe {
+    pub const ZERO: Self = Self {
+        folds: 0,
+        fold_bytes: 0,
+        fold_cycles: 0,
+        verdicts: 0,
+        pass: 0,
+        missing: 0,
+        bad_tag: 0,
+        replay: 0,
+        no_session: 0,
+        locked_out: 0,
+        oversize: 0,
+    };
+}
+
 #[cfg(feature = "bench")]
 #[unsafe(no_mangle)]
 pub static mut TRIM_PROBE: TrimProbe = TrimProbe::ZERO;
+
+#[cfg(feature = "bench")]
+#[unsafe(no_mangle)]
+pub static mut SEC_PROBE: SecProbe = SecProbe::ZERO;
+
+/// Run `f` over the security probe -- a no-op without the `bench` feature.
+#[inline(always)]
+#[allow(unused_variables)]
+pub fn sec_probe(f: impl FnOnce(&mut SecProbe)) {
+    // SAFETY: single-hart; every writer runs at the one transport priority
+    // (HIGH), so accesses never interleave. The debug link only reads.
+    #[cfg(feature = "bench")]
+    unsafe {
+        f(&mut *core::ptr::addr_of_mut!(SEC_PROBE));
+    }
+}
 
 /// Run `f` over the trim probe -- a no-op without the `bench` feature.
 #[inline(always)]

@@ -11,6 +11,20 @@ use defmt_rtt as _;
 tinyboot_ch32::app::app_version!();
 osc_servo_ch32::install_isrs!();
 
+// Security posture (`docs/security-architecture.md`).
+//
+// The message plane lives inside the transport, not here: `ServoBus` owns a
+// `SecurityContext` and gates staged effects at the same verdict the CRC
+// already gates (sec 7.2). So this board file needs no crypto code at all, and
+// an earlier draft that ran a boot handshake ahead of `run!()` was solving the
+// problem in the wrong place -- the session has to be installed through the
+// runtime, and its ~670 ms of ECC204 traffic must not sit in the entry path.
+//
+// No ECC204 is fitted on any board in this repository yet, so the servo boots
+// `SecurityState::Unsecured` (sec 4.2) and behaves exactly as it did before the
+// security layer existed. Fitting one needs a board respin; the production
+// SG90 board has `PD5`/`PD6` free and UART-capable for SWI (sec 0.3.2).
+// Tracked in `TODO.md` sec 7.
 #[qingke_rt::entry]
 fn main() -> ! {
     osc_servo_ch32::log::info!("osc-dev-v006: boot");
