@@ -17,9 +17,21 @@ Citations: [`REFERENCES.md`](REFERENCES.md).
 - [ ] **(BLOCKER)** Confirm the ECC204 **SWI** ordering code against
       Microchip's full ordering-code table. [REF-SE-001] Table 4-1 lists
       `ECC204-TFLXAUTHU/S` and `ECC204-TCSMU/TCSMS` **without an interface
-      column**, and the interface (SWI vs I²C) is fixed at the part number.
-      The trade study (§0.3.1) selects SWI for the servo control board.
-      Blocks 7.8.
+      column**, and Note 3 states the TrustCUSTOM sample device is equivalent
+      to the **I²C** (`DA`) part, not SWI — this table does not show a
+      3-lead-contact or `CZ` (SWI) Trust Platform SKU, and is only a
+      "representative sample" (Note 1). The trade study (§0.3.1) selects SWI
+      for the servo control board. **Narrower now:** [REF-SE-001] §7 (Product
+      Identification System) *does* have a plain, non-Trust-Platform ordering
+      grammar with an explicit interface column (`RB`/`MA`/`SS` package ×
+      `CZ`/`DA` I/O), and gives `ECC204-RBVCZ-T` (3-lead contact, SWI, tape &
+      reel) as a worked example — a real, orderable **unprovisioned** device,
+      used for the schematic/footprint (U7). What's still unresolved: whether
+      a **pre-provisioned** (TrustFLEX/TrustCUSTOM) SWI SKU exists for fleet
+      use, or whether fleet units must go through the TrustCUSTOM configurator
+      starting from the raw `-RBVCZ-T` part. Still blocks final BOM
+      commitment; no longer blocks schematic/footprint capture (done, see
+      7.8).
 - [ ] Decide TrustFLEX vs TrustCUSTOM. TrustFLEX suffices unless the slot
       configuration must change ([REF-SE-001] §4).
 - [ ] Obtain the **complete ECC204 datasheet under NDA** from Microchip.
@@ -112,9 +124,38 @@ convention is that timing facts are silicon-measured ([F1]–[F15]).
 
 ### 7.8 Hardware **(no ECC204 is fitted on any board)**
 
-- [ ] **(BLOCKER)** Add the ECC204 to `osc-sg90-v006`: SWI on `PD6`, one
-      pull-up, decoupling. Blocked by 7.1 and 7.2. Confirm the 10 × 12.5 mm
-      board can absorb the part inside the SG90 case.
+- [x] Schematic capture for `osc-sg90-v006`: `U7` (ECC204-RBVCZ-T, 3-lead
+      contact, SWI), `SI/O` on `PD6` via the `SE_SWIO` net label, `R10`
+      SWI pull-up (`+3V3` to `SE_SWIO`), `C5` 0.1 µF VCC decoupling. New
+      symbol in `hardware/shared.kicad_sym`; new footprint
+      `hardware/shared.pretty/ECC204_Contact-3_L6.5-W2.5-P2.00.kicad_mod`
+      (derived from [REF-SE-001] §6.3 terminal max dimensions, no IPC-7351
+      calculation — verify before fab). `SE_SWIO` added to the `DIGITAL`
+      netclass pattern in `osc-sg90-v006.kicad_pro`.
+      **ERC/DRC-verified with KiCad 10.0.3** (system `kicad-cli` is 9.0.2 and
+      can't load this file at all; used the KiCad 10 AppImage instead).
+      `sch erc --severity-all`: 0 new violations (1 pre-existing, unrelated
+      `DRV8837C` library-mismatch warning on `U4`). `pcb drc --severity-all`:
+      0 new error-severity violations against the same in-place baseline;
+      new findings are only 7 expected unrouted pads (staged parts) + 3
+      cosmetic `lib_footprint_mismatch` warnings (simplified hand-authored
+      footprint graphics vs. full library re-import). First pass had `U7`'s
+      `GND` pin position wrong — KiCad negates a symbol's local Y before
+      applying rotation even at `angle 0`; DRC/ERC caught it, recomputed and
+      fixed.
+  - [ ] **(BLOCKER)** `R10`'s value is `TBD` — no SWI pull-up value is given
+        in [REF-SE-001] (the summary datasheet has no application-circuit
+        section). Needs the NDA datasheet or a CryptoAuthLib reference design
+        (ties to 7.4).
+  - [ ] **(BLOCKER)** `U7`/`R10`/`C5` are placed **off the board outline** (a
+        staging position in the `.kicad_pcb`, not a real layout) — the
+        original "confirm the 10 × 12.5 mm board can absorb the part" question
+        is **still open**. Placing the 6.5×2.5 mm 3-lead-contact part on a
+        board this size, clear of the H-bridge/motor pads and the SG90 case
+        keepout, needs to be done visually in the KiCad PCB editor, not blind.
+  - [ ] Confirm the exact ordering-code/provisioning SKU per 7.1 before BOM
+        commitment; `U7`'s Value (`ECC204-RBVCZ-T`) is the plain/unprovisioned
+        device, explicitly flagged as such in its Description field.
 - [ ] Add an SE breakout path for `osc-dev-v006` bringup via the Qwiic
       connector (§0.3.2).
 - [ ] Re-run the EMC/ESD review with the SE net beside the H-bridge. SWI

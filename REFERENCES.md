@@ -39,9 +39,33 @@ verification*, and a `TODO.md` item is opened against it.
   - *§2.2.3 Compliance Mode* — FIPS 140-3 enforcement bit.
   - *§3.1 Absolute Maximum Ratings* — ESD HBM **> 4 kV (I²C)**, **> 7 kV
     (SWI)**, CDM > 2 kV.
+  - *§3.2.1* — DC parameters, all I/O interfaces: Theta-JA **91.5°C/W** for
+    the 3-lead contact package (soldered-down); sleep current 130 nA typ.
   - *§3.2.2 / §3.2.3* — SWI DC parameters and parasitic-power mode.
   - *§4 / Table 4-1* — Trust&GO / TrustFLEX / TrustCUSTOM provisioning flows;
-    ordering codes.
+    ordering codes. **Note 3**: the TrustCUSTOM sample device
+    `ECC204-TCSMU`/`ECC204-TCSMS` is stated equivalent to
+    `ECC204-MAVDA-T`/`ECC204-SSVDA-T` — **I²C**, not SWI. This table does not
+    show a 3-lead-contact or SWI (`CZ`) Trust Platform SKU; it is a
+    "representative sample" (Note 1), not exhaustive. This is the open part of
+    the `TODO.md` §7.1 blocker — whether a pre-provisioned (TrustFLEX/
+    TrustCUSTOM) SWI part exists is still unconfirmed from this datasheet.
+  - *§6.3 / Package Drawings* — 3-Lead Contact package (Atmel legacy code RHB,
+    Microchip drawing C04-21303 Rev A): body 6.50×2.50 mm BSC, height
+    0.45–0.55 mm, pitch 2.00 mm BSC, terminal width (`b`) 1.60–1.80 mm,
+    terminal length (`L`) 2.10–2.30 mm. Used directly (terminal max
+    dimensions, no IPC-7351 land-pattern calculation applied) for
+    `hardware/shared.pretty/ECC204_Contact-3_L6.5-W2.5-P2.00.kicad_mod` —
+    verify against a real part before fab.
+  - *§7 / Product Identification System* — the **plain** (non-Trust-Platform)
+    ordering-code grammar has an explicit interface column: package `RB`
+    (3-lead contact) / `MA` (UDFN) / `SS` (SOIC) × I/O type `CZ` (SWI) /
+    `DA` (I²C). `ECC204-RBVCZ-T` (3-lead contact, extended temp, SWI, tape &
+    reel) is a **verbatim example** from this section, used as the schematic
+    symbol name (`hardware/shared.kicad_sym`,
+    `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_sch` U7). This is a
+    real, orderable **unprovisioned** device — it is not the fleet
+    provisioning SKU, which remains open per `TODO.md` §7.1/§7.5.
 - **Cited from:** `docs/security-architecture.md` (§0.1–0.5, §2, §3, §5, §6),
   `firmware/lib/drivers/src/se/ecc204.rs`,
   `firmware/lib/osc-security/src/se.rs`, `firmware/lib/osc-security/src/keys.rs`
