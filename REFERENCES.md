@@ -50,17 +50,26 @@ verification*, and a `TODO.md` item is opened against it.
     "representative sample" (Note 1), not exhaustive. This is the open part of
     the `TODO.md` §7.1 blocker — whether a pre-provisioned (TrustFLEX/
     TrustCUSTOM) SWI part exists is still unconfirmed from this datasheet.
-  - *§6.3 / Package Drawings* — 3-Lead Contact package (Atmel legacy code RHB,
+  - *§6.1 / Package Drawings — 8-Pad UDFN* (Q4B, Atmel legacy code YNZ,
+    Microchip drawing C04-21355-Q4B Rev C): body 2.00×3.00 mm BSC, height
+    0.50–0.60 mm, pitch (`e`) 0.50 mm BSC, exposed pad D2 1.40–1.60 mm,
+    exposed pad E2 1.20–1.40 mm, terminal width (`b`) 0.18–0.30 mm, terminal
+    length (`L`) 0.25–0.45 mm, **terminal-to-exposed-pad (`K`) 0.20 mm min**.
+    Used, with the `K` clearance applied against the pulled-in peripheral
+    pads rather than the nominal exposed-pad size, for
+    `hardware/shared.pretty/ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm.kicad_mod`
+    — see that file's description field and `TODO.md` §7.8 for the exact
+    derivation; verify against a real part/stencil before fab.
+  - *§6.3 / Package Drawings — 3-Lead Contact* (Atmel legacy code RHB,
     Microchip drawing C04-21303 Rev A): body 6.50×2.50 mm BSC, height
     0.45–0.55 mm, pitch 2.00 mm BSC, terminal width (`b`) 1.60–1.80 mm,
-    terminal length (`L`) 2.10–2.30 mm. Used directly (terminal max
-    dimensions, no IPC-7351 land-pattern calculation applied) for
-    `hardware/shared.pretty/ECC204_Contact-3_L6.5-W2.5-P2.00.kicad_mod` —
-    verify against a real part before fab.
+    terminal length (`L`) 2.10–2.30 mm. **Superseded** — see "Removed /
+    superseded citations" below; this package does not fit
+    `osc-sg90-v006`'s routed copper anywhere.
   - *§7 / Product Identification System* — the **plain** (non-Trust-Platform)
     ordering-code grammar has an explicit interface column: package `RB`
     (3-lead contact) / `MA` (UDFN) / `SS` (SOIC) × I/O type `CZ` (SWI) /
-    `DA` (I²C). `ECC204-RBVCZ-T` (3-lead contact, extended temp, SWI, tape &
+    `DA` (I²C). `ECC204-MAVCZ-T` (8-pad UDFN, extended temp, SWI, tape &
     reel) is a **verbatim example** from this section, used as the schematic
     symbol name (`hardware/shared.kicad_sym`,
     `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_sch` U7). This is a
@@ -267,3 +276,4 @@ citations resolve consistently.
 | ECC204 SWI on pin `PC1` (`main.rs.new` draft) | **Removed** | `PC1` is the bus receive path on the rev-B and `osc-sg90-v006` configurations and the Qwiic I²C SDA on `osc-dev-v006` Rev 2A. Never free. See §0.3. |
 | `cortex_m::asm::nop()` in the `osc_security.rs` draft | **Removed** | ARM intrinsic on a RISC-V (QingKe RV32EC) target; could not compile. See §0.4. |
 | Infineon OPTIGA Trust M as the selected SE | **Superseded** | ECC204 selected. REF-SE-006 retained for the trade record. |
+| ECC204 3-Lead Contact package (`ECC204-RBVCZ-T`, footprint `ECC204_Contact-3_L6.5-W2.5-P2.00`) | **Superseded** | Confirmed via full computational search of `osc-sg90-v006`'s routed copper (both layers, every position, real pad/track/via/zone geometry) that this 6.5×2.5 mm package has **zero** clear placement on this board. Switched to the same real part's 8-Pad UDFN (`ECC204-MAVCZ-T`), which does fit. [REF-SE-001] §6.1 replaces §6.3 as the applicable package-drawing citation. Symbol/footprint files removed; see `TODO.md` §7.8. |

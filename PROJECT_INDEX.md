@@ -767,7 +767,7 @@ open-servo-core-secure/
 │   │       ├── servo-dev-board.kicad_sch
 │   │       └── sym-lib-table
 │   ├── shared.3dshapes/  *(70 generated files, not enumerated)*
-│   ├── shared.pretty/  *(39 generated + `ECC204_Contact-3_L6.5-W2.5-P2.00.kicad_mod` hand-authored from REF-SE-001 §6.3, not individually enumerated)*
+│   ├── shared.pretty/  *(39 generated + `ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm.kicad_mod` hand-authored from REF-SE-001 §6.1, not individually enumerated)*
 │   ├── templates/
 │   │   └── jlc4l_1v6mm/
 │   │       ├── meta/

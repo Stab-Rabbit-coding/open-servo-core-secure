@@ -16,9 +16,10 @@ OpenServoCore swap board for SG90-class hobby servos. Compact, double-sided, des
 - **Debug** — 4-pad SWD interface for WCH-LinkE.
 - **Position feedback** — existing servo potentiometer wiper.
 - **Form factor** — 10 × 12.5 mm, double-sided assembly.
-- **Secure element** — Microchip ECC204 (`U7`), 3-lead contact package, SWI on
-  `PD6` [REF-SE-001]. **Schematic-only, not yet placed on the board outline**
-  — see [Secure element](#secure-element) below and `TODO.md` §7.8.
+- **Secure element** — Microchip ECC204 (`U7`), 8-pad UDFN package, SWI on
+  `PD6` [REF-SE-001]. **Placed on B.Cu with a generic 3D proxy model; 2
+  residual real DRC clearance conflicts still open** — see
+  [Secure element](#secure-element) below and `TODO.md` §7.8.
 
 ## Connectors
 
@@ -75,54 +76,99 @@ These are the targets the board was laid out around. None are measured.
 
 ## Secure element
 
-`U7` is a Microchip ECC204 (Value `ECC204-RBVCZ-T`), 3-lead contact package,
+`U7` is a Microchip ECC204 (Value `ECC204-MAVCZ-T`), **8-pad UDFN** package,
 100 kbps PWM Single-Wire Interface (SWI). Design of record:
 [`docs/security-architecture.md`](../../../docs/security-architecture.md);
 citations: [`REFERENCES.md`](../../../REFERENCES.md) `REF-SE-001`.
 
-| Signal | Net       | Notes                                            |
-| ------ | --------- | ------------------------------------------------ |
-| `SI/O` | `SE_SWIO` | `PD6` on the MCU, one pull-up (`R10`) to `+3V3`. |
-| `VCC`  | `+3V3`    | 0.1 µF decoupling (`C5`).                        |
-| `GND`  | `GND`     |                                                  |
+| Signal | Net       | Notes                                                                   |
+| ------ | --------- | ----------------------------------------------------------------------- |
+| `SI/O` | `SE_SWIO` | `PD6` on the MCU, one pull-up (`R10`) to `+3V3`.                        |
+| `VCC`  | `+3V3`    | 0.1 µF decoupling (`C5`).                                               |
+| `GND`  | `GND`     | Also `EP` (pin 9, exposed pad) — REF-SE-001 recommends tying it to GND. |
 
-**Status — schematic capture only, three things still open:**
+**Package: 8-pad UDFN, not 3-Lead Contact.** The 3-Lead Contact package
+(6.5×2.5 mm) — the original choice — was confirmed by exhaustive search to
+have **zero** clear placement anywhere on this board's routed copper. The
+same real part's 8-pad UDFN (2×3 mm) does fit; see `TODO.md` §7.8 for the
+search methodology and REFERENCES.md's "Removed / superseded citations" for
+the supersession record.
+
+**Placement — on B.Cu, real position, 2 residual real DRC conflicts open:**
+
+- `U7 (101.7, 93.4)`, `R10 (103.3, 92.4)`, `C5 (103.0, 97.1)`, `C10 (103.7,
+  95.015, −90)`, `RS1 (105.245002, 96.755, 90)`, `C2 (108.18, 91.08)`, all
+  B.Cu — these are the final positions after re-verifying (and, for `RS1`/
+  `C10`, wholesale-restoring) a round of manual GUI repositioning; see the
+  data-integrity note below.
+- `pcb drc --severity-all`: driven from 148 violations (induced by the
+  original manual 3-Lead-Contact placement) down to 74 total / 27 new vs. a
+  clean baseline. Of those 27: **2 are real** (`U7` pad 5 and `R10` pad 2
+  each sit too close to one of `J4`'s three real through-hole pads —
+  `(104.51, 92.0)` / `(103.06, 95.0)` / `(104.51, 98.0)`, confirmed via
+  live Gerber `%TO.P,J4,n%` component-attribute flashes, not a stale-fill
+  or duplicate-reference artifact; see `TODO.md` §7.8 for the placement
+  math proving `U7` cannot clear both nearby `J4`/`J2` pads at once, and for
+  fix options), 18 are `GND_POUR` zone-clearance findings now assessed as
+  **likely real** (point-in-polygon tested against a live-exported Gerber's
+  filled copper region — `U7`'s non-`GND` pads land inside the poured
+  copper with no relief — though a live KiCad "Fill All Zones" + re-DRC is
+  still the only fully conclusive check), and 3 are cosmetic
+  `lib_footprint_mismatch` warnings (hand-authored footprint graphics vs. a
+  full library re-import).
+- `sch erc --severity-all`: 0 new violations (1 pre-existing, unrelated
+  `DRV8837C` library-mismatch warning).
+- **(BLOCKER for fab)** The 2 real conflicts need either further placement
+  in a live KiCad GUI (this work was done headlessly, matching real pad
+  geometry pulled from the raw `.kicad_pcb` and cross-checked against
+  exported Gerbers — no substitute for actually seeing it), smaller pads
+  still, or a justified DRC exclusion matching the `.kicad_pro`'s existing
+  three exclusions for `J4`'s one-sided-TH quirk.
+
+**Still open beyond placement:**
 
 - `R10`'s pull-up value is `TBD`. The summary datasheet [REF-SE-001] has no
   application-circuit section and gives no recommended SWI pull-up; that
   needs the NDA datasheet or a CryptoAuthLib reference design (`TODO.md`
   §7.4).
-- `U7`/`R10`/`C5` are placed **off the board outline** in the `.kicad_pcb` —
-  a staging position, not a real layout. Whether the 6.5×2.5 mm 3-lead-contact
-  package actually fits this 10 × 12.5 mm board, clear of the H-bridge/motor
-  copper and the SG90 case keepout, is unconfirmed and needs to be done
-  visually in the PCB editor (`TODO.md` §7.8).
-- `ECC204-RBVCZ-T` is the **plain, unprovisioned** ordering code — a real
+- `ECC204-MAVCZ-T` is the **plain, unprovisioned** ordering code — a real
   example straight from [REF-SE-001] §7 (Product Identification System), not
   the fleet provisioning SKU. Whether fleet units ship pre-provisioned
   (TrustFLEX/TrustCUSTOM) or get provisioned from this raw part is still open
   (`TODO.md` §7.1/§7.5).
-- The new footprint,
-  [`hardware/shared.pretty/ECC204_Contact-3_L6.5-W2.5-P2.00.kicad_mod`](../../shared.pretty/ECC204_Contact-3_L6.5-W2.5-P2.00.kicad_mod),
-  uses the package's terminal *max* dimensions directly from [REF-SE-001]
-  §6.3 as the pad size — no IPC-7351 land-pattern calculation was applied.
-  Verify against a real part before fab.
+- The footprint,
+  [`hardware/shared.pretty/ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm.kicad_mod`](../../shared.pretty/ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm.kicad_mod),
+  deliberately uses smaller-than-generous pads (peripheral pads 0.5×0.25 mm,
+  EP land 0.61 mm wide) to fit this board's real estate — sized to
+  [REF-SE-001] §6.1's own terminal-to-exposed-pad `K = 0.20 mm` minimum, not
+  arbitrary. Verify against a real part/stencil before fab.
+- **Correction to a prior session's note:** an earlier pass here reported a
+  "duplicate `J4` footprint / phantom pad" bug. That was wrong — it was a
+  sign error in the reviewer's own PCB rotation math (`Rot(+θ)` used where
+  `Rot(−θ)` was correct), not a board defect. `J4` is a single real
+  footprint with three real through-hole pads; see `TODO.md` §7.8 for the
+  corrected transform and its Gerber-based verification.
+- **3D models added** for `U7`, `R10`, `C5` so KiCad's 3D viewer no longer
+  shows bare footprints for these parts. `R10`/`C5` use the existing
+  KiCad standard-library STEP models
+  (`Resistor_SMD.3dshapes/R_0402_1005Metric.step`,
+  `Capacitor_SMD.3dshapes/C_0402_1005Metric.step`), matching this board's
+  existing convention for other passives. `U7` has no vendor-supplied
+  3D model (Microchip does not publish one for the 8-pad UDFN), so it uses
+  a generic dimensionally-accurate proxy generated from
+  [REF-SE-001] §6.1's package dimensions (2.00 × 3.00 mm body, 0.55 mm
+  height) — script and STL live at
+  [`hardware/shared.3dshapes/ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50.stl`](../../shared.3dshapes/ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50.stl).
+  Model references were added both to the library footprint
+  (`shared.pretty/...kicad_mod`) and to each board instance directly (KiCad
+  stores a full independent copy per instance — a library-only edit does
+  not propagate to footprints already placed on this board). Confirmed no
+  DRC regression from adding the models (74/9/27 unchanged); full visual
+  confirmation in KiCad's 3D viewer was not achieved headlessly and should
+  be spot-checked in the GUI before fab.
 - **ERC/DRC verified with KiCad 10.0.3** (`kicad-cli` from the KiCad 10
   AppImage — the system-installed `kicad-cli` is 9.0.2 and cannot even load
-  this file, since it's `generator_version "10.0"`). `sch erc
-  --severity-all` returns **zero new violations**: the one remaining warning
-  (`DRV8837C` library-symbol mismatch on `U4`) is pre-existing, unrelated to
-  this change. `pcb drc --severity-all` also returns **zero new
-  error-severity violations** against the same in-place baseline; the only
-  new findings are 7 informationally-unrouted pads (`U7`/`R10`/`C5` are
-  staged, not routed — expected) and 3 `lib_footprint_mismatch` warnings
-  (the hand-authored footprint graphics are simplified vs. what a full
-  library re-import would produce — cosmetic, not electrical). A first pass
-  had the sign of `U7`'s `GND` pin backwards (KiCad always negates a
-  symbol's local Y before applying its placement rotation, even at
-  `angle 0` — this isn't folded into the rotation matrix the way you'd
-  expect); DRC caught it as `pin_not_connected` / `power_pin_not_driven`,
-  fixed by recomputing the pin position with that rule and re-running.
+  this file, since it's `generator_version "10.0"`).
 
 ## Assembly
 

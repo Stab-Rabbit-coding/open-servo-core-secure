@@ -124,38 +124,172 @@ convention is that timing facts are silicon-measured ([F1]–[F15]).
 
 ### 7.8 Hardware **(no ECC204 is fitted on any board)**
 
-- [x] Schematic capture for `osc-sg90-v006`: `U7` (ECC204-RBVCZ-T, 3-lead
-      contact, SWI), `SI/O` on `PD6` via the `SE_SWIO` net label, `R10`
-      SWI pull-up (`+3V3` to `SE_SWIO`), `C5` 0.1 µF VCC decoupling. New
-      symbol in `hardware/shared.kicad_sym`; new footprint
-      `hardware/shared.pretty/ECC204_Contact-3_L6.5-W2.5-P2.00.kicad_mod`
-      (derived from [REF-SE-001] §6.3 terminal max dimensions, no IPC-7351
-      calculation — verify before fab). `SE_SWIO` added to the `DIGITAL`
-      netclass pattern in `osc-sg90-v006.kicad_pro`.
-      **ERC/DRC-verified with KiCad 10.0.3** (system `kicad-cli` is 9.0.2 and
-      can't load this file at all; used the KiCad 10 AppImage instead).
-      `sch erc --severity-all`: 0 new violations (1 pre-existing, unrelated
-      `DRV8837C` library-mismatch warning on `U4`). `pcb drc --severity-all`:
-      0 new error-severity violations against the same in-place baseline;
-      new findings are only 7 expected unrouted pads (staged parts) + 3
-      cosmetic `lib_footprint_mismatch` warnings (simplified hand-authored
-      footprint graphics vs. full library re-import). First pass had `U7`'s
-      `GND` pin position wrong — KiCad negates a symbol's local Y before
-      applying rotation even at `angle 0`; DRC/ERC caught it, recomputed and
-      fixed.
+- [x] Schematic capture for `osc-sg90-v006`: `U7`, `SI/O` on `PD6` via the
+      `SE_SWIO` net label, `R10` SWI pull-up (`+3V3` to `SE_SWIO`), `C5`
+      0.1 µF VCC decoupling. `SE_SWIO` added to the `DIGITAL` netclass
+      pattern in `osc-sg90-v006.kicad_pro`. **ERC-verified with KiCad
+      10.0.3** (system `kicad-cli` is 9.0.2 and can't load this file at all;
+      used the KiCad 10 AppImage — `AppImage kicad-cli <args>`, no
+      extraction needed, it's a `sharun`-runtime image). `sch erc
+      --severity-all`: 0 new violations (1 pre-existing, unrelated
+      `DRV8837C` library-mismatch warning on `U4`).
+- [x] **Package swapped: 3-Lead Contact → 8-Pad UDFN.** The user moved
+      `U7`/`R10`/`C5` onto the real board (B.Cu) by hand and asked for
+      induced DRC violations to be driven to zero. Investigation found the
+      3-Lead Contact package (6.5×2.5 mm) **does not fit anywhere on this
+      board** — a full computational search of every position on both
+      copper layers (real pad/track/via geometry parsed from the `.kicad_pcb`,
+      500+ candidate points) found **zero** locations without copper
+      conflict, because this fully-routed 12.1×9.6 mm board has no
+      contiguous clear region that size. Switched to the same real part's
+      **8-Pad UDFN (2×3 mm)** — an order of magnitude smaller footprint,
+      genuinely fits. New symbol `ECC204-MAVCZ-T` in
+      `hardware/shared.kicad_sym` (pinout: 1/2/3/6/7 NC, 4 GND, 5 SI/O, 8
+      VCC, 9 EP — [REF-SE-001] Table 1/Fig. 1); new footprint
+      `hardware/shared.pretty/ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm.kicad_mod`
+      built from [REF-SE-001] §6.1 mechanical dims, **with two deliberate,
+      disclosed deviations from a generous IPC land** to fit this board's
+      real estate: peripheral pad size 0.5×0.25 mm (vs. a typical
+      toe-extended ~0.87×0.25 mm) and EP land narrowed to 0.61 mm wide
+      (vs. 1.5 mm D2 nominal), sized to the datasheet's own
+      terminal-to-exposed-pad `K = 0.20 mm` minimum against the pulled-in
+      peripheral pads — **not** the full nominal exposed-pad size. Verify
+      both against a real part/stencil before fab. Superseded
+      `ECC204-RBVCZ-T` / `ECC204_Contact-3_L6.5-W2.5-P2.00` — see
+      REFERENCES.md "Removed / Superseded Citations".
+  - [x] Final placement (all B.Cu): `U7` `(101.7, 93.4)`, `R10`
+        `(103.3, 92.4)`, `C5` `(103.0, 97.1)`. `C10` and `RS1` — moved by
+        the user to make room for the (now-abandoned) 3-Lead Contact part —
+        reverted to their original positions (`(103.7, 95.015, -90)` /
+        `(105.245002, 96.755, 90)`); the UDFN doesn't need that space.
+        **This answers the long-open "confirm the 10×12.5 mm board can
+        absorb the part" question: not the 3-Lead Contact package, but yes
+        for the UDFN, at this specific spot.**
+  - [x] `pcb drc --severity-all` driven from 148 induced violations (the
+        user's manual 3-Lead-Contact placement) down to **74 total / 27 new
+        vs. a clean in-place baseline**:
+    - **2 real residual conflicts, confirmed and root-caused** (`U7` pad 5
+      vs. `J4`'s `/POT` pad; `R10` pad 2 vs. `J4`'s `GND` pad).
+      **(BLOCKER for fab)** Needs either: further hand-nudging in the live
+      KiCad GUI, pads shrunk further, or an explicit, justified DRC
+      exclusion added via the GUI's right-click "Exclude this violation"
+      (the `.kicad_pro` already carries three such exclusions for `J4`'s
+      one-sided-TH quirk, added the same way — **do not hand-author a
+      `drc_exclusions` entry**; the hash format for `clearance`/
+      `shorting_items` findings isn't the same as the `padstack` ones
+      already there and guessing it risks a silently-inert exclusion).
+      Mathematically confirmed unavoidable at the current pad geometry:
+      `J4` has **three** real 1.8 mm pads (not the `size 0.1mm`/`0.9mm`-drill
+      values its `Pot_Wire_Pads` footprint declares — KiCad enforces a
+      larger effective copper size for manufacturability that the
+      footprint's own `size` field doesn't reveal) at `(104.51, 92.0)`,
+      `(103.06, 95.0)`, `(104.51, 98.0)`, confirmed via a live Gerber
+      export's `%TO.P,J4,n%` component-attribute comments next to the
+      exact `D03` flash coordinates. `U7` sits in the 3.5 mm gap between
+      the first two and needs ≈3.75 mm to clear both simultaneously.
+    - **18 `GND_POUR` zone-clearance findings — likely real, not stale.**
+      The same Gerber-based verification method used on `J4` was reapplied
+      to the zone: a freshly exported B.Cu Gerber's filled copper region
+      polygon (point-in-polygon tested against `U7`'s non-GND pad
+      coordinates) covers those pads with no relief cutout. This is
+      consistent with either a live-recomputed fill genuinely needing a
+      keepout there, or a stale stored fill — Gerber export **cannot
+      distinguish the two** (it may itself read the same stored
+      `filled_polygon` data DRC does; `kicad-cli` exposes no explicit
+      "recompute" step for either command). Treat as **likely real**
+      pending a live "Fill All Zones" (`B`) + re-DRC in the GUI, which is
+      the only way to settle it with certainty.
+    - **3 `lib_footprint_mismatch` warnings** — cosmetic; the hand-authored
+      footprint graphics are simplified vs. what a full library re-import
+      would produce.
+    - Zero other new violations (no shorting, no solder-mask-bridge, no
+      hole-clearance beyond the two `J4` items above).
+  - [x] **Root cause of the "phantom J4" confusion, found and fixed:** an
+        entire round of this session was spent unable to reconcile
+        DRC-reported `J4` pad coordinates with hand-computed positions,
+        eventually (wrongly) concluded to be a stale-zone-fill artifact.
+        The real cause: **the B.Cu vs. F.Cu pad-rotation formula used
+        earlier in this task was backwards.** Confirmed by cross-checking
+        against `%TO.P%` component-attribute comments in a live Gerber
+        export (unambiguous ground truth — the exact pad, exact
+        coordinate, direct from KiCad's own plotter): for a footprint
+        stored with rotation angle θ, the pad's true absolute offset is
+        `R(−θ)` applied to the local pad coordinate (`R` = standard CCW
+        rotation; local Y additionally negated first for a `B.Cu`
+        footprint) — **not** `R(+θ)` as assumed earlier. This is the
+        opposite sign convention from the schematic-symbol pin transform
+        (`[[feedback_kicad_hand_authoring]]`, unaffected/still correct);
+        recorded as a distinct rule in the new
+        `[[feedback_kicad_pcb_footprint_rotation]]` memory so the two are
+        never conflated again. DRC's reported `J4` positions were correct
+        the entire time.
+  - [x] **3D models added** so KiCad's 3D viewer shows real bodies for
+        `U7`/`R10`/`C5` instead of bare footprints. `R10`/`C5` reference
+        the standard KiCad library models already used by every other
+        0402 on this board (`${KICAD9_3DMODEL_DIR}/Resistor_SMD.3dshapes/
+        R_0402_1005Metric.step`, `.../Capacitor_SMD.3dshapes/
+        C_0402_1005Metric.step` — matching this board's existing
+        convention, not `KICAD10_3DMODEL_DIR`). `U7` has **no real vendor
+        model** (none published for this part) — built a generic proxy in
+        OpenSCAD from the same real [REF-SE-001] §6.1 dimensions the
+        footprint uses (2.00×3.00×0.55 mm body, pin-1 corner notch),
+        exported to STL (installed OpenSCAD is 2021.01 — no STEP export;
+        STL has no per-face color but KiCad renders it fine), stored at
+        `hardware/shared.3dshapes/ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50.stl`.
+        Model references added to both the library footprint file and the
+        three live PCB instances directly (a hand-authored PCB instance
+        does **not** inherit model references added later to its library
+        footprint — same lesson as the EP-pad-size fix earlier this
+        session: **PCB footprint instances carry their own full copy of
+        everything, always edit both**). Verified via `kicad-cli pcb
+        render` (basic quality, ~5 s): loads without error and DRC stays
+        at the same 74/9 after adding — headless visual confirmation that
+        the tiny (0.55 mm / sub-mm) bodies are actually visible in a
+        render was inconclusive at reachable resolution/framing; confirm
+        by eye in the KiCad 3D viewer.
+  - [ ] **Data-integrity note for future hand-edits:** a `re.sub` over a
+        UUID-anchored block, applied to add `(justify mirror)` to three
+        footprints' text, matched far more than intended and corrupted
+        `C10`/`RS1`'s position and rotation (and possibly other B.Cu
+        footprints' text properties) without any error — the file stayed
+        syntactically valid throughout, so the corruption was silent
+        (only DRC's fill count going from 74/27 to 96/55 gave it away).
+        Recovered by `git checkout --` the file (working-tree PCB changes
+        weren't yet committed) and rebuilding the three footprints fresh
+        with explicit, single-target string edits instead of a regex
+        sweep. **This repeated a second time** in this same session (the
+        user's own KiCad-GUI move of `RS1` desynced its per-pad/per-property
+        rotation suffix from its outer footprint rotation — KiCad's move
+        tool can flatten a footprint's individual sub-element angles
+        without touching the outer one) and was only caught because DRC's
+        finding count jumped; fixed by wholesale-replacing the whole
+        footprint block from `git show HEAD:...`, not by patching just the
+        outer `(at ...)` line. **Never use a broad regex substitution
+        across an extracted multi-footprint block for a "small" cosmetic
+        change; anchor every replacement to a single unique string, and
+        after any hand-edit to a rotated footprint, diff its *entire*
+        block against a known-good copy (not just the outer position
+        line) before trusting it — an outer/inner rotation mismatch
+        produces cascading, hard-to-trace DRC findings against completely
+        unrelated nearby components.**
   - [ ] **(BLOCKER)** `R10`'s value is `TBD` — no SWI pull-up value is given
         in [REF-SE-001] (the summary datasheet has no application-circuit
         section). Needs the NDA datasheet or a CryptoAuthLib reference design
         (ties to 7.4).
-  - [ ] **(BLOCKER)** `U7`/`R10`/`C5` are placed **off the board outline** (a
-        staging position in the `.kicad_pcb`, not a real layout) — the
-        original "confirm the 10 × 12.5 mm board can absorb the part" question
-        is **still open**. Placing the 6.5×2.5 mm 3-lead-contact part on a
-        board this size, clear of the H-bridge/motor pads and the SG90 case
-        keepout, needs to be done visually in the KiCad PCB editor, not blind.
   - [ ] Confirm the exact ordering-code/provisioning SKU per 7.1 before BOM
-        commitment; `U7`'s Value (`ECC204-RBVCZ-T`) is the plain/unprovisioned
+        commitment; `U7`'s Value (`ECC204-MAVCZ-T`) is the plain/unprovisioned
         device, explicitly flagged as such in its Description field.
+- [ ] **New, unrelated finding:** `osc-sg90-v006.kicad_pcb` has **two**
+      footprints both referenced `J4` (both `shared:Pot_Wire_Pads`) — one on
+      the real board at `(107.21, 95, -90)`, one sitting at
+      `(115.815, 85.51, 90)`, well outside the board outline (max X is
+      112.1). Pre-existing, not touched this session. Duplicate reference
+      designators are undefined behaviour for ERC/DRC net/pad attribution
+      (see the data-integrity note above — this may be *why* some DRC
+      output was hard to trace back to real geometry) and for any BOM/pick
+      -and-place export. Needs triage: is the off-board one a leftover
+      staging copy that should be deleted, or does the board actually need
+      a second Pot_Wire_Pads instance with a real reference?
 - [ ] Add an SE breakout path for `osc-dev-v006` bringup via the Qwiic
       connector (§0.3.2).
 - [ ] Re-run the EMC/ESD review with the SE net beside the H-bridge. SWI

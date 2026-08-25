@@ -76,20 +76,7 @@
           "width": 0.0
         }
       ],
-      "drc_exclusions": [
-        [
-          "padstack|102100000|95000000|d62d844b-ae8a-4933-a12f-831f1af00e5b|00000000-0000-0000-0000-000000000000",
-          "J4 is a one sided TH"
-        ],
-        [
-          "padstack|103500000|92460000|c1616f3f-b454-406c-9ce8-e37e84addb83|00000000-0000-0000-0000-000000000000",
-          "J4 is a one sided TH"
-        ],
-        [
-          "padstack|103500000|97540000|36b7b4d3-6734-4a31-91f6-bf09b8f160d1|00000000-0000-0000-0000-000000000000",
-          "J4 is a one sided TH"
-        ]
-      ],
+      "drc_exclusions": [],
       "meta": {
         "version": 2
       },

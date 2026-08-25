@@ -3085,14 +3085,14 @@
 			)
 			(embedded_fonts no)
 		)
-		(symbol "shared:ECC204-RBVCZ-T"
+		(symbol "shared:ECC204-MAVCZ-T"
 			(exclude_from_sim no)
 			(in_bom yes)
 			(on_board yes)
 			(in_pos_files yes)
 			(duplicate_pin_numbers_are_jumpers no)
 			(property "Reference" "U"
-				(at 0 8.89 0)
+				(at 0 9.525 0)
 				(show_name no)
 				(do_not_autoplace no)
 				(effects
@@ -3101,8 +3101,8 @@
 					)
 				)
 			)
-			(property "Value" "ECC204-RBVCZ-T"
-				(at 0 6.35 0)
+			(property "Value" "ECC204-MAVCZ-T"
+				(at 0 -8.255 0)
 				(show_name no)
 				(do_not_autoplace no)
 				(effects
@@ -3111,8 +3111,8 @@
 					)
 				)
 			)
-			(property "Footprint" "shared:ECC204_Contact-3_L6.5-W2.5-P2.00"
-				(at 0 -10.16 0)
+			(property "Footprint" "shared:ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm"
+				(at 0 -11.43 0)
 				(show_name no)
 				(do_not_autoplace no)
 				(hide yes)
@@ -3123,7 +3123,7 @@
 				)
 			)
 			(property "Datasheet" "https://ww1.microchip.com/downloads/aemDocuments/documents/SCBU/ProductDocuments/DataSheets/ECC204-CryptoAuthentication-Summary-Data-Sheet-DS40002436.pdf"
-				(at 0 -12.7 0)
+				(at 0 -13.97 0)
 				(show_name no)
 				(do_not_autoplace no)
 				(hide yes)
@@ -3133,7 +3133,7 @@
 					)
 				)
 			)
-			(property "Description" "Microchip ECC204 CryptoAuthentication secure element -- ECDSA P-256 sign, SHA-256/HMAC, single symmetric key slot; 3-Lead Contact package, 100 kbps PWM Single-Wire Interface (SWI). [REF-SE-001] Sec. 7 Product Identification System; ordering-code example ECC204-RBVCZ-T verbatim from that section. NOT yet confirmed as the fleet-provisioning SKU -- TrustFLEX vs. TrustCUSTOM decision open, see TODO.md Sec. 7.1/7.5."
+			(property "Description" "Microchip ECC204 CryptoAuthentication secure element -- ECDSA P-256 sign, SHA-256/HMAC, single symmetric key slot; 8-Pad UDFN (2x3mm) package, 100 kbps PWM Single-Wire Interface (SWI). [REF-SE-001] Table 1/Fig. 1 (pinout), Sec. 6.1 (mechanical), Sec. 7 (ordering code ECC204-MAVCZ-T, verbatim worked example). Superseded the 3-Lead Contact package (ECC204-RBVCZ-T) -- that footprint does not fit anywhere on osc-sg90-v006's fully-routed B/F.Cu without displacing existing copper; see REFERENCES.md Removed/Superseded Citations and TODO.md Sec. 7.1/7.8. NOT yet confirmed as the fleet-provisioning SKU -- TrustFLEX vs. TrustCUSTOM decision open, see TODO.md Sec. 7.1/7.5."
 				(at 0 0 0)
 				(show_name no)
 				(do_not_autoplace no)
@@ -3144,10 +3144,10 @@
 					)
 				)
 			)
-			(symbol "ECC204-RBVCZ-T_0_1"
+			(symbol "ECC204-MAVCZ-T_0_1"
 				(rectangle
-					(start -7.62 5.08)
-					(end 7.62 -5.08)
+					(start -12.7 6.35)
+					(end 12.7 -6.35)
 					(stroke
 						(width 0)
 						(type default)
@@ -3157,11 +3157,11 @@
 					)
 				)
 			)
-			(symbol "ECC204-RBVCZ-T_1_1"
-				(pin bidirectional line
-					(at -10.16 0 0)
+			(symbol "ECC204-MAVCZ-T_1_1"
+				(pin no_connect line
+					(at -15.24 3.81 0)
 					(length 2.54)
-					(name "SI/O"
+					(name "NC"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -3176,10 +3176,10 @@
 						)
 					)
 				)
-				(pin power_in line
-					(at 0 -7.62 90)
+				(pin no_connect line
+					(at -15.24 1.27 0)
 					(length 2.54)
-					(name "GND"
+					(name "NC"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -3194,8 +3194,98 @@
 						)
 					)
 				)
+				(pin no_connect line
+					(at -15.24 -1.27 0)
+					(length 2.54)
+					(name "NC"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "3"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
 				(pin power_in line
-					(at 10.16 0 180)
+					(at -15.24 -3.81 0)
+					(length 2.54)
+					(name "GND"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "4"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin bidirectional line
+					(at 15.24 -3.81 180)
+					(length 2.54)
+					(name "SI/O"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "5"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin no_connect line
+					(at 15.24 -1.27 180)
+					(length 2.54)
+					(name "NC"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "6"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin no_connect line
+					(at 15.24 1.27 180)
+					(length 2.54)
+					(name "NC"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "7"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin power_in line
+					(at 15.24 3.81 180)
 					(length 2.54)
 					(name "VCC"
 						(effects
@@ -3204,7 +3294,25 @@
 							)
 						)
 					)
-					(number "3"
+					(number "8"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin power_in line
+					(at 0 8.89 270)
+					(length 2.54)
+					(name "EP"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "9"
 						(effects
 							(font
 								(size 1.27 1.27)
@@ -11248,18 +11356,18 @@
 	)
 	(text "SECURE ELEMENT"
 		(exclude_from_sim no)
-		(at 20.32 138.11 0)
+		(at 20.32 190.5 0)
 		(effects
 			(font
 				(size 2 2)
 				(thickness 0.25)
 			)
 		)
-		(uuid "6d6721af-d8ec-4876-afa8-7102782bd241")
+		(uuid "0e5ff689-c750-43b0-a176-502388b42690")
 	)
 	(symbol
-		(lib_id "shared:ECC204-RBVCZ-T")
-		(at 30.48 170.18 0)
+		(lib_id "shared:ECC204-MAVCZ-T")
+		(at 45.72 200.66 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11267,9 +11375,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "26d14ec9-b03a-43de-9b9c-482778de75db")
+		(uuid "6b621ccd-2f42-4be1-accb-c41c9f56c712")
 		(property "Reference" "U7"
-			(at 30.48 158.79 0)
+			(at 45.72 189.23 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11278,8 +11386,8 @@
 				)
 			)
 		)
-		(property "Value" "ECC204-RBVCZ-T"
-			(at 30.48 161.33 0)
+		(property "Value" "ECC204-MAVCZ-T"
+			(at 45.72 209.42 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11288,8 +11396,8 @@
 				)
 			)
 		)
-		(property "Footprint" "shared:ECC204_Contact-3_L6.5-W2.5-P2.00"
-			(at 30.48 179.34 0)
+		(property "Footprint" "shared:ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm"
+			(at 45.72 212.09 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11300,7 +11408,7 @@
 			)
 		)
 		(property "Datasheet" "https://ww1.microchip.com/downloads/aemDocuments/documents/SCBU/ProductDocuments/DataSheets/ECC204-CryptoAuthentication-Summary-Data-Sheet-DS40002436.pdf"
-			(at 30.48 170.18 0)
+			(at 45.72 200.66 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11310,8 +11418,8 @@
 				)
 			)
 		)
-		(property "Description" "Microchip ECC204 secure element, 3-Lead Contact, SWI [REF-SE-001]. Fleet provisioning SKU (TrustFLEX vs TrustCUSTOM) not yet decided -- TODO.md Sec. 7.1/7.5."
-			(at 30.48 170.18 0)
+		(property "Description" "Microchip ECC204 secure element, 8-Pad UDFN (2x3mm), SWI [REF-SE-001]. Superseded the 3-Lead Contact package -- didn't fit osc-sg90-v006's routed copper. Fleet provisioning SKU (TrustFLEX vs TrustCUSTOM) not yet decided -- TODO.md Sec. 7.1/7.5."
+			(at 45.72 200.66 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11322,13 +11430,31 @@
 			)
 		)
 		(pin "1"
-			(uuid "f7c671d9-6478-4328-ac21-25fe98a2daa2")
+			(uuid "1e011472-8801-4e38-847b-de4c044692fb")
 		)
 		(pin "2"
-			(uuid "9ec5f411-fb87-499e-8b4f-9d01d65c2961")
+			(uuid "5c79af72-72fe-4177-bd9d-7b836868a7ba")
 		)
 		(pin "3"
-			(uuid "8448a051-a3d2-486b-a305-1466d86841d7")
+			(uuid "42ffabc5-8ca3-4b04-8a70-89eea98e7e71")
+		)
+		(pin "4"
+			(uuid "86320cbe-38dc-461b-8ceb-288dc91277e4")
+		)
+		(pin "5"
+			(uuid "703f72eb-73d2-4f5a-be14-32f6435b7b56")
+		)
+		(pin "6"
+			(uuid "9c5b3cf7-f6de-449c-ac17-c059f5fcd2bf")
+		)
+		(pin "7"
+			(uuid "9f3993ab-a032-41e8-9d4e-437816ab99c9")
+		)
+		(pin "8"
+			(uuid "af936094-73cc-42e4-bf3b-fb26fdadbed6")
+		)
+		(pin "9"
+			(uuid "640cd103-41c7-4e4e-8af1-b62fe8758275")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11341,7 +11467,7 @@
 	)
 	(symbol
 		(lib_id "Device:R")
-		(at 20.32 154.94 0)
+		(at 73.66 195.58 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11349,9 +11475,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "cd1685a3-d7bc-42d3-b697-9c0a9e91cfb4")
+		(uuid "250184e6-969e-44cc-97c4-f7bbcd83b327")
 		(property "Reference" "R10"
-			(at 23.086 154.94 0)
+			(at 76.454 195.58 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11361,7 +11487,7 @@
 			)
 		)
 		(property "Value" "TBD"
-			(at 23.34 154.94 90)
+			(at 76.708 195.58 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11371,7 +11497,7 @@
 			)
 		)
 		(property "Footprint" "Resistor_SMD:R_0402_1005Metric"
-			(at 19.022 154.94 90)
+			(at 72.39 195.58 90)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11382,7 +11508,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 20.32 154.94 0)
+			(at 73.66 195.58 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11393,7 +11519,7 @@
 			)
 		)
 		(property "Description" "SWI pull-up for U7 (ECC204 secure element); value TBD -- no vetted SWI pull-up spec in REF-SE-001, see TODO.md Sec. 7.4"
-			(at 20.32 154.94 0)
+			(at 73.66 195.58 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11404,10 +11530,10 @@
 			)
 		)
 		(pin "1"
-			(uuid "64442db4-64e2-4af2-b5bf-9d93563d090a")
+			(uuid "1d786f53-e921-4197-9218-06f50f3612a0")
 		)
 		(pin "2"
-			(uuid "f26cae7e-ebd6-4950-bbe9-ef0be0bd02c4")
+			(uuid "efbbfbf7-a273-49a2-8fa0-3c852b393647")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11420,7 +11546,7 @@
 	)
 	(symbol
 		(lib_id "Device:C")
-		(at 40.64 160.02 0)
+		(at 86.36 203.2 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11428,9 +11554,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "3095b271-6b76-4695-913b-03c461da07d5")
+		(uuid "b9d37b4f-ed16-4a78-85fa-5c26f67a4ef9")
 		(property "Reference" "C5"
-			(at 43.406 157.48 0)
+			(at 89.126 200.66 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11440,7 +11566,7 @@
 			)
 		)
 		(property "Value" "0.1µF"
-			(at 43.406 162.56 0)
+			(at 89.126 205.74 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11450,7 +11576,7 @@
 			)
 		)
 		(property "Footprint" "Capacitor_SMD:C_0402_1005Metric"
-			(at 53.82 142.956 0)
+			(at 99.54 186.156 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11461,7 +11587,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 40.64 160.02 0)
+			(at 86.36 203.2 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11472,7 +11598,7 @@
 			)
 		)
 		(property "Description" "VCC decoupling for U7 (ECC204 secure element); 0.1uF is standard MLCC bypass practice, not an REF-SE-001-specific value"
-			(at 40.64 160.02 0)
+			(at 86.36 203.2 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11483,10 +11609,10 @@
 			)
 		)
 		(pin "1"
-			(uuid "10c24cf2-8ed7-45c6-85b2-6680d520f5ea")
+			(uuid "ec588ded-60e2-4824-8e51-ae987310e5be")
 		)
 		(pin "2"
-			(uuid "e885994b-8a8d-492c-a145-e2a6264c7cce")
+			(uuid "e79eb717-e180-4274-8af2-e068336260ff")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11499,7 +11625,7 @@
 	)
 	(symbol
 		(lib_id "power:+3.3V")
-		(at 40.64 170.18 180)
+		(at 60.96 196.85 180)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11507,9 +11633,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "7000981d-8aa1-482b-bef2-174713c79490")
+		(uuid "0cb76e64-25ea-4343-b69e-7be5fec6dcc4")
 		(property "Reference" "#PWR0132"
-			(at 40.64 166.37 0)
+			(at 60.96 193.04 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11520,7 +11646,7 @@
 			)
 		)
 		(property "Value" "+3V3"
-			(at 40.64 173.73600000000002 0)
+			(at 60.96 200.406 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11530,7 +11656,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 40.64 170.18 0)
+			(at 60.96 196.85 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11541,7 +11667,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 40.64 170.18 0)
+			(at 60.96 196.85 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11552,7 +11678,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"+3V3\""
-			(at 40.64 170.18 0)
+			(at 60.96 196.85 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11563,7 +11689,7 @@
 			)
 		)
 		(pin "1"
-			(uuid "8591423e-9cac-49af-89d9-e2f3afaef57e")
+			(uuid "278661b7-3d20-480f-a817-717cc6dc8ced")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11576,7 +11702,7 @@
 	)
 	(symbol
 		(lib_id "power:GND")
-		(at 30.48 177.8 0)
+		(at 30.48 204.47 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11584,9 +11710,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "c835952e-a797-45c2-8550-81904360f16c")
+		(uuid "b3509e01-2733-4ea7-8e47-ab9b2e55bc6a")
 		(property "Reference" "#PWR0133"
-			(at 30.48 184.15 0)
+			(at 30.48 210.82 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11597,7 +11723,7 @@
 			)
 		)
 		(property "Value" "GND"
-			(at 30.48 182.88000000000002 0)
+			(at 30.48 209.55 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11607,7 +11733,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 30.48 177.8 0)
+			(at 30.48 204.47 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11618,7 +11744,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 30.48 177.8 0)
+			(at 30.48 204.47 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11629,7 +11755,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
-			(at 30.48 177.8 0)
+			(at 30.48 204.47 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11640,7 +11766,7 @@
 			)
 		)
 		(pin "1"
-			(uuid "730682f5-8aef-4b54-8a77-22a388f42334")
+			(uuid "ce663d77-853b-414d-a81d-39b232c0a1eb")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11652,8 +11778,8 @@
 		)
 	)
 	(symbol
-		(lib_id "power:+3.3V")
-		(at 20.32 151.13 180)
+		(lib_id "power:GND")
+		(at 45.72 191.77 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11661,9 +11787,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "d9253792-9e62-4330-ad8e-31dd8eaae989")
-		(property "Reference" "#PWR0134"
-			(at 20.32 147.32 0)
+		(uuid "837617a7-cbc5-4f4d-93a0-bef8d826ca8e")
+		(property "Reference" "#PWR0137"
+			(at 45.72 198.12 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11673,8 +11799,8 @@
 				)
 			)
 		)
-		(property "Value" "+3V3"
-			(at 20.32 154.686 0)
+		(property "Value" "GND"
+			(at 45.72 196.85000000000002 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11684,7 +11810,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 20.32 151.13 0)
+			(at 45.72 191.77 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11695,7 +11821,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 20.32 151.13 0)
+			(at 45.72 191.77 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11705,8 +11831,8 @@
 				)
 			)
 		)
-		(property "Description" "Power symbol creates a global label with name \"+3V3\""
-			(at 20.32 151.13 0)
+		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
+			(at 45.72 191.77 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11717,7 +11843,84 @@
 			)
 		)
 		(pin "1"
-			(uuid "e638be9d-6ed0-4e80-a86e-485b519fa026")
+			(uuid "71dfe958-2aba-418d-9d83-ad0afecfa3ba")
+		)
+		(instances
+			(project "osc-sg90-v006"
+				(path "/6062e7d2-0c72-467e-b49c-6387ba053e09"
+					(reference "#PWR0137")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:+3.3V")
+		(at 73.66 191.77 180)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "67a0e62d-4f15-48d6-9629-64c1dae8b521")
+		(property "Reference" "#PWR0134"
+			(at 73.66 187.96 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "+3V3"
+			(at 73.66 195.32600000000002 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 73.66 191.77 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 73.66 191.77 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"+3V3\""
+			(at 73.66 191.77 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "0dcb88ff-047a-4dc6-922a-d9490328769e")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11730,7 +11933,7 @@
 	)
 	(symbol
 		(lib_id "power:+3.3V")
-		(at 40.64 156.21 180)
+		(at 86.36 199.39 180)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11738,9 +11941,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "e071b8dc-218d-4037-9cb4-99d992957a67")
+		(uuid "6ddbfc54-8750-4277-bb01-a01391b4e05c")
 		(property "Reference" "#PWR0135"
-			(at 40.64 152.4 0)
+			(at 86.36 195.57999999999998 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11751,7 +11954,7 @@
 			)
 		)
 		(property "Value" "+3V3"
-			(at 40.64 159.76600000000002 0)
+			(at 86.36 202.946 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11761,7 +11964,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 40.64 156.21 0)
+			(at 86.36 199.39 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11772,7 +11975,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 40.64 156.21 0)
+			(at 86.36 199.39 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11783,7 +11986,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"+3V3\""
-			(at 40.64 156.21 0)
+			(at 86.36 199.39 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11794,7 +11997,7 @@
 			)
 		)
 		(pin "1"
-			(uuid "2e78f387-54dd-4422-b267-be751f5fa01d")
+			(uuid "51eef42e-ade5-4184-a61b-a121b405b756")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11807,7 +12010,7 @@
 	)
 	(symbol
 		(lib_id "power:GND")
-		(at 40.64 163.83 0)
+		(at 86.36 207.01 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -11815,9 +12018,9 @@
 		(on_board yes)
 		(in_pos_files yes)
 		(dnp no)
-		(uuid "42d4d33c-44aa-4a3a-83c9-fb11e0f4348e")
+		(uuid "30ed1eed-5c34-444b-aa1a-345d127f0973")
 		(property "Reference" "#PWR0136"
-			(at 40.64 170.18 0)
+			(at 86.36 213.35999999999999 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11828,7 +12031,7 @@
 			)
 		)
 		(property "Value" "GND"
-			(at 40.64 168.91000000000003 0)
+			(at 86.36 212.09 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -11838,7 +12041,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 40.64 163.83 0)
+			(at 86.36 207.01 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11849,7 +12052,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 40.64 163.83 0)
+			(at 86.36 207.01 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11860,7 +12063,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
-			(at 40.64 163.83 0)
+			(at 86.36 207.01 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -11871,7 +12074,7 @@
 			)
 		)
 		(pin "1"
-			(uuid "db51c26e-d972-45da-91d5-3915a719e825")
+			(uuid "bf905b2b-9e30-4d6b-a966-a1a3a453e1dd")
 		)
 		(instances
 			(project "osc-sg90-v006"
@@ -11883,24 +12086,24 @@
 		)
 	)
 	(label "SE_SWIO"
-		(at 20.32 170.18 180)
+		(at 60.96 204.47 180)
 		(effects
 			(font
 				(size 1.27 1.27)
 			)
 			(justify right bottom)
 		)
-		(uuid "aa7ee60c-6a20-4f0e-9000-7b10aff579b5")
+		(uuid "26ffdf5d-955e-4c1a-a03c-dad159580ab7")
 	)
 	(label "SE_SWIO"
-		(at 20.32 158.75 90)
+		(at 73.66 199.39 90)
 		(effects
 			(font
 				(size 1.27 1.27)
 			)
 			(justify left bottom)
 		)
-		(uuid "a7f67367-71c4-4c8c-8d9f-c4ee06ca5b81")
+		(uuid "ce9b5cb3-5eb5-43b6-a26d-394be9b7b919")
 	)
 	(label "SE_SWIO"
 		(at 219.71 125.73 90)
@@ -11910,7 +12113,7 @@
 			)
 			(justify left bottom)
 		)
-		(uuid "2ce6a8c1-238d-4f81-a85c-7acbd970b9eb")
+		(uuid "57c49768-aebb-4d00-bef5-dbe75e0afb35")
 	)
 	(sheet_instances
 		(path "/"
