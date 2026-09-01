@@ -9,13 +9,18 @@ unplated -- and the board outline [REF-FAB-001].  That is stricter than the
 small it is the constraint that actually decides how close a via may sit to the
 edge.
 
-KiCad cannot express it.  Its ``edge_clearance`` constraint measures copper,
-not holes, and its ``physical_hole_clearance`` constraint only evaluates
-hole-against-item pairs -- board outline graphics are not among the items it
-considers.  This was verified against ``kicad-cli`` 10.0.3 by running
-``physical_hole_clearance`` unconditioned (199 violations reported) and then
-conditioned on ``B.Layer == 'Edge.Cuts'`` (0 violations reported, at a
-deliberately absurd 3.00 mm minimum).  The check is therefore done here.
+KiCad *can* express it, as ``physical_hole_clearance`` conditioned on
+``B.Layer == 'Edge.Cuts'``, and ``osc-sg90-v006.kicad_dru`` carries that rule.
+This script is the independent cross-check on it, for two reasons.  First, a
+``.kicad_dru`` fails silently: a single ``;`` anywhere in the file stops every
+rule firing with no diagnostic, so a clean DRC run is not by itself evidence
+that the rule ran.  Second, this runs anywhere -- it parses the board file
+directly and needs no ``pcbnew`` binding or KiCad install, so it works as a CI
+gate.
+
+The two agree on this board.  They differ by 0.025 mm, half the Edge.Cuts
+stroke width, because KiCad measures to the near edge of the outline graphic
+and this measures to its centreline; KiCad's reading is the conservative one.
 
 Usage
 -----

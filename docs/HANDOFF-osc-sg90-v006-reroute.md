@@ -29,8 +29,8 @@ picked without a source.
 | DRC warnings | 7 | 7 |
 
 **All 9 remaining errors are placement defects that predate the route** (§5).
-The route closed 24 connections and introduced no violations. Verified with
-`kicad-cli` 10.0.3 and with `hardware/tools/check_hole_to_edge.py`.
+The route closed 24 connections and introduced no violations. Verified with `kicad-cli` 10.0.3 and with
+`hardware/tools/check_hole_to_edge.py`.
 
 Backup of the pre-session board:
 `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_pcb.pre-reroute-20260829-2306.bak`
@@ -63,22 +63,44 @@ Two consistency defects were fixed along the way:
   constraint that actually decides how close a via may sit (0.65 mm to via
   centre, for this board's 0.55/0.30 mm via).
 
-### 3.1 Why the hole rule is not a KiCad rule
+### 3.1 The hole rule, and a correction
 
-**KiCad cannot express hole-to-board-edge.** `edge_clearance` measures copper,
-not holes. `physical_hole_clearance` evaluates hole-against-item pairs and does
-not consider `Edge.Cuts` graphics. Demonstrated against `kicad-cli` 10.0.3
-rather than assumed:
+**Corrected 2026-08-31.** This document originally stated that KiCad could not
+express hole-to-board-edge. That was wrong, and how it went wrong is the more
+useful lesson.
 
-| Rule under test | Violations reported |
-| --------------- | ------------------- |
-| `physical_hole_clearance (min 3.00mm)`, unconditioned | 199 |
-| same, `(condition "B.Layer == 'Edge.Cuts'")` | **0** |
+`physical_hole_clearance` conditioned on `B.Layer == 'Edge.Cuts'` expresses the
+rule correctly, and `osc-sg90-v006.kicad_dru` now carries it. It caught a
+hand-routed `PGND` via at 0.40 mm from the outline the moment it was enabled.
 
-A rule that silently does nothing is worse than no rule, so the `.kicad_dru`
-carries a comment explaining this in place of a dead rule, and the constraint
-is enforced by `hardware/tools/check_hole_to_edge.py`. It currently passes
-(10 holes, all clear of 0.50 mm). Run it before any fabrication release.
+The original test appeared to show the condition matching nothing — 199
+violations unconditioned, 0 conditioned. Both runs were real, but the
+conditioned one was run against a `.kicad_dru` that contained `;` comments, and
+**a single `;` anywhere in a `.kicad_dru` makes the whole file fail to parse,
+silently.** Every rule stops firing; DRC reports nothing to say so. The 0 was
+the comments, not the condition.
+
+| Rule under test | `;` in file | Violations |
+| --------------- | ----------- | ---------- |
+| `physical_hole_clearance (min 3.00mm)`, unconditioned | no | 199 |
+| same | yes | 0 |
+| same + `(condition "B.Layer == 'Edge.Cuts'")` | no | **20** |
+| same | yes | 0 |
+
+`#` and `( comment 1 "text" )` blocks fail the same way: the grammar accepts
+`(version)` and `(rule)` at top level and nothing else, so a `.kicad_dru`
+admits no comments in any form. Its commentary lives in
+`hardware/boards/osc-sg90-v006/README2.md`; the prohibition is now in
+`AGENTS.md` §Coding standards.
+
+**After editing any `.kicad_dru`, prove the rules still fire** — raise a
+minimum to an absurd value and check the violation count moves. A clean DRC run
+is not evidence of a clean board; it may mean no rules ran. That is also why
+`hardware/tools/check_hole_to_edge.py` is kept as an independent second
+implementation and CI gate rather than retired: it parses the board directly,
+needs no KiCad, and cannot be silently disabled by a stray character. The two
+agree on this board to within 0.025 mm — half the Edge.Cuts stroke width,
+KiCad measuring to the graphic's near edge and the script to its centreline.
 
 ## 4. `J4` — the reason the board will not auto-route **(read this first)**
 

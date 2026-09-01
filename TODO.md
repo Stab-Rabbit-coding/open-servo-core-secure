@@ -370,14 +370,27 @@ All work by Claude Opus 5 (Anthropic), on the user's instruction.
       0.30 mm is 1.5× the DFM gate. Set in both the `.kicad_dru` custom rule and
       `min_copper_edge_clearance` in the `.kicad_pro`, which were previously
       inconsistent with each other.
-- [x] **Hole-to-outline (0.50 mm, [REF-FAB-001]) cannot be expressed in KiCad.**
-      `edge_clearance` measures copper, not holes; `physical_hole_clearance`
-      only evaluates hole-against-item pairs and ignores `Edge.Cuts` graphics.
-      Demonstrated against `kicad-cli` 10.0.3: the constraint unconditioned
-      reports 199 violations, and conditioned on `B.Layer == 'Edge.Cuts'` at a
-      deliberately absurd 3.00 mm minimum reports 0. Enforced instead by
-      `hardware/tools/check_hole_to_edge.py`, which currently passes
-      (8 holes, all clear of 0.50 mm).
+- [x] **Hole-to-outline (0.50 mm, [REF-FAB-001]) is enforced by a DRC rule.**
+      `physical_hole_clearance` conditioned on `B.Layer == 'Edge.Cuts'`, in the
+      `.kicad_dru`. It immediately caught a hand-routed `PGND` via sitting
+      0.40 mm from the outline.
+- [x] **Corrected on 2026-08-31 — an earlier session recorded that KiCad could
+      not express this rule. That was wrong, and the reason matters.** The test
+      that "proved" it was run against a `.kicad_dru` containing `;` comments,
+      and **a single `;` anywhere in a `.kicad_dru` makes the whole file fail to
+      parse, silently** — every rule stops firing and DRC says nothing. The
+      0 violations attributed to the `Edge.Cuts` condition were the comments
+      killing the file. Re-tested comment-free: the same rule reports 20
+      violations at a 3.00 mm minimum. `#` and `( comment 1 "text" )` blocks
+      fail identically; the grammar takes `(version)` and `(rule)` and nothing
+      else. Found by `Stab-Rabbit-coding`, characterised and written up into
+      `AGENTS.md` §Coding standards and the board's `README2.md`.
+- [x] Cross-checked against `hardware/tools/check_hole_to_edge.py`, which now
+      serves as the independent second implementation and the CI gate (it needs
+      no KiCad install, and a `.kicad_dru` cannot be trusted to have run). The
+      two agree at every threshold tested, differing by 0.025 mm — half the
+      Edge.Cuts stroke width, KiCad measuring to the graphic's near edge and
+      the script to its centreline.
 - [ ] Re-verify [REF-FAB-001] if the board moves to another fabricator; the
       0.20/0.25/0.50 mm figures are PCBWay's capability, not a consensus
       standard.

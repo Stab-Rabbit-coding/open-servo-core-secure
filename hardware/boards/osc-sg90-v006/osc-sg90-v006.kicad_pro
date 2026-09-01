@@ -636,6 +636,10 @@
       {
         "netclass": "DIGITAL",
         "pattern": "/TX|/RX|/TX_EN|/DATA|/EN|/IN(1|2)|/SWDIO|/nRST|SE_SWIO"
+      },
+      {
+        "netclass": "Default",
+        "pattern": "/PGND"
       }
     ]
   },

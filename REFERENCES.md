@@ -287,10 +287,14 @@ verification*, and a `TODO.md` item is opened against it.
     line, 1.0mm spacing from hole to edge is required."** The 0.5 mm figure is
     stricter than the copper rule and is what actually limits how close a via
     may sit to the edge: for this board's 0.55/0.30 mm via it puts the via
-    centre 0.65 mm inboard. KiCad cannot express this constraint (see
-    `hardware/tools/check_hole_to_edge.py` for the empirical demonstration and
-    the substitute check).
-- **Cited from:** `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_dru`;
+    centre 0.65 mm inboard. Enforced as a `physical_hole_clearance` rule
+    conditioned on `B.Layer == 'Edge.Cuts'` in the board's `.kicad_dru`, and
+    cross-checked independently by `hardware/tools/check_hole_to_edge.py`.
+    Note also **"For panel made via v-scoring line, 1.0mm spacing from hole to
+    edge is required"** — the 0.50 mm figure assumes CNC routing.
+- **Cited from:** `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_dru`
+  (via `hardware/boards/osc-sg90-v006/README2.md`, since a `.kicad_dru` cannot
+  hold comments — see `AGENTS.md` §Coding standards);
   `hardware/tools/check_hole_to_edge.py`
 - **Status:** vendor capability document, not a consensus standard. It governs
   because it is the accepting fabricator's stated limit; if the board is moved
@@ -314,6 +318,7 @@ verification*, and a `TODO.md` item is opened against it.
     board-edge spacing** — REF-FAB-001 is. Recorded here so the reasoning is
     auditable rather than assumed.
 - **Cited from:** `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_dru`
+  (via `hardware/boards/osc-sg90-v006/README2.md`)
 - **Status:** *requires verification* — the standard is paywalled and has not
   been read directly. The Table 6-1 values quoted above were taken from
   secondary summaries of the table, not from the issued document. This does not
