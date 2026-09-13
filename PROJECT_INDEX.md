@@ -20,7 +20,7 @@ their contents are reproducible from the sources beside them.
 | `firmware/host-ch32/` | CH32V203 host/adapter runtime |
 | `firmware/boards/` | Per-board entry points and memory maps |
 | `firmware-old/` | Superseded v1 firmware, retained for reference |
-| `hardware/` | KiCad projects: dev board, SG90 swap board, encoder board, motor mount |
+| `hardware/` | KiCad projects: dev board, SG90 swap board, encoder board, motor mount; `tools/` holds board checks KiCad's DRC cannot express |
 | `mechanical/` | Enclosures and fixtures |
 | `client/` | Host-side Rust client library and examples |
 | `tools/`, `scripts/` | Build and bringup tooling |
@@ -68,6 +68,7 @@ open-servo-core-secure/
 │   ├── sg90-clones/  *(2 generated files, not enumerated)*
 │   ├── 3-Lead-Contact-Package-Usage-DS00004041.pdf
 │   ├── ECC204-CryptoAuthentication-Summary-Data-Sheet-DS40002436.pdf
+│   ├── HANDOFF-osc-sg90-v006-reroute.md
 │   ├── Security-Exchange-Process-for-TrustFLEX-and-TrustCUSTOM-Provisioning-DS50004144.pdf
 │   ├── SecurityElement.md
 │   ├── Trust-Platform-Manifest-File-Full-Format-DS60001759.pdf
@@ -752,6 +753,7 @@ open-servo-core-secure/
 │   │   │   └── sym-lib-table
 │   │   ├── osc-sg90-v006/
 │   │   │   ├── README.md
+│   │   │   ├── README2.md
 │   │   │   ├── fp-lib-table
 │   │   │   ├── osc-sg90-v006.kicad_dru
 │   │   │   ├── osc-sg90-v006.kicad_pcb
@@ -768,6 +770,9 @@ open-servo-core-secure/
 │   │       └── sym-lib-table
 │   ├── shared.3dshapes/  *(70 generated files, not enumerated)*
 │   ├── shared.pretty/  *(39 generated + `ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm.kicad_mod` hand-authored from REF-SE-001 §6.1, not individually enumerated)*
+│   ├── tools/
+│   │   ├── check_hole_to_edge.py
+│   │   └── prune_routing_conflicts.py
 │   ├── templates/
 │   │   └── jlc4l_1v6mm/
 │   │       ├── meta/

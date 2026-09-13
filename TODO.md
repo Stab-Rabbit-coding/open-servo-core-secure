@@ -349,6 +349,164 @@ convention is that timing facts are silicon-measured ([F1]–[F15]).
 
 ---
 
+## 10. PCB routing and DFM — `osc-sg90-v006`
+
+Opened 2026-08-30 after a full re-route of the board following the user's
+manual placement pass. Toolchain: KiCad 10.0.3 AppImage (`kicad-cli`, `pcbnew`
+Python) + FreeRouting 2.2.4 (`freerouting-executable.jar`, headless). The
+system KiCad is 9.0.2 and cannot load this board at all — see §7.8.
+All work by Claude Opus 5 (Anthropic), on the user's instruction.
+
+### 10.1 Board-edge clearance — verified against standards
+
+- [x] **Copper-to-outline set to 0.30 mm** (was 0.40 mm, an unsourced value).
+      Derivation, recorded in `osc-sg90-v006.kicad_dru` and cited to
+      `REFERENCES.md`: the electrical requirement is *not* binding — at this
+      board's 8.4 V maximum working voltage, IPC-2221B Table 6-1
+      (external, uncoated, below 3050 m) asks 0.10 mm [REF-STD-007], which the
+      global 0.10 mm copper-clearance rule already meets. The binding number is
+      the fabricator's routing tolerance: PCBWay rejects artwork below 0.20 mm
+      and quotes 0.25 mm for the normal CNC-routing process [REF-FAB-001].
+      0.30 mm is 1.5× the DFM gate. Set in both the `.kicad_dru` custom rule and
+      `min_copper_edge_clearance` in the `.kicad_pro`, which were previously
+      inconsistent with each other.
+- [x] **Hole-to-outline (0.50 mm, [REF-FAB-001]) is enforced by a DRC rule.**
+      `physical_hole_clearance` conditioned on `B.Layer == 'Edge.Cuts'`, in the
+      `.kicad_dru`. It immediately caught a hand-routed `PGND` via sitting
+      0.40 mm from the outline.
+- [x] **Corrected on 2026-08-31 — an earlier session recorded that KiCad could
+      not express this rule. That was wrong, and the reason matters.** The test
+      that "proved" it was run against a `.kicad_dru` containing `;` comments,
+      and **a single `;` anywhere in a `.kicad_dru` makes the whole file fail to
+      parse, silently** — every rule stops firing and DRC says nothing. The
+      0 violations attributed to the `Edge.Cuts` condition were the comments
+      killing the file. Re-tested comment-free: the same rule reports 20
+      violations at a 3.00 mm minimum. `#` and `( comment 1 "text" )` blocks
+      fail identically; the grammar takes `(version)` and `(rule)` and nothing
+      else. Found by `Stab-Rabbit-coding`, characterised and written up into
+      `AGENTS.md` §Coding standards and the board's `README2.md`.
+- [x] Cross-checked against `hardware/tools/check_hole_to_edge.py`, which now
+      serves as the independent second implementation and the CI gate (it needs
+      no KiCad install, and a `.kicad_dru` cannot be trusted to have run). The
+      two agree at every threshold tested, differing by 0.025 mm — half the
+      Edge.Cuts stroke width, KiCad measuring to the graphic's near edge and
+      the script to its centreline.
+- [ ] Re-verify [REF-FAB-001] if the board moves to another fabricator; the
+      0.20/0.25/0.50 mm figures are PCBWay's capability, not a consensus
+      standard.
+- [ ] [REF-STD-007] is marked *requires verification*: IPC-2221B is paywalled
+      and the Table 6-1 values were taken from secondary summaries. Also
+      superseded by IPC-2221C (Dec 2023), unchecked. Not load-bearing — the
+      applied clearances exceed the quoted values by 1.27× to 2×.
+
+### 10.2 `J4` `Pot_Wire_Pads` — invisible to the router **(BLOCKER for a clean route)**
+
+- [ ] **The three pot wire pads use a KiCad 10 per-layer padstack:** a 0.1 mm
+      token pad on F.Cu inside a 0.9 mm drill — no annulus at all, which is
+      what the `One-sided PTH annulus for Potentiometer` exception in the
+      `.kicad_dru` exists for and what the three `padstack` warnings ("PTH pad
+      hole leaves no copper") report — but **1.8 mm lands on `In1.Cu`,
+      `In2.Cu` and `B.Cu`**. The back and inner sides are real, large pads.
+- [ ] **Consequence for routing:** KiCad's Specctra exporter serialises only
+      the F.Cu shape, concludes the pad has no copper, and emits **no
+      `(pin ...)` at all** — just unnamed `(keepout ...)` circles that
+      FreeRouting does not honour the same way. The router therefore never
+      learns about the 1.8 mm back-side lands and drives `/SWDIO`, `+3V3` and
+      `/VSNA` straight across them. **Every routing-induced DRC violation on
+      this board involved J4 and nothing else** — no other footprint
+      contributed one. Injecting a correctly-sized padstack and three pins into
+      the `.dsn` does fix the routing, but FreeRouting then hangs writing the
+      session file (§10.4), so the conflicting copper is pruned after import
+      instead and those connections are left for hand routing. Any future
+      auto-route of this board hits the same wall until the footprint changes.
+- [ ] **Consequence for fabrication:** zero annular ring *on F.Cu* is below
+      PCBWay's stated 0.15 mm minimum [REF-FAB-001]. A barrel with no land on
+      one side is prone to lifting. Decide whether to give these pads a real annulus (and accept the
+      placement cost) or to confirm with PCBWay that they will build it as
+      drawn. This is a design decision for the user, not a routing fix.
+
+### 10.3 Placement conflicts the router cannot resolve
+
+Present in the board with **all tracks removed and zones refilled**, so they are
+placement, not routing. DRC baseline in that state: 57 unconnected, 9 errors.
+
+- [ ] `C1` pad 1 (`VSYS`, B.Cu) to `J4` pad 2 (`/POT`): **0.125 mm**, against
+      the 0.200 mm `VSYS_FEED` netclass clearance.
+- [ ] `R9` pad 1 (`+3V3`) to `TH1` pad 2 (`GND`): **0.125 mm**, against the
+      0.127 mm `3V3` netclass clearance. Marginal by 2 µm.
+- [ ] `R4` pad 1, `R9` pad 1 and `TH1` pad 2 sit **0.255 mm** from the board
+      outline, against the 0.30 mm rule set in §10.1. Above PCBWay's 0.20 mm
+      hard gate, so buildable, but outside this board's own rule — nudge the
+      three parts ~0.05 mm inboard, or accept and document the exception.
+- [ ] `NT1` pad 2 (`PGND`) shorts `U7` pad 4 (`GND`), and `NT1`'s internal
+      segment shorts the same pad. `NT1` is the PGND/GND net tie; the short is
+      to a *different* component, so this is an overlap, not the tie doing its
+      job.
+
+### 10.4 Auto-route status
+
+Delivered state of `osc-sg90-v006.kicad_pcb`: **89 track segments, 2 vias,
+33 unconnected items, 9 DRC errors — every one of the 9 a §10.3 placement
+defect, none introduced by routing.** The unrouted board with zones refilled
+scores 57 unconnected and the same 9 errors, so the route removed 24
+connections and added no violations.
+
+- [x] Re-routed with FreeRouting 2.2.4 against a `.dsn` exported from KiCad
+      10.0.3 with all tracks cleared, the boundary inset 0.20 mm (Specctra has
+      no per-item edge constraint, so the inset plus the router's own class
+      clearance is the only lever), and all zone planes left in place.
+      Conflicting copper was then pruned with
+      `hardware/tools/prune_routing_conflicts.py`, driven off KiCad's own DRC
+      report by UUID rather than re-derived geometry, and the resulting stubs
+      removed with its `--dangling` mode. Zones refilled via
+      `kicad-cli pcb drc --refill-zones --save-board`.
+- [ ] **33 connections are still unrouted and need hand routing.** They are not
+      a router-settings problem. Six configurations were tried — all zone
+      planes kept; surface pours stripped; all planes stripped; inner layers
+      retyped `signal`; J4 keepouts removed; J4 pins injected — and every one
+      plateaued at the same 24 internal FreeRouting violations and ~30
+      unrouted connections. Keeping all planes (the configuration shipped) was
+      marginally the best at the DRC level.
+- [ ] Two structural causes, both worth a decision before another attempt:
+      (a) `In1.Cu` (GND) and `In2.Cu` (+3V3) are full-board planes, so a via on
+      any third net is a clearance violation against copper FreeRouting may not
+      modify — it placed only 2–3 vias in every run, on a board that needs many
+      more; (b) with the F.Cu/B.Cu GND pours exported as fixed planes, both
+      signal layers read as almost entirely obstructed. Stripping the pours
+      from the `.dsn` and letting KiCad re-pour after import is the right
+      pipeline in general, but it did not help here because (a) still blocks
+      the vias, and it cost connectivity because the pours had been satisfying
+      the ground connections for free.
+- [ ] Given (a), consider whether this board should be 6-layer. See §10.6.
+- [ ] **FreeRouting 2.2.4 hangs writing the `.ses`** for some inputs: it logs
+      `Auto-router session completed` and then never writes the file. Seen
+      reproducibly on the all-planes-stripped `.dsn` and on both J4-pin-injected
+      `.dsn` variants; not seen on the three configurations that shipped
+      candidates. If a run stalls after that log line, it will not recover.
+
+### 10.5 Findings closed in passing
+
+- [x] **Zone fills were stale** after the placement move. DRC on the board as
+      received reported 187 violations; 153 of them were phantom
+      pad/track/via-to-zone clearance errors at "actual 0.1005 mm" against
+      netclass minima of 0.127/0.200 mm. Re-running with `--refill-zones`
+      dropped the count to 25. Any DRC on this board must refill zones first.
+- [x] **The board-setup value, not the custom rule, is what DRC reports
+      against.** Editing only the `Copper to board edge` rule in the
+      `.kicad_dru` had no effect — DRC went on citing "board setup constraints
+      edge clearance 0.4000 mm" from `min_copper_edge_clearance` in the
+      `.kicad_pro`. Both now say 0.30 mm. Any future clearance change has to
+      touch both files.
+
+### 10.6 Documentation defect
+
+- [ ] `hardware/boards/osc-sg90-v006/README.md` §Assembly states "The board is
+      8-layer for routing density at this size." The board is **4-layer**:
+      `F.Cu`, `In1.Cu`, `In2.Cu`, `B.Cu`. Correct the README. Worth deciding at
+      the same time whether the board *should* be 6- or 8-layer, given §10.4.
+
+---
+
 ## 9. Tooling
 
 ### 9.1 Markdown lint

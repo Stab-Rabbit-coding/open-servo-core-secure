@@ -251,6 +251,84 @@ verification*, and a `TODO.md` item is opened against it.
 
 ---
 
+## Fabrication and board design
+
+### REF-FAB-001 — PCBWay manufacturing capability and design rules
+
+- **Designation:** PCBWay published capability tables and Help Center design
+  rulings (accessed 2026-08-29)
+- **URLs:**
+  - <https://www.pcbway.com/capabilities.html>
+  - <https://www.pcbway.com/helpcenter/board_outline_issues/The_distance_between_the_trace_and_board_outline_is_less_than_0_20mm.html>
+  - <https://www.pcbway.com/helpcenter/Engineering_Questions/the_spacing_requirement_from_hole_to_the_edge_of_board.html>
+- **Why this is the governing source:** PCBWay fabricates and assembles this
+  project's boards (`README.md` §Sponsorship). Board-edge spacing on a 3.3–8.4 V
+  design is set by the fabricator's routing tolerance, not by electrical
+  clearance — see REF-STD-007 for why the electrical requirement is not
+  binding here.
+- **Sections applied:**
+  - *Capabilities — minimum trace / spacing:* 0.1 mm (4 mil) each. Consistent
+    with the 0.10 mm `Track width minimum` and `Copper clearance` rules in
+    `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_dru`.
+  - *Capabilities — minimum via drill / annular ring:* 0.15 mm drill,
+    0.15 mm annular ring. The board is more conservative: 0.30 mm drill,
+    0.125 mm annular ring.
+  - *Capabilities — outline (CNC routing):* 0.25 mm copper-to-outline for the
+    normal process; ±0.2 mm outline tolerance for CNC routing, ±0.5 mm for
+    V-scoring.
+  - *Help Center — "The distance between the trace and board outline is less
+    than 0.20mm":* **"The distance between the trace and board outline should
+    be 0.20mm for us to proceed."** This is the hard DFM gate. Applied as the
+    floor under the `Copper to board edge` rule, which is set to **0.30 mm**
+    — 1.5× the gate and above the 0.25 mm normal-process figure.
+  - *Help Center — "the spacing requirement from hole to the edge of board":*
+    **"The distance from hole (no matter PTH hole or unplated hole) to outline
+    of board should be ≧ 0.5mm."** Note also **"For panel made via v-scoring
+    line, 1.0mm spacing from hole to edge is required."** The 0.5 mm figure is
+    stricter than the copper rule and is what actually limits how close a via
+    may sit to the edge: for this board's 0.55/0.30 mm via it puts the via
+    centre 0.65 mm inboard. Enforced as a `physical_hole_clearance` rule
+    conditioned on `B.Layer == 'Edge.Cuts'` in the board's `.kicad_dru`, and
+    cross-checked independently by `hardware/tools/check_hole_to_edge.py`.
+    Note also **"For panel made via v-scoring line, 1.0mm spacing from hole to
+    edge is required"** — the 0.50 mm figure assumes CNC routing.
+- **Cited from:** `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_dru`
+  (via `hardware/boards/osc-sg90-v006/README2.md`, since a `.kicad_dru` cannot
+  hold comments — see `AGENTS.md` §Coding standards);
+  `hardware/tools/check_hole_to_edge.py`
+- **Status:** vendor capability document, not a consensus standard. It governs
+  because it is the accepting fabricator's stated limit; if the board is moved
+  to another fab, this entry must be re-verified against that fab's tables.
+
+### REF-STD-007 — IPC-2221B, Generic Standard on Printed Board Design
+
+- **Designation:** IPC-2221B (2012)
+- **Title:** *Generic Standard on Printed Board Design*
+- **URL:** <https://shop.ipc.org/ipc-2221/ipc-2221-standard-only/Revision-b/english>
+- **Sections applied:**
+  - *§6.3 / Table 6-1, Electrical Conductor Spacing* — minimum spacing as a
+    function of peak working voltage, by conductor location and coating, for
+    altitudes below 3050 m (10 007 ft). This board's maximum working voltage is
+    **8.4 V** (2S LiPo on `VIN`, `hardware/boards/osc-sg90-v006/README.md`),
+    which falls in the lowest (0–15 V) band. The board is uncoated, so the
+    external-uncoated column governs at **0.10 mm**. The board's global
+    `Copper clearance` rule is already 0.10 mm and every netclass is at or
+    above it (0.127 mm signal, 0.200 mm VSYS/MOTOR), so **the electrical
+    requirement is satisfied with margin and is not the binding constraint on
+    board-edge spacing** — REF-FAB-001 is. Recorded here so the reasoning is
+    auditable rather than assumed.
+- **Cited from:** `hardware/boards/osc-sg90-v006/osc-sg90-v006.kicad_dru`
+  (via `hardware/boards/osc-sg90-v006/README2.md`)
+- **Status:** *requires verification* — the standard is paywalled and has not
+  been read directly. The Table 6-1 values quoted above were taken from
+  secondary summaries of the table, not from the issued document. This does not
+  affect the design: the applied clearances exceed the quoted values by 1.27×
+  to 2×, and the governing constraint is REF-FAB-001 in any case. Superseded by
+  **IPC-2221C** (December 2023), which has not been checked for changes to the
+  spacing table or its numbering.
+
+---
+
 ## Internal specifications
 
 These are this repository's own normative documents, listed so that code

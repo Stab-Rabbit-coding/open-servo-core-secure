@@ -86,6 +86,21 @@ US jurisdiction for all legal and regulatory questions.
   cites the governing doc section.
 - For formats without inline comments (KiCad), put the commentary in an
   accompanying Markdown file.
+- **KiCad files: never use `;` or `#` for comments.** They are not comment
+  syntax in the KiCad S-expression grammar. In a `.kicad_dru` a single `;`
+  anywhere in the file makes the **whole file fail to parse — silently**, so
+  every custom rule stops firing and DRC reports nothing to say it happened.
+  Measured on `kicad-cli` 10.0.3 against `osc-sg90-v006`: an identical
+  `physical_hole_clearance` rule reports **199** violations with no comment in
+  the file and **0** with one, whether the `;` sits at top level between rules,
+  as the first line inside a rule block, or between two clauses of a rule.
+  `( comment 1 "text" )` blocks do not help either: a `.kicad_dru` accepts
+  `(version)` and `(rule)` at top level and nothing else, so **that file admits
+  no comments in any form**. Put its commentary in the accompanying Markdown
+  file (`hardware/boards/<board>/README2.md` for `osc-sg90-v006`). After
+  editing any `.kicad_dru`, confirm the rules still fire — raise a minimum to
+  an absurd value and check the violation count moves. A clean DRC run does not
+  mean a clean board; it may mean no rules ran.
 - All PRs pass CI: at minimum a security check and a lint check per language.
 
 ## Workflow
