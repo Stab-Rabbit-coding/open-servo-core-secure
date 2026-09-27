@@ -38,7 +38,7 @@ Every connector is labelled on the silkscreen:
 
 ## Powering it
 
-Three ways in, and they can be combined freely:
+Three ways in, and they may be combined freely:
 
 1. **Battery jack** - 2S or 3S LiPo. This input has a protection diode, so a reversed pack does nothing instead of damage. The diode costs ~0.4 V, so a nearly-empty 2S may dip under the motor's 6.5 V floor a little early.
 2. **Bus jack `VS` pin** - wired straight to the rail, no diode. This is how a servo receives power in a robot, and the better path for high-current bench work.
@@ -47,7 +47,7 @@ Three ways in, and they can be combined freely:
 The one rule to internalize: **the motor only runs above about 6.5 V.** The gate driver refuses to switch below that - a built-in safety property, not a fault. In practice:
 
 - On 5 V from the LinkE, everything except the motor works: the MCU boots, firmware flashes, the bus talks, sensors read. **A dark motor on USB-level power is normal, not a broken board.**
-- A 1S battery (4.2 V) can never drive the motor. 2S minimum.
+- A 1S battery (4.2 V) could never drive the motor. 2S minimum.
 
 The FETs are sized for roughly 2 A continuous and 3 A bursts - enough for every SG90/MG90/MG996R-class servo. A hardware comparator cuts the bridge at about 2.5-2.75 A on its own, even if firmware hangs.
 
@@ -92,7 +92,7 @@ Connect a WCH-LinkE to the debug header - `SWDIO` and `G` at minimum, plus `5V` 
 The board is designed around JLCPCB's 6-layer promo: 50 × 50 mm, all vias 0.3 mm, epoxy-filled vias (select "Epoxy Filled & Capped"), which prices at a few dollars for five boards and forces ENIG (gold) finish - which also makes hand assembly nicer.
 
 - Every part has its LCSC number in the schematic; the passives are 0805, chosen for easy hand soldering.
-- One genuinely hard joint: the QFN-26 with its center pad. That pad ties into the board's internal copper planes, which soak up heat - hot air from the top alone usually can't get the joint to reflow. Heat the board from below with a hotplate (paste stencil, place the chip, reflow the whole side), using hot air on top only as a finisher. Everything else is beginner-friendly.
+- One genuinely hard joint: the QFN-26 with its center pad. That pad ties into the board's internal copper planes, which soak up heat - hot air from the top alone usually could not get the joint to reflow. Heat the board from below with a hotplate (paste stencil, place the chip, reflow the whole side), using hot air on top only as a finisher. Everything else is beginner-friendly.
 - Parts marked DNP ("do not populate") in the schematic are options and tuning pads. Leave them empty - that IS the standard build. Some of them change how the board behaves (shunt value, sense filtering), so only mount one if you know exactly why you want it.
 
 ## More reading

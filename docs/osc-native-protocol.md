@@ -25,9 +25,9 @@ Goals, in priority order:
    reply's first byte waits on nothing — not a completed encode (streaming
    TX), not a folded CRC (hardware CRC engine), not a reply grid
    (enable-when-ready).
-3. **Cheap-MCU fit** — everything must run on the V006 tier: one UART, one
+3. **Cheap-MCU fit** — everything shall run on the V006 tier: one UART, one
    DMA ring, the SPI block as a CRC engine, no input capture, no crystal.
-4. **Recoverability in the field** — a servo must be reachable regardless of
+4. **Recoverability in the field** — a servo shall be reachable regardless of
    its configured baud or ID (rescue break, UID enumeration).
 
 Non-goals: DXL wire compatibility; multi-host arbitration (a single host
@@ -67,12 +67,12 @@ unchanged).
 - **Baud**: operational baud is a config register selecting from
   **{0.5 M, 1 M, 2 M, 3 M}**, default **1 M**. DXL's legacy low rates are
   pointless on this bus — recovery is the rescue break's job (§9.1), not a
-  crawl-speed fallback. Servos run HSI; the host must be crystal-clocked.
+  crawl-speed fallback. Servos run HSI; the host shall be crystal-clocked.
   Measured margin: the V006 cannot be detuned far enough (±3.4 % full
   HSITRIM throw) to break 3 M framing or data in either direction [F10] —
   ≥3× the trimmed-HSI ±1 % budget, and lower rates only widen it.
 - **Rescue baud**: 0.5 M — the floor of the option set, not a fifth rate.
-  Rescue must work anywhere the protocol can work at all: a bus that can't
+  Rescue shall work anywhere the protocol can work at all: a bus that can't
   carry the lowest operational rate can't run any configuration either, so
   the floor is by construction sufficient. Entered only via rescue break
   (§9.1).
@@ -648,7 +648,7 @@ are garbage — and garbage _is_ the collision signal:
   the UART shifts bits onto the wire. A servo whose UID begins with the
   prefix replies `OK` with its full 16-byte UID; everyone else stays
   silent. Mismatches and malformed queries draw no reply on the broadcast
-  wire — a nack storm is the one reply a broadcast must never produce
+  wire — a nack storm is the one reply a broadcast shall never produce
   (unicast keeps the §5.3 layer-2 `instruction` verdict). Matching servos
   are same-die replicas running cycle-identical firmware, so an unguarded
   collision is a lie waiting to happen: they answer in unison, and two

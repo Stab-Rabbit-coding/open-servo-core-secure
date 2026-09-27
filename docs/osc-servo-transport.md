@@ -318,7 +318,7 @@ it; at most they may be polled from a cold path as line-noise telemetry
 
 The rationale for waking on LBD rather than the error flags is
 first-principles: the error flags are latched, positionless, and
-coalescing, so a wake built on them must be throttled against garble
+coalescing, so a wake built on them shall be throttled against garble
 storms (wrong-baud traffic heard as continuous framing errors), and any
 mute needs a restore path that itself cannot be starved — a structural
 liability. A wake that never needs muting deletes the problem: LBD is
@@ -394,7 +394,7 @@ The zero-gap argument, from first principles:
    in-order ring walk preserves frame order. A backlog write commits
    before the frame behind it dispatches — DES-pinned by
    `backlog_write_then_read_processes_in_order`.
-4. **The host's side of the contract.** RESPONSE_DEADLINE must cover the
+4. **The host's side of the contract.** RESPONSE_DEADLINE shall cover the
    full reply path — decode + dispatch + verify, elastically late under a
    backlog — not just the happy-path grid: with ~70 µs dispatch bodies a
    60 µs default is dishonest, and a chain slot reclaims into a

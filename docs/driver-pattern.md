@@ -169,7 +169,7 @@ The grid laws:
 2. **Never depend across columns.** The two ends meet only on the wire (`osc-protocol` encodes it) or inside `osc-integration`'s sim. A host crate importing a servo crate (or vice versa) is a layering bug, not a convenience.
 3. **`hal::*` lives only in the `osc-*-ch32` orchestration crates** — §2.4's build-time invariant, applied per role.
 4. **Foundation crates stay end-neutral.** No servo-shaped or host-shaped types in the shared row; each end brings its own vocabulary.
-5. **Roles compose on one die.** A limb gateway instantiates the servo stack toward its upstream bus and the host stack toward its downstream bus. The grid names roles, not chips — which is why the columns must never fuse.
+5. **Roles compose on one die.** A limb gateway instantiates the servo stack toward its upstream bus and the host stack toward its downstream bus. The grid names roles, not chips — which is why the columns shall never fuse.
 
 ---
 
@@ -791,7 +791,7 @@ Three intentional asymmetries vs the driver registry:
 - **No accessors.** `Drivers::install` reaches directly into provider types (e.g., `provider::monotonic::Monotonic`) to construct driver instances. Routing those through `Provider::monotonic()` would just rename the same unit struct.
 - **`init` vs `install` verb.** `install` implies storage (cells); `init` implies setup. Layer names stay symmetric (`Provider` ↔ `Drivers`); method verbs differ because the work differs.
 
-**Init-order discipline.** System providers run first (clock tree must exist before any peripheral is configured; pin modes must be set before any peripheral that drives those pins comes up). Driver providers follow. Each driver provider's `::init()` performs the clock-gate enable + peripheral configuration writes; IRQs stay masked. After `Drivers::install` populates cells, `Provider::enable_irqs` unmasks vectors.
+**Init-order discipline.** System providers run first (the clock tree shall exist before any peripheral is configured; pin modes shall be set before any peripheral that drives those pins comes up). Driver providers follow. Each driver provider's `::init()` performs the clock-gate enable + peripheral configuration writes; IRQs stay masked. After `Drivers::install` populates cells, `Provider::enable_irqs` unmasks vectors.
 
 ### 9.5 Chip-agnosticity boundary
 
