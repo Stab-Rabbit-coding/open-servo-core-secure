@@ -64,7 +64,7 @@ surface. The suite sweeps the full baud matrix (0.5 M / 1 M / 2 M / 3 M).
   and the host-detune probe (an off-catalog rate one BRR step from nominal)
   exercises the differential tracker.
 - **hot loop** (`hot_loop.rs`) — the production `[GWRITE(HOLD), COMMIT, GREAD]`
-  zero-gap loop, the silicon twin of the DES `hot_loop` suite. The GREAD must
+  zero-gap loop, the silicon twin of the DES `hot_loop` suite. The GREAD shall
   read back the just-committed value every cycle; a stale read-back is a
   silently-dropped frame.
 - **plain flood** (`hot_loop.rs`) — an aggressive `[WRITE(NOREPLY) × 8, READ]`

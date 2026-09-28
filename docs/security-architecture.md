@@ -6,7 +6,7 @@ dispatch-before-verdict spine, its hardware CRC pipeline, its reply-gap
 grid, or the control cascade's tick budget.
 
 Companion pillars: `osc-native-protocol.md` (the wire), `osc-servo-transport.md`
-(the servo-side transport), `control-theory.md` (the cascade this must not
+(the servo-side transport), `control-theory.md` (the cascade this shall not
 disturb), `SecurityElement.md` (the originating design note).
 
 Code is authoritative; when this doc and the code disagree, fix the doc.
@@ -80,7 +80,7 @@ in a frame, and ~2 000× too slow to participate in a 20 kHz control tick.
 session-key model is the only workable one. This document keeps it and makes
 it normative.
 
-### 0.2 An 8-bit truncated HMAC must not replace the CRC
+### 0.2 An 8-bit truncated HMAC shall not replace the CRC
 
 The note proposes *"an 8 bit truncation of its HMAC instead of a CRC."*
 Three independent problems:
@@ -211,7 +211,7 @@ the Qwiic connector already carries GND / +3V3 / SDA / SCL, so an SWI breakout
 plugs straight in using either data pin as SI/O — provided the Qwiic I²C bus
 is not otherwise in use. That is a bringup convenience, not a product path.
 
-> The concrete USART instance and remap index for `PD5`/`PD6` must be read
+> The concrete USART instance and remap index for `PD5`/`PD6` shall be read
 > from `ch32_metapac::METADATA` — the same source `servo-ch32/build.rs`
 > already generates `UsartMapping` from — and **not** assumed. If they resolve
 > to USART1 remaps only, they would contend with the bus and the SE falls back
@@ -221,7 +221,7 @@ is not otherwise in use. That is a bringup convenience, not a product path.
 > **Procurement action:** the ECC204 ordering code fixes the interface at the
 > part number. `ECC204-TFLXAUTH*` and `ECC204-TCS*` codes appear in
 > [REF-SE-001] Table 4-1 **without an interface column**, so the SWI suffix
-> must be confirmed against the full ordering-code table before the BOM is
+> shall be confirmed against the full ordering-code table before the BOM is
 > frozen. Tracked in `TODO.md` §7.1.
 
 ### 0.4 Bit-banged SWI cannot coexist with the transport
@@ -435,7 +435,7 @@ first dropped frame.
 > environment, so no cycle counts were produced. The instruction counts are
 > derived from the primitive's operation structure (HalfSipHash round = 4
 > adds + 4 XORs + 6 rotates; a rotate is 3 instructions with no `Zbb`) and
-> assume ~1.5 CPI. **They must be confirmed on silicon before this design is
+> assume ~1.5 CPI. **They shall be confirmed on silicon before this design is
 > flown.**
 >
 > A `bench`-feature probe (`SEC_PROBE`, §7.4) is provided for exactly this,
@@ -477,7 +477,7 @@ duty, which by the transport's measured relation (tick loss ≈ 1.2–1.4× HIGH
 duty, `osc-servo-transport.md` §2) costs roughly **4–5 % additional kernel
 tick coalescing**. Ticks are never starved outright and latency stays bounded,
 so the cascade sees a slightly coarser effective sample rate, not a
-destabilising one. This is the single number the bench gate must confirm.
+destabilising one. This is the single number the bench gate shall confirm.
 
 If bench shows the cost is material, three tuning levers exist, in order of
 preference:
@@ -565,7 +565,7 @@ host                                            servo + ECC204
 - Cost: one `NONCE` plus **three** HMACs (unicast key, wrap pad, wrap-tag
   check) ≈ **670 ms** over SWI — see §0.1 for why an HMAC is two `SHA`
   commands. Once, at boot, with the bus quiet by construction and torque off.
-  This is the dominant term in the servo's boot time and must be budgeted for
+  This is the dominant term in the servo's boot time and shall be budgeted for
   in the airframe's power-on sequence.
 
 Re-key (`MGMT SEC_REKEY`) repeats the exchange with a fresh epoch. It requires
@@ -605,7 +605,7 @@ rejects. A flight build calls `set_policy(Policy::FLIGHT)` explicitly.
 > flight build that forgets to set the policy silently accepts unauthenticated
 > commands. Making that impossible to forget — a build-time assertion, a
 > persisted policy register, or refusing to arm torque under `Policy::OPEN` in
-> a flight image — is tracked in `TODO.md` §7.10 and must be closed before the
+> a flight image — is tracked in `TODO.md` §7.10 and shall be closed before the
 > design flies.
 
 ### 4.3 Runtime quiet window
@@ -671,6 +671,14 @@ irreversible** operations:
   against 10 000 — three orders of margin.
 - These operations already require torque-off and a long host timeout (§9.4),
   so the added ~40 ms (`COUNTER` + `SHA`) is free.
+
+> [!CAUTION]
+> The ECC204 monotonic counter is a finite, non-resettable hardware resource
+> [REF-SE-001 §1.2]. Every `MGMT SAVE`, `MGMT FACTORY`, or firmware-update
+> grant consumes one of its 10 000 total counts. A tool or test harness that
+> issues grants outside the documented budget (e.g. scripted repeated
+> `MGMT FACTORY` during bring-up or CI) can exhaust the counter early and
+> permanently strand the affected unit's identity plane.
 
 ---
 
@@ -747,7 +755,7 @@ firmware is expected to fall **outside** the encryption controls, and no
 License Exception ENC notification would be required.
 
 > This is an engineering assessment, not a legal determination. ECCN
-> classification is a legal call and must be confirmed by counsel or through a
+> classification is a legal call and shall be confirmed by counsel or through a
 > CCATS request before export or public distribution — noting the repository
 > is already public, which is itself relevant to the analysis (published
 > open-source encryption source code has its own treatment under EAR

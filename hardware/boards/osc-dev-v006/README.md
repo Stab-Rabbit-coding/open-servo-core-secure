@@ -128,7 +128,7 @@ Three connectors share the same nets. Pick whichever fits your wiring:
 
 The powered board feeds `VSYS` onto `V+` to power downstream boards over the same cable, just like a real Dynamixel daisy-chain. The `DATA` line has a PESD5V0L1BA ESD clamp (D6) and a DNP 10K pull-up footprint (R24) for single-device bench setups.
 
-⚠️ **`V+` is `VSYS` directly, unprotected.** Anything you daisy-chain to the bus must tolerate the upstream board's full input voltage (up to 8.4 V at 2S full charge).
+⚠️ **`V+` is `VSYS` directly, unprotected.** Anything you daisy-chain to the bus shall tolerate the upstream board's full input voltage (up to 8.4 V at 2S full charge).
 
 ## Jumpers
 
@@ -192,6 +192,12 @@ Use a **WCH-LinkE** on J2. The link talks the CH32V006's 1-wire protocol on `SWD
 ### First boot
 
 The MCU's `nRST` and the op-amp `+` input share pin `PD7`. Fresh chips default to `nRST`, and the sense network sits near GND, which would hold the MCU in reset if it were connected. JP1 breaks the link until the option byte is flipped:
+
+> ⚠️ **CAUTION:** Perform these steps in order. Closing JP1 before the option
+> byte is flipped ties `PD7` to the sense network while it is still acting as
+> `nRST`, holding the MCU permanently in reset. A board in that state cannot
+> be reprogrammed over SWD, so recovering it requires reflowing JP1 open again
+> by hand.
 
 1. Make sure JP1 is open (no solder bridging the pads).
 2. Program the USER option byte via the WCH-LinkE on J2 to set `nRST -> GPIO`.
