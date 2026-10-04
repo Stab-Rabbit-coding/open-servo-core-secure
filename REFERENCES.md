@@ -245,7 +245,7 @@ verification*, and a `TODO.md` item is opened against it.
 - **Cited from:** `docs/osc-native-protocol.md` §9.2, §10;
   `docs/security-architecture.md` §0.3, §0.4
 - **Status:** *requires verification* — the USART instance and remap index for
-  `PD5`/`PD6` on the CH32V006F8U6 must be confirmed against
+  `PD5`/`PD6` on the CH32V006F8U6 shall be confirmed against
   `ch32_metapac::METADATA` before the SWI pin assignment is frozen
   (`TODO.md` §7.2).
 
@@ -298,7 +298,7 @@ verification*, and a `TODO.md` item is opened against it.
   `hardware/tools/check_hole_to_edge.py`
 - **Status:** vendor capability document, not a consensus standard. It governs
   because it is the accepting fabricator's stated limit; if the board is moved
-  to another fab, this entry must be re-verified against that fab's tables.
+  to another fab, this entry shall be re-verified against that fab's tables.
 
 ### REF-STD-007 — IPC-2221B, Generic Standard on Printed Board Design
 

@@ -28,7 +28,7 @@ routing tolerance: PCBWay quote **0.25 mm** copper-to-outline for the normal
 CNC-routing process and reject artwork below **0.20 mm** [REF-FAB-001].
 **0.30 mm** is 1.5× that DFM gate.
 
-This value must also be set as `min_copper_edge_clearance` in the `.kicad_pro`.
+This value shall also be set as `min_copper_edge_clearance` in the `.kicad_pro`.
 That board-setup value is what DRC reports against; the custom rule alone does
 not change the reported constraint.
 

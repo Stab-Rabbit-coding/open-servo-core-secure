@@ -144,8 +144,13 @@ mitigation lands in the calibration LUT. Mitigation ladder:
   at once, so cross-illumination is otherwise indistinguishable from
   signal. The bridge fixes box-to-box pitch, so the part self-jigs on
   the windows. Glue order is forced: fence onto the bare deck and full
-  cure BEFORE the motor-flex sandwich - the boxes sit over the windows,
-  so gluing with sensors in place drips epoxy onto the sensor faces.
+  cure BEFORE the motor-flex sandwich.
+
+  > **CAUTION:** Glue and fully cure the light fence onto the bare deck
+  > *before* the motor-flex sandwich goes in. The fence boxes sit directly
+  > over the sensor windows — gluing with the sensors already in place drips
+  > epoxy onto the sensor faces and ruins them.
+
   Dabs on the outer wall feet, away from the window rims, so squeeze-out
   creeps outward, not down the bore. Finger-press only, no clamp - the
   walls would crush, and the bond is non-structural anyway (the fence

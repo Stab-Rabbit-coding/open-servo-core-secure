@@ -7,7 +7,7 @@ the compiler will not catch a race between two priority contexts touching the
 same register. The lost-update bug class is real: an RMW racing against a
 different-bit write from a higher-priority context silently drops the latter.
 
-This module is the safety boundary. Code outside `hal/` should only call HAL
+This module is the safety boundary. Code outside `hal/` shall only call HAL
 helpers and never touch the metapac directly. Each helper that needs more than
 "single-context, safe" treatment carries an inline contract above its
 definition — read those at the source, not from a parallel registry here.
@@ -36,7 +36,7 @@ section, OR an atomic primitive replaces the RMW.
 
 ## Audit tiers
 
-Every `.modify()` in this module sits in one of three tiers. New callers must
+Every `.modify()` in this module sits in one of three tiers. New callers shall
 keep this invariant true.
 
 ### Tier 1 — single-context: safe
@@ -55,7 +55,7 @@ CS cost on V006/V2A is ~5 cycles via `mstatus.MIE` (csrrci + csrw). Nested CS
 (calling these from inside an ISR or another CS) is a no-op — the inner
 `with` re-disables already-disabled interrupts.
 
-### Tier 3 — must use atomic primitives, not `.modify()`
+### Tier 3 — shall use atomic primitives, not `.modify()`
 
 Registers where multiple priorities touch *different bits*. RMW here corrupts
 state. Use the per-register atomic primitive instead:

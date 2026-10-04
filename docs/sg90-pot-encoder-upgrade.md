@@ -95,6 +95,11 @@ pocket (see memory / future work), justified only at fleet scale.
 - Bringup check: read AGC/field-status at the assembled gap and confirm
   mid-window before the epoxy becomes permanent.
 
+> **CAUTION:** The magnet mount is a permanent epoxy bond. Complete the
+> AGC/field-status bringup check and confirm mid-window alignment before the
+> epoxy cures — an out-of-window sensor discovered after cure means
+> discarding the pot/magnet assembly rather than re-aligning it.
+
 ## Cost (self-assembly, per servo)
 
 | item | est. cost |
