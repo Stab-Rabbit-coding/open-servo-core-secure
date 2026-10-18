@@ -329,6 +329,29 @@ verification*, and a `TODO.md` item is opened against it.
 
 ---
 
+## Documentation and technical-writing standards
+
+### REF-MIL-001 — CNAF M-3710.7, §1.5 (Warnings, Cautions, and Notes) and §1.6 (Wording)
+
+Department of the Navy, Commander, Naval Air Forces, *NATOPS General Flight
+and Operating Instructions Manual*, CNAF M-3710.7 (COMNAVAIRFOR M-3710.7),
+Original, 2 May 2016. Source: NATEC NATOPS library,
+<https://www.mynatec.navair.navy.mil/> (access-restricted); verified against
+pages 1–52 of the issued manual (front matter, Chapter 1, Glossary, List of
+Abbreviations/Acronyms), held locally at `docs/cnaf-3710.7_1-52.pdf` in the
+`SecureControllers` repository.
+
+Applied: §1.5 "Warnings, Cautions, and Notes" (p. 1-5) for callout-severity
+definitions; §1.6 "Wording" (p. 1-5) for shall/should/may–need not/will
+requirement-verb usage. This repository does not claim NATOPS compliance as
+a whole — only the §1.5/§1.6 documentation-style conventions are adopted.
+The paired active-vs-passive-voice guidance in `AGENTS.md` is a project
+addition, not sourced from this document.
+
+Cited in: `AGENTS.md` "Warnings, cautions, notes, and wording".
+
+---
+
 ## Internal specifications
 
 These are this repository's own normative documents, listed so that code
