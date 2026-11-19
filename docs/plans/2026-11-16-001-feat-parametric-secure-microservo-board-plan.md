@@ -148,6 +148,27 @@ check, not a new design.
   | WCH CH32V006 | — | Rejected: PRC-domiciled maker. |
   | Microchip ECC204 | Command set NDA-only | Rejected: fails the openness rule. |
 
+- **KTD3a — Owner BOM proposal, 2026-11-19** *(owner input: issue #4 comment; not yet a
+  decision)*. The owner posted a "Core Silicon BOM (Allied / Trusted Supply Chain)". U3 scores
+  it alongside the KTD3 candidates. Every part-level fact below is the comment's claim and is
+  *requires verification* against the maker's datasheet before U3 may rely on it
+  (`AGENTS.md` authenticity rules). Dimensions are shown imperial-primary.
+
+  | Role | Manufacturer, MPN | Package (per comment) | Reconciliation with this plan |
+  | --- | --- | --- | --- |
+  | MCU, ultra-compact | TI `MSPM0G3507YCJR` | 28-DSBGA, 0.087 × 0.087 in (2.2 × 2.2 mm) | Candidate for the slim envelope. KTD3 lists the G350x family as *without* key storage, so it pairs with a discrete secure element. The comment's AES-128/256 and TRNG claims are unverified. BGA assembly cost and fabricator capability are unassessed. |
+  | MCU, easier assembly | TI `MSPM0G3507SRHBR` | 32-VQFN, 0.157 × 0.157 in (4.0 × 4.0 mm) | Same die. Fits only if U2 shows a width above 0.236 in (6 mm). |
+  | MCU, bare-bones | TI `MSPM0C1104SRUKR`, `MSPM0C1104SDYYR` | 20-WQFN 0.118 × 0.118 in (3.0 × 3.0 mm); 16-SOT 0.165 × 0.126 in (4.2 × 3.2 mm) | 16 KB flash and 1 KB SRAM sit below the 4 KB floor at which KTD3 rejects the L110x, against a firmware budget of 8 KB. Rejected unless U3 shows the firmware fits 1 KB. The comment's "XRCE-DDS framer" is not this project's protocol (osc-native). |
+  | Secure element, primary | Microchip `ATECC608B-MAHDA-T` | 8-UDFN, 0.079 × 0.118 in (2.0 × 3.0 mm), I²C | Openness of its full command set requires verification (R4). Adds an I²C bus and board area. |
+  | Secure element, bare-bones | Microchip `ECC204-RBVCZ-T` | 3-lead contact, SWI | **Conflict.** KTD3 rejects the ECC204: command set published only under NDA (`TODO.md` §7.1, §7.4). Needs an owner ruling: reinstate with a recorded waiver, or drop. |
+  | Transceiver A (CAN-FD) | TI `TCAN1044AVDRBRQ1` | 8-VSON, 0.118 × 0.118 in (3.0 × 3.0 mm) | **Conflict.** R6 fixes the bus as single-wire osc-native (break-framed half-duplex UART, `docs/osc-servo-transport.md`). The comment's part needs 5 V `VCC`; R5 requires 3.5–8.4 V supply, so it also needs a regulator. |
+  | Transceiver B, B2 (RS-485) | TI `THVD1426DRLR`, `THVD1420DRLR` | 8-SOT, 0.083 × 0.063 in (2.1 × 1.6 mm) | **Conflict** with R6, as above. Direction control and bus idle state differ from the single-wire bus. |
+  | Transceiver C (TTL) | none; 0 Ω links on `TX`/`RX` | — | Closest to the existing bus. Fits R6 if the single-wire buffer and TVS of KTD5 are kept. |
+
+  Not in the comment and still owed by U1/U3: bridge, LDO, bus TVS replacement and bus buffer
+  (KTD5). A US-domiciled maker is necessary but not sufficient under the sourcing rule, which
+  also tests datasheet openness (R4).
+
 - **KTD4 — Schematic is shared; geometry is generated.** One hierarchical schematic serves every
   envelope class. Generators own outline, pads, keep-outs and rule values. Routing is done once
   per envelope class and is never regenerated over (fleet lesson: regenerating a packed board

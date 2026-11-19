@@ -65,6 +65,8 @@ open-servo-core-secure/
 │   └── osc-servo.json
 ├── docs/
 │   ├── control/  *(11 generated files, not enumerated)*
+│   ├── plans/
+│   │   └── 2026-11-16-001-feat-parametric-secure-microservo-board-plan.md
 │   ├── sg90-clones/  *(2 generated files, not enumerated)*
 │   ├── 3-Lead-Contact-Package-Usage-DS00004041.pdf
 │   ├── ECC204-CryptoAuthentication-Summary-Data-Sheet-DS40002436.pdf
