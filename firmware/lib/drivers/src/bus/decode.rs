@@ -1,8 +1,8 @@
 //! Linearized frame -> decoded request mapping (`docs/osc-native-protocol.md`
 //! sec 5, sec 6). Input is a whole, CRC-clean frame (header pre-validated by the
 //! framer): `[0x00][ID][LEN][INST][payload][PAD?][crc][crc]`. Output is the
-//! chip-agnostic [`Request`] plus its reply contract and chain slot, or a
-//! classification the composite acts on without dispatching.
+//! chip-agnostic [`Request`] plus its reply contract and chain [`Slot`], or
+//! a classification the composite acts on without dispatching.
 //!
 //! Addressing: plain ops address by frame ID (unicast-to-us or broadcast);
 //! group ops address by their id-lists regardless of the (broadcast) frame ID.
@@ -17,7 +17,7 @@ use osc_protocol::group::{
     GreadPerTarget, GreadProfilePerTarget, GreadProfileUniform, GreadUniform, GwritePerTarget,
     GwriteUniform,
 };
-use osc_protocol::wire::{Id, Inst, MgmtOp, Opcode};
+use osc_protocol::wire::{self, Id, Inst, MgmtOp, Opcode};
 use osc_servo_core::traits::{Request, RequestCtx};
 
 /// What the frame is, from the composite's point of view.
@@ -27,9 +27,30 @@ pub enum Decoded<'a> {
     /// Not addressed to us (or a group op that doesn't list us): ignore.
     Skip,
     /// Addressed to us: dispatch this request, reply per `ctx`, chain at `slot`.
-    Own(Request<'a>, RequestCtx, u8),
+    Own(Request<'a>, RequestCtx, Slot),
 }
 
+/// A reply's place in its status chain (sec 6).
+#[derive(Copy, Clone)]
+pub struct Slot {
+    /// Predecessor statuses ahead of the reply; 0 answers the instruction.
+    pub index: u8,
+    /// Footprint of a predecessor's OK status when the GREAD sizes every
+    /// reply alike; `None` when each servo sizes its own.
+    pub peer_footprint: Option<u16>,
+}
+
+impl Slot {
+    /// A slot whose predecessors' replies this servo cannot size.
+    pub const fn at(index: u8) -> Self {
+        Self {
+            index,
+            peer_footprint: None,
+        }
+    }
+}
+
+#[rustc_align(4)]
 pub fn decode(frame: FrameBytes<'_>, id: u8) -> Decoded<'_> {
     let (Some(b0), Some(b1), Some(b2), Some(b3)) = (
         frame.u8_at(0),
@@ -59,6 +80,15 @@ pub fn decode(frame: FrameBytes<'_>, id: u8) -> Decoded<'_> {
         Opcode::Gwrite => gwrite(inst, pay, own),
         _ => plain(op, inst, h.id, pay, own),
     }
+}
+
+/// A plain op for another servo, decided from the header alone: plain ops
+/// address by frame ID, group ops by their id-lists (never foreign here).
+pub fn foreign(h: &Header, own: u8) -> bool {
+    // Own id first: every own frame leaves after one compare.
+    !h.id.addresses(Id::new(own))
+        && !h.inst.is_status()
+        && !matches!(h.inst.opcode(), Some(Opcode::Gread | Opcode::Gwrite))
 }
 
 /// PING / READ / WRITE / COMMIT / MGMT: addressed by frame ID, reply at slot 0.
@@ -125,14 +155,14 @@ fn plain<'a>(op: Opcode, inst: Inst, frame_id: Id, pay: FrameBytes<'a>, own: Id)
         // Group opcodes are routed before this call.
         _ => Request::Unsupported,
     };
-    // sec 5: a broadcast reply would collide on the shared push-pull wire, so
+    // sec 5: a broadcast reply would collide on the shared wire, so
     // plain ops answer only unicast; NOREPLY suppresses either way. ENUM and
     // ASSIGN are the sec 9.2 carve-out: broadcast-addressed by design, with the
     // dispatcher's UID match electing the sole replier -- a malformed pair
     // decodes Unsupported and stays under broadcast suppression.
     let may_reply = !inst.noreply()
         && (!broadcast || matches!(req, Request::Enumerate { .. } | Request::Assign { .. }));
-    Decoded::Own(req, RequestCtx { may_reply }, 0)
+    Decoded::Own(req, RequestCtx { may_reply }, Slot::at(0))
 }
 
 /// GREAD: our span comes from the id-list; the chain slot is our list position.
@@ -142,23 +172,30 @@ fn plain<'a>(op: Opcode, inst: Inst, frame_id: Id, pay: FrameBytes<'a>, own: Id)
 fn gread<'a>(inst: Inst, pay: FrameBytes<'a>, own: Id) -> Decoded<'a> {
     match (inst.profile(), inst.per_target()) {
         (false, true) => match GreadPerTarget::parse(pay).and_then(|g| g.find(own)) {
-            Some((slot, t)) => own_read(t.addr, t.count, slot),
+            Some((index, t)) => own_read(t.addr, t.count, Slot::at(index)),
             None => Decoded::Skip,
         },
         (false, false) => match GreadUniform::parse(pay) {
             Some(g) => match g.slot_of(own) {
-                Some(slot) => own_read(g.addr, g.count, slot),
+                Some(index) => own_read(
+                    g.addr,
+                    g.count,
+                    Slot {
+                        index,
+                        peer_footprint: ok_footprint(g.count),
+                    },
+                ),
                 None => Decoded::Skip,
             },
             None => Decoded::Skip,
         },
         (true, true) => match GreadProfilePerTarget::parse(pay).and_then(|g| g.find(own)) {
-            Some((slot, t)) => own_read_profile(t.slot, slot),
+            Some((index, t)) => own_read_profile(t.slot, Slot::at(index)),
             None => Decoded::Skip,
         },
         (true, false) => match GreadProfileUniform::parse(pay) {
             Some(g) => match g.slot_of(own) {
-                Some(slot) => own_read_profile(g.slot, slot),
+                Some(index) => own_read_profile(g.slot, Slot::at(index)),
                 None => Decoded::Skip,
             },
             None => Decoded::Skip,
@@ -166,7 +203,16 @@ fn gread<'a>(inst: Inst, pay: FrameBytes<'a>, own: Id) -> Decoded<'a> {
     }
 }
 
-fn own_read<'a>(addr: u16, count: u16, slot: u8) -> Decoded<'a> {
+/// Footprint of an OK status carrying `count` table bytes, when one can
+/// (sec 5.1); a larger read answers with an empty error status.
+fn ok_footprint(count: u16) -> Option<u16> {
+    u8::try_from(count)
+        .ok()
+        .filter(|&p| p <= wire::MAX_PAYLOAD)
+        .map(|p| wire::footprint(wire::len_for(p)) as u16)
+}
+
+fn own_read<'a>(addr: u16, count: u16, slot: Slot) -> Decoded<'a> {
     Decoded::Own(
         Request::Read { addr, count },
         RequestCtx { may_reply: true },
@@ -174,7 +220,7 @@ fn own_read<'a>(addr: u16, count: u16, slot: u8) -> Decoded<'a> {
     )
 }
 
-fn own_read_profile<'a>(profile: u8, slot: u8) -> Decoded<'a> {
+fn own_read_profile<'a>(profile: u8, slot: Slot) -> Decoded<'a> {
     Decoded::Own(
         Request::ReadProfile { slot: profile },
         RequestCtx { may_reply: true },
@@ -205,6 +251,6 @@ fn own_write<'a>(addr: u16, data: FrameBytes<'a>, hold: bool) -> Decoded<'a> {
     Decoded::Own(
         Request::Write { addr, data, hold },
         RequestCtx { may_reply: false },
-        0,
+        Slot::at(0),
     )
 }

@@ -12,15 +12,16 @@
 use osc_integration::sim::{Source, WireFrame, assert_valid, instruction, status};
 use osc_protocol::wire::{Inst, Opcode, ResultCode};
 use osc_servo_core::BaudRate;
+use osc_servo_core::regions::config::DEFAULT_STALL_TIME_TICKS;
+use osc_servo_core::regions::config::addr::limits::STALL_TIME_TICKS;
 use osc_servo_core::regions::control::addr::lifecycle::GOAL_VELOCITY;
-use osc_servo_core::regions::control::addr::streaming::STREAM_DECIMATION;
 use rstest::rstest;
 use rstest_reuse::apply;
 
 mod support;
 use support::{matrix, sim};
 
-/// Break-keyed reclaim makes the 60 us default sound at every baud (see chains.rs).
+/// Break-keyed reclaim keeps a 60 us window sound at every baud (see chains.rs).
 const CHAIN_DEADLINE_US: u16 = 60;
 const BCAST: u8 = 0xFE;
 const IDS: [u8; 3] = [1, 2, 3];
@@ -90,7 +91,7 @@ fn hot_loop_cycles_survive_zero_gap(baud_idx: u8) {
             .iter()
             .map(|&id| (cycle as i32) * 100 + id as i32)
             .collect();
-        let deci = (cycle % 128) as u8 + 1;
+        let aux = (cycle % 128) as u8 + 1;
 
         // GWRITE(HOLD) x 2, COMMIT, GREAD -- one burst, zero gap throughout.
         let bytes: Vec<[u8; 4]> = gv.iter().map(|v| v.to_le_bytes()).collect();
@@ -105,15 +106,18 @@ fn hot_loop_cycles_survive_zero_gap(baud_idx: u8) {
             Inst::FLAG_HOLD,
             &gwrite_uniform(GOAL_VELOCITY, 4, &entries),
         ));
-        let deci_entries: Vec<(u8, u16, &[u8])> = IDS
+        // Second staged register: a 1-byte per-target write into the u32's
+        // low byte (the upper bytes keep their boot seed), so the per-target
+        // stride differs from the uniform frame's 4-byte stride.
+        let aux_entries: Vec<(u8, u16, &[u8])> = IDS
             .iter()
-            .map(|&id| (id, STREAM_DECIMATION, std::slice::from_ref(&deci)))
+            .map(|&id| (id, STALL_TIME_TICKS, std::slice::from_ref(&aux)))
             .collect();
         sim.host_send(&instruction(
             BCAST,
             Opcode::Gwrite,
             Inst::FLAG_HOLD | Inst::FLAG_PER_TARGET,
-            &gwrite_per_target(&deci_entries),
+            &gwrite_per_target(&aux_entries),
         ));
         sim.host_send(&instruction(BCAST, Opcode::Commit, 0, &[]));
         sim.host_send(&instruction(
@@ -136,9 +140,9 @@ fn hot_loop_cycles_survive_zero_gap(baud_idx: u8) {
                 "cycle {cycle}: servo {i} goal_velocity committed"
             );
             assert_eq!(
-                sim.servo_table(i, |t| t.control.streaming.stream_decimation),
-                deci,
-                "cycle {cycle}: servo {i} stream_decimation committed"
+                sim.servo_table(i, |t| t.config.limits.stall_time_ticks),
+                (DEFAULT_STALL_TIME_TICKS & !0xFF) | aux as u32,
+                "cycle {cycle}: servo {i} stall_time_ticks low byte committed"
             );
         }
 
@@ -217,9 +221,8 @@ fn hot_loop_survives_handler_latency(baud_idx: u8) {
 
     let mut sim = sim(baud_idx);
     // RESPONSE_DEADLINE must exceed worst-case dispatch+staging latency or a
-    // chain slot reclaims into a live-but-slow predecessor (band finding,
-    // transport sec 9 acceptance): with 70 us handler bodies the 60 us default
-    // is dishonest -- a real deployment tunes this register to its worst case.
+    // chain slot reclaims into a live-but-slow predecessor (transport sec 9):
+    // with 70 us handler bodies a 60 us window is too short.
     for id in IDS {
         sim.add_servo_with(id, 0, 250);
     }
@@ -230,6 +233,7 @@ fn hot_loop_survives_handler_latency(baud_idx: u8) {
                 on_break_us: 2,
                 on_deadline_us: 70,
                 on_tx_complete_us: 2,
+                per_frame_us: 0,
             },
         );
     }
@@ -300,6 +304,7 @@ fn plain_burst_survives_deadline_latency(baud_idx: u8) {
                 on_break_us: 2,
                 on_deadline_us: dl,
                 on_tx_complete_us: 2,
+                per_frame_us: 0,
             },
         );
 
@@ -375,6 +380,7 @@ fn plain_burst_survives_gap_jitter(baud_idx: u8) {
                 on_break_us: 2,
                 on_deadline_us: dl,
                 on_tx_complete_us: 2,
+                per_frame_us: 0,
             },
         );
 
@@ -449,6 +455,7 @@ fn plain_burst_survives_midframe_stall(baud_idx: u8) {
                         on_break_us: 2,
                         on_deadline_us: dl,
                         on_tx_complete_us: 2,
+                        per_frame_us: 0,
                     },
                 );
 
@@ -538,6 +545,7 @@ fn zero_gap_flood(baud_idx: u8) {
                 on_break_us: 2,
                 on_deadline_us: dl,
                 on_tx_complete_us: 2,
+                per_frame_us: 0,
             },
         );
 

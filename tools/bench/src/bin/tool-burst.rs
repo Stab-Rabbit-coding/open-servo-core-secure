@@ -20,15 +20,13 @@ use anyhow::Result;
 use bench::cli::{Connect, Target, gate_fail_rate, print_conn};
 use bench::osc::{build_instruction, build_read, gread_uniform_payload, gwrite_uniform_payload};
 use bench::run::{
-    BurstCycle, CycleObservation, CycleOutcome, Stats, burst_measure_observed, dump_stamps,
-    hot_loop_cycle, plain_flood_cycle,
+    BurstCycle, CycleObservation, CycleOutcome, Stats, burst_goal_base, burst_measure_observed,
+    dump_stamps, goal_rails, hot_loop_cycle, plain_flood_cycle,
 };
 use clap::Parser;
 use osc_protocol::wire::{Inst, Opcode};
+use osc_servo_core::regions::control::addr::lifecycle::GOAL_POSITION;
 
-/// goal_position (see tool-write): the rule-heavy hot-loop register --
-/// its soft-limit rules make commit the representative worst-case work.
-const GOAL_POSITION_ADDR: u16 = 0x0184;
 const BCAST: u8 = 0xFE;
 /// goal_position width (i32), the GREAD/READ span these cycles read back.
 const GOAL_LEN: u16 = 4;
@@ -87,7 +85,9 @@ struct Args {
 /// `--plain` paths delegate to the shared scenario builders (also driven by the
 /// bench test); the rest are tool-only forensic isolations.
 fn cycle_for(args: &Args, value: i32) -> BurstCycle {
-    let addr = GOAL_POSITION_ADDR;
+    // The rule-heavy hot-loop register: its soft-limit rules make commit the
+    // representative worst-case work.
+    let addr = GOAL_POSITION;
     let id = args.target.id;
     if args.plain {
         plain_flood_cycle(id, addr, args.writes, value)
@@ -141,13 +141,19 @@ fn cycle_for(args: &Args, value: i32) -> BurstCycle {
 fn main() -> Result<()> {
     let args = Args::parse();
     let mut client = args.conn.wire()?;
+    let dip = if args.plain {
+        args.writes.max(1) as i32 - 1
+    } else {
+        0
+    };
+    let base = burst_goal_base(&goal_rails(&mut client, args.target.id)?, dip)?;
 
     let report = burst_measure_observed(
         &mut client,
         args.count,
         3,
         args.paced,
-        |v| cycle_for(&args, v),
+        |v| cycle_for(&args, base + v),
         |obs: &CycleObservation| observe(&args, obs),
     )?;
 

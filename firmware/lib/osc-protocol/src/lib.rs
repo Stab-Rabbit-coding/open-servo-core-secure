@@ -6,6 +6,7 @@
 //! this crate owns layout -- `#[repr(C)]` views, offset arithmetic, and the
 //! osc-CRC-16 definition.
 #![no_std]
+#![feature(fn_align)]
 
 pub mod build;
 pub mod bytes;
@@ -15,6 +16,8 @@ pub mod group;
 pub mod models;
 pub mod reply;
 pub mod table;
+pub mod tel;
+pub mod version;
 pub mod wire;
 
 pub use bytes::FrameBytes;

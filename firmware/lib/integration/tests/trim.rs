@@ -1,10 +1,11 @@
 //! MGMT CAL break-pair ruler (`docs/osc-native-protocol.md` sec 9.3): the host
 //! announces a break train, its crystal spaces the breaks, and each servo
-//! measures the announced gap with its own clock -- break-FE entry stamps at
-//! both ends of every gap, so entry latency cancels. Plain assertions on the
-//! trim decisions and on the transport's health after trains.
+//! measures the announced gap with its own clock: the break detector's
+//! hardware stamps at both ends of every gap, so wake service lag never
+//! enters. Plain assertions on the trim decisions and on the transport's
+//! health after trains.
 
-use osc_integration::sim::{Sim, Source, instruction, status};
+use osc_integration::sim::{HandlerCost, Sim, Source, instruction, status};
 use osc_protocol::wire::{Inst, Opcode, ResultCode};
 use osc_servo_core::BaudRate;
 use osc_servo_core::regions::config::DEFAULT_RESPONSE_DEADLINE_US;
@@ -172,207 +173,198 @@ fn unicast_cal_is_refused() {
     assert_eq!(sim.poll_clock_trim(s), None);
 }
 
-// ---- differential drift tracker (sec 9.3) ----------------------------------
+/// Wake service lag bound: a mark served behind a kernel body (v3 kernel on
+/// top, transport sec 5.1).
+const WAKE_LAG_MAX_US: f64 = 60.0;
+const LAG_TRAINS: usize = 100;
+const LAG_SEED: u64 = 0x05C_CA1;
+/// Truth 0.4 nominal step off: the reading decides nothing while the ruler
+/// stays within 0.1 step of it.
+const NEAR_HALF_STEP_PPM: i32 = STEP_PPM * 2 / 5;
+
+/// SplitMix64, uniform in [0, 1).
+struct Rng(u64);
+
+impl Rng {
+    fn unit(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) as f64 / u64::MAX as f64
+    }
+}
+
+/// The ruler measures the breaks, not their service: every wake served
+/// U(0, 60) us late, coalesced or not, and each train still reads truth 0
+/// as no correction and truth +/-0.4 step as no correction - within 0.1
+/// step. A ruler stamped at wake entry reads the lag differences instead.
+#[test_log::test]
+fn cal_ruler_ignores_wake_lag() {
+    let mut rng = Rng(LAG_SEED);
+    for rate in [BaudRate::B1000000, BaudRate::B3000000] {
+        let (mut half_off, mut tenth_off) = (0, 0);
+        for _ in 0..LAG_TRAINS {
+            let lags: Vec<f64> = (0..3 * (GAPS as usize + 2))
+                .map(|_| WAKE_LAG_MAX_US * rng.unit())
+                .collect();
+            let mut lags = lags.into_iter();
+            let mut sim = Sim::new(rate);
+            let truth = [0, NEAR_HALF_STEP_PPM, -NEAR_HALF_STEP_PPM];
+            let servos: Vec<usize> = truth
+                .iter()
+                .zip(ID..)
+                .map(|(&ppm, id)| sim.add_servo_with(id, ppm, DEFAULT_RESPONSE_DEADLINE_US))
+                .collect();
+            for &s in &servos {
+                sim.set_handler_cost(
+                    s,
+                    HandlerCost {
+                        on_break_us: 2,
+                        ..Default::default()
+                    },
+                );
+            }
+            sim.set_wake_lag_us(move || lags.next().unwrap_or(0.0));
+            send_train(&mut sim, 0, GAPS as u64 + 1);
+            sim.run();
+            half_off += sim.poll_clock_trim(servos[0]).is_some() as usize;
+            tenth_off += servos[1..]
+                .iter()
+                .any(|&s| sim.poll_clock_trim(s).is_some()) as usize;
+        }
+        assert!(
+            half_off == 0 && tenth_off == 0,
+            "{rate:?}: of {LAG_TRAINS} trains, {half_off} off by > 0.5 step, \
+             {tenth_off} off by > 0.1 step"
+        );
+    }
+}
+
+// ---- between CALs ----------------------------------------------------------
 
 const OTHER_ID: u8 = 6;
 /// Silent hot-loop stand-in: WRITE|NOREPLY, 42-byte payload -> 48-byte
 /// footprint, 480 us of wire at 1M; host seam = 20 us.
 const PERIOD_US: u64 = 500;
 
-fn silent_write() -> Vec<u8> {
-    instruction(OTHER_ID, Opcode::Write, Inst::FLAG_NOREPLY, &[0u8; 42])
-}
-
 /// `n` silent frames from `t0`, PERIOD_US apart.
 fn send_silent(sim: &mut Sim, t0: u64, n: u64) -> u64 {
-    let f = silent_write();
+    let f = instruction(OTHER_ID, Opcode::Write, Inst::FLAG_NOREPLY, &[0u8; 42]);
     for k in 0..n {
         sim.host_send_at(t0 + k * PERIOD_US, &f);
     }
     t0 + n * PERIOD_US
 }
 
-/// The tracker follows drift injected mid-run: the baseline absorbs the
-/// host's queuing seam AND the boot-time skew, and a later rate change is
-/// read as its shift -- one step of drift draws one step of correction,
-/// with no CAL in sight.
-#[test_log::test]
-fn tracker_follows_thermal_drift() {
-    let mut sim = Sim::new(BaudRate::B1000000);
-    let s = sim.add_servo_with(ID, 0, DEFAULT_RESPONSE_DEADLINE_US);
-    // Baseline (32 pairs) + one full window (128) at the boot rate.
-    let t = send_silent(&mut sim, 0, 180);
-    sim.run();
-    assert_eq!(sim.poll_clock_trim(s), None, "no drift, no decision");
-    // Thermal drift: +2600 ppm, continuously (the clock never steps).
-    sim.set_servo_skew_at(t, s, 2_600);
-    send_silent(&mut sim, t + PERIOD_US, 140);
-    sim.run();
-    assert_eq!(sim.poll_clock_trim(s), Some(1));
+/// The sim's Deadline provider's nominal step effect (`SimDeadline`).
+const STEP_PPM: i32 = 2_500;
+
+/// The chip adapter's side of the closed loop, which the sim does not own:
+/// the main loop polls between frames and HSITRIM moves the oscillator by
+/// the nominal effect per applied step (positive = slower), on top of the
+/// thermal skew the scenario sets.
+struct Oscillator {
+    thermal_ppm: i32,
+    total: i32,
 }
 
-/// A constant seam and a constant skew are BOTH invisible: the tracker
-/// measures changes, not states -- absolute correction is CAL's job.
-#[test_log::test]
-fn constant_seam_and_skew_cancel() {
-    let mut sim = Sim::new(BaudRate::B1000000);
-    let s = sim.add_servo_with(ID, 5_200, DEFAULT_RESPONSE_DEADLINE_US);
-    send_silent(&mut sim, 0, 320);
-    sim.run();
-    assert_eq!(sim.poll_clock_trim(s), None);
-    assert_eq!(sim.poll_clock_trim(s), None);
-}
-
-/// Solicited frames never pair -- an ack's turnaround rides another clock,
-/// and at 1M a reply gap slips under the span gate. The silent-shape rule
-/// keeps them out entirely: acked traffic yields no pairs, no windows.
-#[test_log::test]
-fn solicited_frames_never_pair() {
-    let mut sim = Sim::new(BaudRate::B1000000);
-    let s = sim.add_servo_with(ID, 0, DEFAULT_RESPONSE_DEADLINE_US);
-    let f = instruction(OTHER_ID, Opcode::Write, 0, &[0u8; 42]); // acked shape
-    for k in 0..320 {
-        sim.host_send_at(k * PERIOD_US, &f);
+impl Oscillator {
+    fn new(sim: &mut Sim, id: u8, thermal_ppm: i32) -> (Self, usize) {
+        let s = sim.add_servo_with(id, thermal_ppm, DEFAULT_RESPONSE_DEADLINE_US);
+        (
+            Self {
+                thermal_ppm,
+                total: 0,
+            },
+            s,
+        )
     }
-    sim.run();
-    assert_eq!(sim.poll_clock_trim(s), None);
+
+    fn apply(&self, sim: &mut Sim, s: usize) {
+        let now = sim.now_us();
+        sim.set_servo_skew_at(now, s, self.thermal_ppm - self.total * STEP_PPM);
+    }
+
+    fn poll(&mut self, sim: &mut Sim, s: usize) -> Option<i8> {
+        let out = sim.poll_clock_trim(s);
+        if let Some(total) = out {
+            self.total = total as i32;
+            self.apply(sim, s);
+        }
+        out
+    }
+
+    fn drift_to(&mut self, sim: &mut Sim, s: usize, thermal_ppm: i32) {
+        self.thermal_ppm = thermal_ppm;
+        self.apply(sim, s);
+    }
 }
 
-/// The full composition: CAL anchors absolute, the tracker holds through
-/// quiet, then follows a later drift on top -- each layer consuming exactly
-/// its own signal.
+/// One truthful train at `t0`, its decision applied; returns the quiet
+/// instant after the train's hunt.
+fn cal(sim: &mut Sim, osc: &mut Oscillator, s: usize, t0: u64) -> u64 {
+    send_train(sim, t0, GAPS as u64 + 1);
+    sim.run();
+    osc.poll(sim, s);
+    train_end(t0) + 5_000
+}
+
+/// Traffic never trims: thermal drift between CALs leaves the trim where
+/// the last CAL put it however much silent food the servo hears and however
+/// often the main loop polls, and only the host's next CAL follows it
+/// (sec 9.3).
 #[test_log::test]
-fn cal_anchors_then_tracker_follows() {
+fn traffic_never_trims_between_cals() {
+    let mut sim = Sim::new(BaudRate::B1000000);
+    let (mut osc, s) = Oscillator::new(&mut sim, ID, 0);
+    let mut t = 0;
+    let mut decisions = Vec::new();
+    for chunk in 0..8 {
+        if chunk == 2 {
+            osc.drift_to(&mut sim, s, 6_900);
+        }
+        t = send_silent(&mut sim, t, 130) + PERIOD_US;
+        sim.run();
+        decisions.push(osc.poll(&mut sim, s));
+    }
+    assert!(
+        decisions.iter().all(Option::is_none),
+        "silent food decides nothing: {decisions:?}"
+    );
+    assert_eq!(osc.total, 0);
+}
+
+/// Every break latches a stamp, traffic's too: the announce drops what
+/// traffic left, so the ruler opens on the train's first mark.
+#[test_log::test]
+fn cal_ruler_opens_on_the_first_mark_after_traffic() {
     let mut sim = Sim::new(BaudRate::B1000000);
     let s = sim.add_servo_with(ID, 5_200, DEFAULT_RESPONSE_DEADLINE_US);
-    send_train(&mut sim, 0, GAPS as u64 + 1);
+    let t = send_silent(&mut sim, 0, 16);
+    send_train(&mut sim, t, GAPS as u64 + 1);
     sim.run();
+    assert_eq!(sim.poll_clock_trim(s), Some(2));
+}
+
+/// The host's periodic CAL follows a thermal shift: two trains converge
+/// the boot anchor, the oscillator then drifts by +6.9k ppm, and the next
+/// trains re-converge - the first takes the steps, the second reads the
+/// residual inside the deadband and identifies the step effect over them.
+#[test_log::test]
+fn cal_reconverges_after_a_thermal_shift() {
+    let mut sim = Sim::new(BaudRate::B1000000);
+    let (mut osc, s) = Oscillator::new(&mut sim, ID, 5_200);
+    let t = cal(&mut sim, &mut osc, s, 0);
+    let t = cal(&mut sim, &mut osc, s, t);
+    assert_eq!(osc.total, 2, "the trio's acquire jump");
+    osc.drift_to(&mut sim, s, 5_200 + 6_900);
+    let t = send_silent(&mut sim, t, 64);
+    let t = cal(&mut sim, &mut osc, s, t);
+    assert_eq!(osc.total, 5, "round(7100 / 2500) steps more");
+    cal(&mut sim, &mut osc, s, t);
     assert_eq!(
-        sim.poll_clock_trim(s),
-        Some(2),
-        "CAL takes the acquire jump"
-    );
-    // Quiet stretch (clear of the post-train hunt's trailing wakes):
-    // baseline recaptures post-CAL, windows read no drift.
-    let t = send_silent(&mut sim, train_end(0) + 5_000, 180);
-    sim.run();
-    assert_eq!(sim.poll_clock_trim(s), None, "no drift since the anchor");
-    // Motor heat: +2600 ppm on top of the boot skew.
-    sim.set_servo_skew_at(t, s, 5_200 + 2_600);
-    send_silent(&mut sim, t + PERIOD_US, 140);
-    sim.run();
-    assert_eq!(sim.poll_clock_trim(s), Some(3));
-}
-
-// ---- bench-shape regression ----------------------------------------------
-//
-// The hardware tracker probe feeds 24-frame WRITE|NOREPLY bursts with
-// ~4-bit seams and a -6.9k ppm host detune, and the silicon tracker reads
-// ZERO -- while every DES tracker test above (500 us-period FOREIGN traffic)
-// stays green. These twins replicate the bench shape exactly; the fork
-// between them and against silicon localizes the starvation.
-
-/// Bench burst geometry at 1M: 10-byte frame + break = 110 us wire,
-/// 4-bit host seam, 24 frames per burst, settle gap between bursts.
-const BURST_FRAMES: u64 = 24;
-const BURST_PERIOD_US: u64 = 114;
-const BURST_SETTLE_US: u64 = 5_000;
-
-fn goal_write(id: u8) -> Vec<u8> {
-    use osc_servo_core::regions::control::addr::lifecycle::GOAL_POSITION;
-    let mut payload = GOAL_POSITION.to_le_bytes().to_vec();
-    payload.extend_from_slice(&0i32.to_le_bytes());
-    instruction(id, Opcode::Write, Inst::FLAG_NOREPLY, &payload)
-}
-
-fn send_bursts(sim: &mut Sim, frame: &[u8], mut t: u64, bursts: u64) -> u64 {
-    for _ in 0..bursts {
-        for k in 0..BURST_FRAMES {
-            sim.host_send_at(t + k * BURST_PERIOD_US, frame);
-        }
-        t += BURST_FRAMES * BURST_PERIOD_US + BURST_SETTLE_US;
-    }
-    t
-}
-
-fn last_trim(sim: &mut Sim, s: usize) -> Option<i8> {
-    let mut last = None;
-    while let Some(v) = sim.poll_clock_trim(s) {
-        last = Some(v);
-    }
-    last
-}
-
-#[test_log::test]
-fn tracker_follows_bench_bursts_foreign() {
-    let mut sim = Sim::new(BaudRate::B1000000);
-    let s = sim.add_servo_with(ID, 0, DEFAULT_RESPONSE_DEADLINE_US);
-    let f = goal_write(OTHER_ID);
-    let t = send_bursts(&mut sim, &f, 0, 3);
-    sim.run();
-    assert_eq!(last_trim(&mut sim, s), None, "baseline absorbs the seam");
-    sim.set_servo_skew_at(t, s, 6_900);
-    send_bursts(&mut sim, &f, t + 100, 16);
-    sim.run();
-    let moved = last_trim(&mut sim, s);
-    assert!(
-        matches!(moved, Some(n) if n >= 2),
-        "foreign bursts feed the tracker: {moved:?}"
-    );
-}
-
-#[test_log::test]
-fn tracker_follows_bench_bursts_self_addressed() {
-    let mut sim = Sim::new(BaudRate::B1000000);
-    let s = sim.add_servo_with(ID, 0, DEFAULT_RESPONSE_DEADLINE_US);
-    let f = goal_write(ID);
-    let t = send_bursts(&mut sim, &f, 0, 3);
-    sim.run();
-    assert_eq!(last_trim(&mut sim, s), None, "baseline absorbs the seam");
-    sim.set_servo_skew_at(t, s, 6_900);
-    send_bursts(&mut sim, &f, t + 100, 16);
-    sim.run();
-    let moved = last_trim(&mut sim, s);
-    assert!(
-        matches!(moved, Some(n) if n >= 2),
-        "self-addressed bursts feed the tracker: {moved:?}"
-    );
-}
-
-/// The silicon reality behind the bench-shape starvation:
-/// NOREPLY frames leave the wire-fault flag latched (nothing transmits to
-/// retire it), and its level-pend re-fire lands in the seam before the
-/// next frame's bytes (transport sec 7). A re-fire is NOT a break -- stamping
-/// the drift tracker from it clobbers the pair in flight and starves the
-/// tracker to zero, while clean-break sims stay green. The fix gates the
-/// drift stamp on ring freshness (fault contract: fault handling is
-/// idempotent), the same cursor idiom the CAL run already uses.
-#[test_log::test]
-fn tracker_survives_latched_refires_between_frames() {
-    let mut sim = Sim::new(BaudRate::B1000000);
-    let s = sim.add_servo_with(ID, 0, DEFAULT_RESPONSE_DEADLINE_US);
-    let f = goal_write(ID);
-    let send = |sim: &mut Sim, mut t: u64, bursts: u64| -> u64 {
-        for _ in 0..bursts {
-            for k in 0..BURST_FRAMES {
-                sim.host_send_at(t + k * BURST_PERIOD_US, &f);
-                // A spurious wake per seam (the FE-era latched re-fire
-                // shape), just before the next frame's bytes.
-                sim.inject_wake_refire_at(t + k * BURST_PERIOD_US + 112, s);
-            }
-            t += BURST_FRAMES * BURST_PERIOD_US + BURST_SETTLE_US;
-        }
-        t
-    };
-    let t = send(&mut sim, 0, 3);
-    sim.run();
-    assert_eq!(last_trim(&mut sim, s), None, "baseline absorbs the seam");
-    sim.set_servo_skew_at(t, s, 6_900);
-    send(&mut sim, t + 100, 16);
-    sim.run();
-    let moved = last_trim(&mut sim, s);
-    assert!(
-        matches!(moved, Some(n) if n >= 2),
-        "re-fires must not eat the tracker's pairs: {moved:?}"
+        osc.total, 5,
+        "converged: the residual is inside half a step"
     );
 }

@@ -2,7 +2,7 @@ use ch32_metapac::ADC;
 
 use crate::hal::Pin;
 
-pub use ch32_metapac::adc::vals::{Extsel, SampleTime};
+pub use ch32_metapac::adc::vals::{Extsel, Jextsel, SampleTime};
 
 #[derive(Copy, Clone)]
 #[repr(u8)]
@@ -15,14 +15,16 @@ pub enum Channel {
     IN5 = 5,
     IN6 = 6,
     IN7 = 7,
-    // IN8 is unused on v006 (no external bonding on this package).
-    OpaOut = 9,
-    /// IN10 = "Vcal" per datasheet block diagram. SMP lives in SAMPTR1.
-    Vcal = 10,
+    /// IN8 = VREFINT, the 1.2 V internal reference (RM sec 9.2.2). The ADC
+    /// reference is VDD itself on this package, so this count is the one
+    /// reading of VDD: VDD = 1.2 V x 4096 / count. IN9 is the OPA's internal
+    /// output and IN10 ("VCAL" on the datasheet block diagram) is about
+    /// VDD/2, ratiometric, blind to a VDD change; neither is scanned.
+    Vref = 8,
 }
 
 impl Channel {
-    /// `None` for internal channels (OpaOut, Vcal). Caller configures pin as analog input.
+    /// `None` for internal channels (Vref). Caller configures pin as analog input.
     pub const fn pin(self) -> Option<Pin> {
         match self {
             Channel::IN0 => Some(Pin::PA2),
@@ -33,7 +35,7 @@ impl Channel {
             Channel::IN5 => Some(Pin::PD5),
             Channel::IN6 => Some(Pin::PD6),
             Channel::IN7 => Some(Pin::PD4),
-            Channel::OpaOut | Channel::Vcal => None,
+            Channel::Vref => None,
         }
     }
 }
@@ -58,15 +60,22 @@ impl Input {
 pub fn set_sequence(channels: &[Channel]) {
     assert!(!channels.is_empty() && channels.len() <= 16);
     for (i, &ch) in channels.iter().enumerate() {
-        let v = ch as u8;
-        match i {
-            0..=5 => ADC.rsqr3().modify(|w| w.set_sq(i, v)),
-            6..=11 => ADC.rsqr2().modify(|w| w.set_sq(i - 6, v)),
-            12..=15 => ADC.rsqr1().modify(|w| w.set_sq(i - 12, v)),
-            _ => unreachable!(),
-        }
+        set_slot(i, ch);
     }
     ADC.rsqr1().modify(|w| w.set_l((channels.len() - 1) as u8));
+}
+
+/// Regular slot `i` (0..16) converts `ch`; the sequence length stands. A
+/// write under a live conversion restarts the group (RM sec 9.2.2).
+pub fn set_slot(i: usize, ch: Channel) {
+    let v = ch as u8;
+    match i {
+        0..=5 => ADC.rsqr3().modify(|w| w.set_sq(i, v)),
+        6..=11 => ADC.rsqr2().modify(|w| w.set_sq(i - 6, v)),
+        12..=15 => ADC.rsqr1().modify(|w| w.set_sq(i - 12, v)),
+        // A group holds 16 slots; there is no register past them to write.
+        _ => {}
+    }
 }
 
 pub fn set_sample_time(channel: Channel, t: SampleTime) {
@@ -86,6 +95,55 @@ pub fn set_external_trigger(source: Extsel) {
     });
 }
 
+/// A two-conversion injected group, `first` then `second`, started by
+/// `source`. With JL = 1 the group converts JSQ3 then JSQ4 (RM sec 9.3.11).
+/// Write before `enable`: a CTLR2 write with ADON set starts a regular
+/// conversion.
+pub fn set_injected(first: Channel, second: Channel, source: Jextsel) {
+    set_injected_channels(first, second);
+    ADC.ctlr2().modify(|w| {
+        w.set_jextsel(source);
+        w.set_jexttrig(true);
+    });
+}
+
+/// The injected group converts `first` then `second`. A write under a live
+/// conversion restarts the group (RM sec 9.2.2).
+pub fn set_injected_channels(first: Channel, second: Channel) {
+    ADC.isqr().write(|w| {
+        w.set_jl(1);
+        w.set_jsq(2, first as u8);
+        w.set_jsq(3, second as u8);
+    });
+}
+
+/// IDATAR(n + 1), no offset programmed: at JL = 1 IDATAR1 holds the first
+/// conversion (JSQ3) and IDATAR2 the second (JSQ4), as the tick block's
+/// rest readings show (`providers::sensors`).
+#[inline(always)]
+pub fn injected_data(n: usize) -> u16 {
+    ADC.idatar(n).read().jdata()
+}
+
+/// CTLR1.JEOCIE: the ADC vector on the injected group's end. EOCIE stays
+/// clear: the injected group sets EOC too.
+pub fn set_jeoc_irq(enable: bool) {
+    ADC.ctlr1().modify(|w| w.set_jeocie(enable));
+}
+
+/// Clears STATR.JEOC alone. Each flag clears on a 0 and holds on a 1 (RM
+/// sec 9.3.1), so the regular scan running behind the group keeps its EOC
+/// and STRT.
+#[inline(always)]
+pub fn clear_jeoc() {
+    ADC.statr().write(|w| {
+        w.set_awd(true);
+        w.set_eoc(true);
+        w.set_jstrt(true);
+        w.set_strt(true);
+    });
+}
+
 pub fn set_scan_mode(enable: bool) {
     ADC.ctlr1().modify(|w| w.set_scan(enable));
 }
@@ -94,15 +152,108 @@ pub fn set_dma(enable: bool) {
     ADC.ctlr2().modify(|w| w.set_dma(enable));
 }
 
-/// CTLR3.ADC_LP. Reset default is set; gates the internal OPA->IN9 path,
-/// so it must be cleared before the OpaOut channel reads non-zero.
+/// Shuts the DMA tap, parks the trigger on SWSTART, never pulsed, and stops
+/// the injected trigger, in ONE CTLR2 write. That write starts a conversion of
+/// its own (RM sec 9.3.3), but after it nothing else can until the next CTLR2
+/// write, so once that one retires the converter is provably idle.
+pub fn park() {
+    ADC.ctlr2().modify(|w| {
+        w.set_extsel(Extsel::SWSTART);
+        w.set_dma(false);
+        w.set_jexttrig(false);
+    });
+}
+
+/// CTLR2.CONT: the converter re-triggers itself after each conversion instead
+/// of waiting for the next trigger.
+pub fn set_continuous(enable: bool) {
+    ADC.ctlr2().modify(|w| w.set_cont(enable));
+}
+
+/// Launches a free-running software-triggered run with the DMA tap open, in
+/// ONE CTLR2 write. Any CTLR2 write with ADON set starts a conversion (RM sec
+/// 9.3.3), so splitting this would open the tap onto a conversion that had
+/// already begun and land a partial first sample. Caller owns SCAN, the
+/// regular sequence, and the armed DMA channel.
+pub fn start_continuous_dma() {
+    ADC.ctlr2().modify(|w| {
+        w.set_extsel(Extsel::SWSTART);
+        w.set_exttrig(true);
+        w.set_cont(true);
+        w.set_dma(true);
+        w.set_swstart(true);
+    });
+}
+
+/// Re-arms the externally-triggered scan in ONE CTLR2 write: trigger source,
+/// trigger enable, and the DMA tap together. Splitting it opens a window in
+/// which a trigger starts a scan the DMA cannot deliver, and the tap then
+/// opens partway through that scan -- the buffer fills from the middle of the
+/// sequence and every slot index is off by however far it got (bench: the
+/// sensor frame came back rotated three slots and the undervolt fault
+/// latched). Caller has SCAN, the regular sequence, and the DMA channel ready.
+/// The injected trigger [`park`] stopped comes back on its bringup source.
+pub fn arm_scan(source: Extsel) {
+    ADC.ctlr2().modify(|w| {
+        w.set_extsel(source);
+        w.set_exttrig(true);
+        w.set_dma(true);
+        w.set_jexttrig(true);
+    });
+}
+
+/// RDATAR's absolute address, for a DMA peripheral-side program.
+pub fn data_addr() -> u32 {
+    ADC.rdatar().as_ptr() as u32
+}
+
+/// CTLR3.ADC_LP (RM sec 9.3.14). Reset default is set (low-power, sub-1M
+/// sampling); clearing it picks the high-power converter, which the
+/// datasheet rates for VDD >= 4.5 V only.
 pub fn set_low_power(enable: bool) {
     ADC.ctlr3().modify(|w| w.set_adc_lp(enable));
 }
 
+/// ADON off->on wakes the converter from power-down; the delay covers tSTAB
+/// (RM sec 9.2.2). An on->on write instead *starts* a conversion, so callers
+/// that already enabled the ADC must [`disable`] it first.
 pub fn enable() {
     ADC.ctlr2().modify(|w| w.set_adon(true));
     crate::hal::delay_cycles(1_000);
+}
+
+pub fn disable() {
+    ADC.ctlr2().modify(|w| w.set_adon(false));
+}
+
+/// Polls for EOC this many times before giving up. A conversion is at most
+/// 54 ADCCLK cycles, so exceeding this means the converter is not running.
+const EOC_POLL_LIMIT: u32 = 100_000;
+
+/// One software-triggered conversion of `channel`, polled. Overwrites the
+/// regular sequence and the trigger source; the caller owns ADON, scan and
+/// DMA state, and must have armed [`set_external_trigger`] with
+/// [`Extsel::SWSTART`] beforehand. `None` = EOC never arrived (see
+/// [`EOC_POLL_LIMIT`]).
+pub fn convert_once(channel: Channel) -> Option<u16> {
+    set_sequence(&[channel]);
+    // SWSTART always changes state here (hardware clears it), so the
+    // same-value ADON bit in this write cannot start a second conversion of
+    // its own (RM sec 9.3.3, ADON note).
+    ADC.ctlr2().modify(|w| {
+        w.set_extsel(Extsel::SWSTART);
+        w.set_exttrig(true);
+        w.set_swstart(true);
+    });
+    let mut polls = EOC_POLL_LIMIT;
+    while !ADC.statr().read().eoc() {
+        polls -= 1;
+        if polls == 0 {
+            return None;
+        }
+    }
+    // Reading RDATAR clears EOC.
+    Some(ADC.rdatar().read().data())
 }
 
 #[cfg(test)]
@@ -129,8 +280,7 @@ mod tests {
 
     #[test]
     fn internal_channels_have_no_pin() {
-        assert!(Channel::OpaOut.pin().is_none());
-        assert!(Channel::Vcal.pin().is_none());
+        assert!(Channel::Vref.pin().is_none());
     }
 
     #[test]

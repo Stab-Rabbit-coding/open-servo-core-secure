@@ -17,10 +17,9 @@ pub const TICKS_PER_US: u64 = 48;
 /// 10 bit-times per UART character (8N1) -- the byte and break unit (sec 2).
 const BITS_PER_BYTE: u64 = 10;
 
-/// SBK break length; measured ~14 bit-times, zero variance [F5]. The ring
-/// byte and `on_break` are delivered at the break's *end* -- where the
-/// detector latches (silicon: LBD sets at the rising edge that ends the span;
-/// == bit 10 for the 10-bit law break).
+/// SBK break length; measured ~14 bit-times, zero variance [F5]. `on_break`
+/// is delivered at the break's *end*, its ring byte beside it or
+/// [`break_wake_lead`] after it (see [`super::BreakWake`]).
 const BREAK_BITS: u64 = 14;
 
 /// Runaway guards: a wedged scenario must fail loudly, not spin forever.
@@ -40,6 +39,12 @@ pub fn byte_ticks(baud: BaudRate) -> u64 {
 pub fn break_ticks(baud: BaudRate) -> u64 {
     bit_ticks(baud) * BREAK_BITS
 }
+/// How far the chip's TIM2 wake (9.5 bit-times of low) leads the break's
+/// ringed 0x00 (10).
+#[inline]
+pub fn break_wake_lead(baud: BaudRate) -> u64 {
+    bit_ticks(baud) / 2
+}
 
 /// Who is driving the wire (sec 2 drive discipline). `Host` schedules the bus;
 /// `Servo(index)` is a replying node -- index, not id, so the F8 assert names
@@ -56,7 +61,7 @@ pub enum Event {
     /// receivers whose rate qualifies the span (sec 3.4: the detector is
     /// length-qualified -- >=10 of the RECEIVER's bit-times -- so a break
     /// wakes only servos at or above `baud`). `break_start` is the
-    /// recorded frame's `at`; delivery is at break end.
+    /// recorded frame's `at`; the wake is delivered at break end.
     WireBreak {
         talker: Talker,
         baud: BaudRate,
@@ -78,12 +83,14 @@ pub enum Event {
     /// rings a 0x00 and wakes qualified receivers, invisible to the frame
     /// recorder (noise, not traffic).
     StrayBreak { baud: BaudRate },
-    /// A rescue pulse crossed the sampler threshold (sec 9.1): every servo's
-    /// main-loop sampler has seen >= RESCUE_LOW_US of continuous low with the
-    /// ring frozen -- deliver `on_rescue_break` (a thread-level event, not a
-    /// vector; the pulse still holds the line). The pulse's END additionally
-    /// fires an ordinary break wake ([`Event::StrayBreak`]).
-    RescueDeclare,
+    /// Every servo's main-loop line sampler reads the wire once (sec 9.1,
+    /// `sample_rescue`, thread-level, not a vector) at [`Core::line_low`]'s
+    /// level. A `pump` sample re-arms one sample period on while a held
+    /// pulse lasts: the chip's idle wake cadence.
+    LineSample { pump: bool },
+    /// A rescue pulse has held the line a break's length: every receiver
+    /// rings one 0x00 and wakes at its own rate.
+    PulseWake,
     /// The host's frame drained -- finalize the recorded frame.
     HostFrameEnd,
     /// Scheduled quiet: nothing happens, sim time passes (the paced-client
@@ -94,21 +101,50 @@ pub enum Event {
     Compare { servo: usize, generation: u64 },
     /// Test-injected oscillator drift (sec 9.3): servo `servo`'s clock RATE
     /// becomes `ppm` here, continuously -- re-anchored, the reading never
-    /// steps (thermal drift as the tracker sees it).
+    /// steps (thermal drift).
     SkewChange { servo: usize, ppm: i32 },
-    /// Test-injected spurious wake: the break vector re-enters with NO new
+    /// The break vector enters: a test-injected spurious wake with NO new
     /// wire byte (a coalesced or lagged break service -- sec 3.4's reason to
-    /// demand idempotence).
+    /// demand idempotence), or a lagged break's own service.
     WakeRefire { servo: usize },
+    /// A break's 0x00 lands in servo `servo`'s ring after its wake
+    /// ([`super::BreakWake::BeforeByte`]).
+    BreakByte { servo: usize },
     /// A servo TX DMA arm completed -- drive `on_tx_complete`.
     TxArmDone { servo: usize },
+    /// The TEL lane's TX DMA reads one image byte into the data register;
+    /// it rings at `at`, its stop bit. `src` points into a leaked channel.
+    /// The image's `last` byte closes the recorded frame behind it: the
+    /// lane raises no TX-done.
+    DmaFetch {
+        talker: Talker,
+        src: *const u8,
+        baud: BaudRate,
+        at: u64,
+        last: bool,
+    },
+    /// The servo's TEL frame left the wire.
+    ServoTxEnd { talker: Talker },
+    /// A servo's TEL fast-tick pump fired (kernel 50 us grid): synthesize one
+    /// sample into the kernel-side feed. Stale epochs (aborted bursts) drop.
+    TelTick { servo: usize, epoch: u64 },
     /// A servo's handler body ended (`super::cpu`): deliver one pended vector.
     CpuFree { servo: usize },
+    /// A servo's ADC scan completed: pend its kernel lane's tick.
+    KernelScan { servo: usize },
+    /// Re-try entering a servo's pended kernel tick.
+    KernelRetry { servo: usize },
+    /// A servo's kernel body reached its tail: the TEL sample and poll.
+    KernelTail { servo: usize },
     /// The attached host engine's tick-compare fired; same generation gate
     /// as `Compare`.
     HostCompare { generation: u64 },
     /// The host engine's TX span drained -- drive its `on_tx_complete`.
     HostTxDone,
+    /// The adapter's break-detector service: mark the last ringed byte.
+    HostMark,
+    /// A servo's bootloader reply left: it resets, toward the app if `app`.
+    BootReset { servo: usize, app: bool },
 }
 
 struct Scheduled {
@@ -154,8 +190,12 @@ pub struct Core {
     processed: u64,
     // Drive discipline: the current owner and how far its claim reaches.
     busy: Option<(Talker, u64)>,
+    // A rescue pulse holding the line dominant over `[start, end)`.
+    held: Option<(u64, u64)>,
     pending: Option<PendingFrame>,
     recorded: Vec<WireFrame>,
+    /// The end of the host's last byte sent with no break ahead of it.
+    pub last_breakless_tx: Option<u64>,
 }
 
 impl Core {
@@ -166,8 +206,10 @@ impl Core {
             now: 0,
             processed: 0,
             busy: None,
+            held: None,
             pending: None,
             recorded: Vec::new(),
+            last_breakless_tx: None,
         }
     }
 
@@ -180,6 +222,15 @@ impl Core {
         let seq = self.seq;
         self.seq += 1;
         self.heap.push(Scheduled { time, seq, event });
+    }
+
+    /// Pop the earliest event at or before `limit`, else `None` - the main
+    /// loop's turn at a chosen instant (`Sim::run_until`).
+    pub fn pop_until(&mut self, limit: u64) -> Option<Event> {
+        if self.heap.peek()?.time > limit {
+            return None;
+        }
+        self.pop()
     }
 
     /// Pop the earliest event, advancing the clock and tripping the runaway
@@ -234,6 +285,36 @@ impl Core {
         self.busy = Some((talker, reach));
     }
 
+    // --- line level (sec 9.1 sampler) -------------------------------------
+
+    /// A rescue pulse holds the line over `[start, end)` (`u64::MAX` while
+    /// its width is open): start the sampler pump once the pulse's own 0x00
+    /// has rung at every receiver rate (a break and a bit at the slowest).
+    pub fn hold_low(&mut self, start: u64, end: u64) {
+        self.held = Some((start, end));
+        let first = start + break_ticks(BaudRate::B500000) + bit_ticks(BaudRate::B500000);
+        self.schedule(Event::LineSample { pump: true }, first);
+    }
+
+    /// Close an open hold at `at`.
+    pub fn release_low(&mut self, at: u64) {
+        if let Some((start, _)) = self.held {
+            self.held = Some((start, at));
+        }
+    }
+
+    pub fn held_now(&self) -> bool {
+        matches!(self.held, Some((start, end)) if start <= self.now && self.now < end)
+    }
+
+    /// The level servo `servo`'s sampler reads now: low under a held pulse,
+    /// and low throughout its own TX - the worst case, every sample landing
+    /// on a low bit of an own byte, which HDSEL keeps out of the ring.
+    pub fn line_low(&self, servo: usize) -> bool {
+        self.held_now()
+            || matches!(self.busy, Some((Talker::Servo(j), end)) if j == servo && self.now < end)
+    }
+
     // --- wire recorder ----------------------------------------------------
 
     /// Begin the frame a break opens; its ring image starts with the 0x00
@@ -242,6 +323,11 @@ impl Core {
     /// frame's record -- the wire carries one span of colliding energy, not
     /// two frames. Any host-involved overlap is a harness invariant break.
     pub fn begin_frame(&mut self, at: u64, talker: Talker) {
+        // A servo's frame ends at its last byte; its release body may still
+        // wait for the CPU (no wire deadline at TC, transport sec 7).
+        if matches!(&self.pending, Some(p) if matches!(p.talker, Talker::Servo(_)) && at >= p.end) {
+            self.finalize_frame();
+        }
         if let Some(p) = self.pending.as_mut() {
             if matches!(p.talker, Talker::Servo(_)) && matches!(talker, Talker::Servo(_)) {
                 p.collided = true;
@@ -267,6 +353,13 @@ impl Core {
         if let Some(p) = self.pending.as_mut() {
             p.bytes.push(byte);
             p.end = at;
+        }
+    }
+
+    /// A servo released the wire: close its frame if still recording.
+    pub fn finalize_servo_frame(&mut self, talker: Talker) {
+        if matches!(&self.pending, Some(p) if p.talker == talker) {
+            self.finalize_frame();
         }
     }
 

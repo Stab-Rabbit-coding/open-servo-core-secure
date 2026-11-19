@@ -3,23 +3,42 @@ use ch32_metapac::DMA1;
 pub use ch32_metapac::dma::vals::{Dir, Pl, Size};
 
 /// DMA1 priority ladder (arbiter: higher `Pl` wins; equal `Pl` breaks by
-/// lowest channel number). The one hard invariant is that an inbound RX byte's
-/// drain must never be deferred past the FE-IRQ entry -- a deferred drain lets
-/// the break IRQ read a cursor that hasn't counted the byte (no-reply) or a
-/// `DATAR` clear steal it (ring loss). A bringup spike (`rx_dma_drain_latency`)
-/// proved the arbiter preempts per-beat, so RX alone at the top bounds its
-/// drain wait to one in-flight transfer (much less than IRQ latency) regardless
-/// of any competitor's burst length:
+/// lowest channel number, RM sec 8.2.1). The one hard invariant is that an
+/// inbound RX byte's drain is never deferred past a transport ISR's cursor
+/// read -- a deferred drain hands the service a cursor that hasn't counted
+/// the byte. A bringup spike (`rx_dma_drain_latency`) proved the arbiter
+/// preempts per-beat, so RX at the top bounds its drain wait to one
+/// in-flight transfer regardless of any competitor's burst length:
 ///
 ///   VERYHIGH  CH5 RX ring          -- inbound bytes, never deferred
+///             CH7 TIM2_CH2 zero    -- one halfword into the break detector's
+///                                    counter per rising bus edge (TIM2_CH2
+///                                    has no other channel; I2C1_RX shares
+///                                    it). It must land before the next low
+///                                    has counted the detector's last 0.25
+///                                    bit-time on top of a 9-bit data low:
+///                                    about one bit, 16 HCLK at 3M. RX wins
+///                                    the tie, so each waits at most one beat
+///                                    of the other; at HIGH it would lose
+///                                    every beat of a snapshot copy
 ///   HIGH      CH1 ADC              -- motor kernel; wins HIGH ties (lowest #)
+///             CH2 TIM2_UP stamp    -- one halfword of TIM3's count into the
+///                                    break-stamp ring per detector overflow.
+///                                    Below RX by priority, so it never
+///                                    defers a byte; above CH4/CH6 by number,
+///                                    so a snapshot copy never defers it past
+///                                    one beat
 ///             CH4 TX               -- reply wire arms
-///             CH6 M2M -> snapshot  -- copies the reply payload for CRC + wire
+///             CH6 M2M              -- copies the reply payload into the
+///                                    snapshot for CRC + wire, or, while a
+///                                    TEL burst streams, the rows into the
+///                                    frame images
 ///   MEDIUM    CH3 SPI-CRC feed     -- must run BEHIND CH6 so the copy it reads
 ///                                    is written first (producer -> consumer)
 ///
-/// RX CRC feeds the SPI engine straight from the ring (no M2M staging), so CH6
-/// serves only the reply snapshot and CH7 is unused.
+/// RX CRC feeds the SPI engine straight from the ring (no M2M staging), so
+/// CH6 serves only the reply snapshot and the TEL rows, which never meet:
+/// the bus stages no reply while it has lent the lane.
 #[derive(Copy, Clone)]
 #[repr(u8)]
 pub enum Channel {
@@ -64,6 +83,53 @@ pub fn configure(ch: Channel, cfg: &Config, paddr: u32, maddr: u32, count: u16) 
     });
 }
 
+/// `cfg`'s whole CR value, EN clear, for [`rearm`] and [`stop`].
+#[inline(always)]
+pub fn cr_of(cfg: &Config) -> ch32_metapac::dma::regs::Cr {
+    let mut w = ch32_metapac::dma::regs::Cr(0);
+    w.set_dir(cfg.dir);
+    w.set_circ(cfg.circ);
+    w.set_pinc(cfg.pinc);
+    w.set_minc(cfg.minc);
+    w.set_psize(cfg.size);
+    w.set_msize(cfg.size);
+    w.set_htie(cfg.htie);
+    w.set_tcie(cfg.tcie);
+    w.set_pl(cfg.pl);
+    w
+}
+
+/// [`cr_of`] for a memory-to-memory copy: PAR is the source.
+#[inline(always)]
+pub fn cr_m2m(cfg: &Config) -> ch32_metapac::dma::regs::Cr {
+    let mut w = cr_of(cfg);
+    w.set_mem2mem(true);
+    w
+}
+
+/// [`configure`] and start in whole-register writes: no read-modify-write,
+/// so no critical section. Only for a channel no other context touches
+/// meanwhile.
+#[inline(always)]
+pub fn rearm(ch: Channel, cr: ch32_metapac::dma::regs::Cr, paddr: u32, maddr: u32, count: u16) {
+    let n = (ch as u8 - 1) as usize;
+    let c = DMA1.ch(n);
+    c.cr().write_value(cr);
+    c.par().write_value(paddr);
+    c.mar().write_value(maddr);
+    c.ndtr().write(|w| w.set_ndt(count));
+    let mut on = cr;
+    on.set_en(true);
+    c.cr().write_value(on);
+}
+
+/// [`disable`] as one whole-register write of `cr` (see [`rearm`]).
+#[inline(always)]
+pub fn stop(ch: Channel, cr: ch32_metapac::dma::regs::Cr) {
+    let n = (ch as u8 - 1) as usize;
+    DMA1.ch(n).cr().write_value(cr);
+}
+
 /// Memory-to-memory byte copy: `src` -> `dst`, `count` bytes, started
 /// immediately (no peripheral request -- MEM2MEM free-runs at bus speed).
 /// PAR is the source (DIR = from-peripheral), both sides increment.
@@ -94,11 +160,10 @@ pub fn set_count(ch: Channel, count: u16) {
 
 // SAFETY: see hal/SAFETY.md. CH(n).CR is per-channel; channels driven from
 // >= 2 priority contexts (the CH4 TX channel today, touched from MAIN and
-// HIGH ISRs) need the CS to keep EN/TCIE RMW atomic. Single-context channels
+// the bus ISRs) need the CS to keep EN/TCIE RMW atomic. Single-context channels
 // pay the CS cost but stay correct.
-// `inline(always)` folds this into the TIM2 CC3 hot path so the wire-driver
-// activate sequence stays inside the `.highcode` body -- no standalone flash
-// fetch per call.
+// `inline(always)` keeps this inside its caller's body, so a caller placed in
+// RAM (`.data.ram_code`) makes no flash fetch for it.
 #[inline(always)]
 pub fn enable(ch: Channel) {
     let n = (ch as u8 - 1) as usize;

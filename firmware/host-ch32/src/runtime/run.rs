@@ -1,14 +1,19 @@
 //! The main loop: USB pump -> pipe bytes into the link server -> engine
 //! events out as records -> USB IN. The transport ISRs run underneath;
-//! every main-loop touch of the bus sits inside a critical section.
+//! every main-loop touch of the bus sits inside `Drivers::with_bus`.
 
+use osc_host::link::record::{
+    FEATURE_ADAPTER_IAP, FEATURE_RAILS, FEATURE_TINYBOOT, PHASE_ADAPTER_REQ, PHASE_PIPE,
+    PHASE_PUMP, PHASE_USB_POLL, PHASE_USB_TX,
+};
 use osc_host::link::{AdapterRequest, LinkServer, RecordSink};
 use osc_host::traits::tick_reached;
 
-use crate::hal::systick;
+use crate::hal::{iwdg, pfic, systick};
 use crate::providers::edges::Edges;
 use crate::providers::pins;
-use crate::runtime::{Drivers, iap, init, usb::UsbDevice};
+use crate::providers::ring::RxRing;
+use crate::runtime::{Drivers, crash, iap, init, usb::UsbDevice};
 
 /// Outbound record staging between the sans-io server and USB IN packets.
 /// Sized so a whole RX ring of statuses fits; the pump gate below keeps
@@ -20,8 +25,9 @@ const TXQ_CAP: usize = 4096;
 const PUMP_HEADROOM: usize = 2048;
 
 /// Pipe flush bound before the bootloader reset: a host that stops reading
-/// after requesting the bootloader forfeits its ack.
-const FLUSH_BOUND_US: u32 = 100_000;
+/// after requesting the bootloader forfeits its DONE. The longest bounded
+/// stall on the main loop; the watchdog period derives from it.
+pub(crate) const FLUSH_BOUND_US: u32 = 100_000;
 
 /// LED pulse stretch per pipe-activity event: long enough to see, short
 /// enough that a busy pipe reads as flicker. Dark at idle.
@@ -48,6 +54,11 @@ impl TxQueue {
 
     fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.read = 0;
+        self.len = 0;
     }
 
     /// Dequeue up to `dst.len()` bytes (records are a byte stream; USB
@@ -84,39 +95,52 @@ impl RecordSink for TxQueue {
 /// Bring the adapter up and serve forever.
 pub fn run() -> ! {
     if !init::bringup() {
+        crash::note_hse_fail();
         fail_blink();
     }
 
     let mut usb = UsbDevice::new();
-    let mut server = LinkServer::new();
+    let mut server = LinkServer::new(FEATURE_RAILS | FEATURE_ADAPTER_IAP | FEATURE_TINYBOOT);
+    server.set_diag(crash::diag());
     let mut txq = TxQueue::new();
+    let mut zlp_owed = false;
     // Latched out once reached: a bare tick comparison would re-fire every
     // half wrap (~119 s) of the tick domain and strobe the idle LED.
     let mut led_until: Option<u32> = None;
 
     loop {
+        iwdg::kick();
+        crash::phase(PHASE_USB_POLL);
         usb.poll();
-        // Keep the edge-capture lap accounting honest (main-loop cadence
-        // is the overflow detector's sampling clock).
+        // Queued bytes belong to a host that is gone; a partly sent record
+        // would lead the new session's stream with a hole.
+        if usb.take_new_session() {
+            txq.clear();
+            zlp_owed = false;
+            Drivers::with_bus(|bus| server.reset_session(bus));
+        }
+        // Keep the edge-capture and RX-ring lap accounting honest (main-loop
+        // cadence is their sampling clock; the pump gate below may keep the
+        // engine off the ring for many passes).
         Edges::poll_accumulate();
+        RxRing::poll_accumulate();
 
         // Inbound pipe bytes -> server -> engine. Held NAK-parked until
         // the queue can absorb the worst-case reply burst.
         if txq.free() >= PUMP_HEADROOM
             && let Some(bytes) = usb.rx()
         {
-            critical_section::with(|_| {
-                // SAFETY: main-loop bus access under CS (registry doc).
-                let bus = unsafe { Drivers::bus() };
-                server.on_pipe(bytes, bus, &mut txq);
-            });
+            crash::phase(PHASE_PIPE);
+            server.set_uptime_ticks(systick::ticks64());
+            Drivers::with_bus(|bus| server.on_pipe(bytes, bus, &mut txq));
             usb.rx_consume();
             led_until = Some(systick::ticks().wrapping_add(LED_PULSE_US * systick::TICKS_PER_US));
         }
 
         match server.take_adapter_request() {
             Some(AdapterRequest::EnterBootloader) => {
-                flush_pipe(&mut usb, &mut txq);
+                crash::phase(PHASE_ADAPTER_REQ);
+                flush_pipe(&mut usb, &mut txq, zlp_owed);
                 iap::enter_bootloader();
             }
             Some(AdapterRequest::SetRails { v3v3, v5 }) => {
@@ -128,18 +152,13 @@ pub fn run() -> ! {
 
         // Engine events -> records, same headroom gate.
         if txq.free() >= PUMP_HEADROOM {
-            critical_section::with(|_| {
-                // SAFETY: main-loop bus access under CS (registry doc).
-                let bus = unsafe { Drivers::bus() };
-                server.pump(bus, &mut txq);
-            });
+            crash::phase(PHASE_PUMP);
+            Drivers::with_bus(|bus| server.pump(bus, &mut txq));
         }
 
-        if usb.tx_ready() && !txq.is_empty() {
-            let mut pkt = [0u8; 512];
-            let mps = usb.mps().min(pkt.len());
-            let n = txq.pop_into(&mut pkt[..mps]);
-            usb.tx(&pkt[..n]);
+        if usb.tx_ready() && (!txq.is_empty() || zlp_owed) {
+            crash::phase(PHASE_USB_TX);
+            zlp_owed = send_packet(&mut usb, &mut txq);
             led_until = Some(systick::ticks().wrapping_add(LED_PULSE_US * systick::TICKS_PER_US));
         }
 
@@ -152,37 +171,53 @@ pub fn run() -> ! {
     }
 }
 
-/// Drain the queued records (the bootloader ack among them) out the IN
+/// One IN packet off the queue; returns whether the burst still owes a
+/// zero-length packet.
+fn send_packet(usb: &mut UsbDevice, txq: &mut TxQueue) -> bool {
+    let mut pkt = [0u8; 512];
+    let mps = usb.mps().min(pkt.len());
+    let n = txq.pop_into(&mut pkt[..mps]);
+    usb.tx(&pkt[..n]);
+    owes_zlp(n, mps, txq.is_empty())
+}
+
+/// Every burst ends in a short packet (link sec 8.1): a host read only
+/// completes on one, so a burst that ends on a full packet sits unread
+/// until the next record arrives unless a zero-length packet follows.
+fn owes_zlp(sent: usize, mps: usize, drained: bool) -> bool {
+    sent == mps && drained
+}
+
+/// Drain the queued records (the ADAPTER_IAP DONE among them) out the IN
 /// endpoint, bounded -- then the port is allowed to die.
-fn flush_pipe(usb: &mut UsbDevice, txq: &mut TxQueue) {
+fn flush_pipe(usb: &mut UsbDevice, txq: &mut TxQueue, mut zlp_owed: bool) {
     let start = systick::ticks();
     let bound = FLUSH_BOUND_US.saturating_mul(systick::TICKS_PER_US);
     while systick::ticks().wrapping_sub(start) < bound {
         usb.poll();
         if usb.tx_ready() {
-            if txq.is_empty() {
+            if txq.is_empty() && !zlp_owed {
                 return;
             }
-            let mut pkt = [0u8; 512];
-            let mps = usb.mps().min(pkt.len());
-            let n = txq.pop_into(&mut pkt[..mps]);
-            usb.tx(&pkt[..n]);
+            zlp_owed = send_packet(usb, txq);
         }
     }
 }
 
-/// Dead crystal: triple pulse forever. Timing runs off whatever clock the
-/// loader left (visibly wrong scale is fine -- the pattern is the signal).
+/// Dead crystal: one triple pulse, then reset and try again: a marginal
+/// crystal recovers on its own, and the pattern keeps repeating across
+/// resets if it never does (the record counts the attempts). Timing runs
+/// off whatever clock the loader left (visibly wrong scale is fine, the
+/// pattern is the signal); the watchdog, already running, backstops it.
 fn fail_blink() -> ! {
-    loop {
-        for _ in 0..3 {
-            blink_delay(120_000);
-            pins::led(true);
-            blink_delay(120_000);
-            pins::led(false);
-        }
-        blink_delay(800_000);
+    for _ in 0..3 {
+        blink_delay(120_000);
+        pins::led(true);
+        blink_delay(120_000);
+        pins::led(false);
     }
+    blink_delay(800_000);
+    pfic::software_reset()
 }
 
 fn blink_delay(us: u32) {
@@ -190,5 +225,44 @@ fn blink_delay(us: u32) {
     let ticks = us.saturating_mul(systick::TICKS_PER_US);
     while systick::ticks().wrapping_sub(start) < ticks {
         core::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::vec::Vec;
+
+    use super::*;
+
+    fn drain(q: &mut TxQueue) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pkt = [0u8; 64];
+        while !q.is_empty() {
+            let n = q.pop_into(&mut pkt);
+            out.extend_from_slice(&pkt[..n]);
+        }
+        out
+    }
+
+    #[test]
+    fn only_a_burst_ending_on_a_full_packet_owes_a_zlp() {
+        assert!(owes_zlp(512, 512, true));
+        assert!(!owes_zlp(512, 512, false), "the burst goes on");
+        assert!(!owes_zlp(511, 512, true), "already short");
+        assert!(!owes_zlp(0, 512, true), "the zlp itself");
+    }
+
+    #[test]
+    fn a_record_half_sent_before_a_new_session_never_reaches_it() {
+        let mut q = TxQueue::new();
+        q.record(&[0xAA; 100]);
+        let mut pkt = [0u8; 64];
+        q.pop_into(&mut pkt);
+        q.clear();
+        q.record(&[1, 2, 3]);
+        assert_eq!(drain(&mut q), [1, 2, 3]);
+        assert_eq!(q.free(), TXQ_CAP);
     }
 }

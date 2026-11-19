@@ -12,10 +12,13 @@ use osc_protocol::wire::{BaudRate, Id, Inst, ResultCode};
 use crate::traits;
 
 pub const RING_LEN: usize = 512;
+pub const MARKS_LEN: usize = 64;
 
 struct RingState {
     buf: UnsafeCell<[u8; RING_LEN]>,
-    cursor: Cell<u16>,
+    written: Cell<u32>,
+    marks: UnsafeCell<[u32; MARKS_LEN]>,
+    marked: Cell<u32>,
 }
 
 /// Counted RX ring the test feeds like the wire would.
@@ -26,21 +29,35 @@ impl FakeRing {
     pub fn new() -> Self {
         FakeRing(Rc::new(RingState {
             buf: UnsafeCell::new([0xFF; RING_LEN]),
-            cursor: Cell::new(0),
+            written: Cell::new(0),
+            marks: UnsafeCell::new([0; MARKS_LEN]),
+            marked: Cell::new(0),
         }))
     }
 
-    /// Ring bytes in at the cursor, advancing it -- one wire arrival.
+    /// A break plus the bytes behind it: `bytes[0]` is the break's ring
+    /// byte and gets the detector's mark.
+    pub fn frame(&self, bytes: &[u8]) {
+        let at = self.0.written.get();
+        self.feed(bytes);
+        // SAFETY: as `feed`.
+        let marks = unsafe { &mut *self.0.marks.get() };
+        let n = self.0.marked.get();
+        marks[n as usize % MARKS_LEN] = at;
+        self.0.marked.set(n.wrapping_add(1));
+    }
+
+    /// Ring bytes no break heads, in at the cursor - one wire arrival.
     pub fn feed(&self, bytes: &[u8]) {
         // SAFETY: test-only, single-threaded; never called while a
         // `bytes()` slice is live.
         let buf = unsafe { &mut *self.0.buf.get() };
-        let mut c = self.0.cursor.get() as usize;
+        let mut w = self.0.written.get();
         for &b in bytes {
-            buf[c] = b;
-            c = (c + 1) % RING_LEN;
+            buf[w as usize % RING_LEN] = b;
+            w = w.wrapping_add(1);
         }
-        self.0.cursor.set(c as u16);
+        self.0.written.set(w);
     }
 }
 
@@ -52,8 +69,18 @@ impl traits::RxRing for FakeRing {
         &arr[..]
     }
 
-    fn cursor(&self) -> u16 {
-        self.0.cursor.get()
+    fn written(&self) -> u32 {
+        self.0.written.get()
+    }
+
+    fn marks(&self) -> &[u32] {
+        // SAFETY: as `bytes`.
+        let arr: &[u32; MARKS_LEN] = unsafe { &*self.0.marks.get() };
+        &arr[..]
+    }
+
+    fn marked(&self) -> u32 {
+        self.0.marked.get()
     }
 }
 
@@ -165,81 +192,14 @@ impl traits::UsartBaud for FakeBaud {
     }
 }
 
-struct EdgeState {
-    falls: Vec<u16>,
-    rises: Vec<u16>,
-    overflow: bool,
-    resets: u32,
-}
-
-/// Preloadable edge-capture fake: tests stage ticks, drains pop in order.
-#[derive(Clone, Default)]
-pub struct FakeEdges(Rc<RefCell<Option<EdgeState>>>);
-
-impl FakeEdges {
-    fn state(&self) -> core::cell::RefMut<'_, EdgeState> {
-        core::cell::RefMut::map(self.0.borrow_mut(), |s| {
-            s.get_or_insert_with(|| EdgeState {
-                falls: Vec::new(),
-                rises: Vec::new(),
-                overflow: false,
-                resets: 0,
-            })
-        })
-    }
-
-    pub fn stage(&self, falls: &[u16], rises: &[u16]) {
-        let mut s = self.state();
-        s.falls.extend_from_slice(falls);
-        s.rises.extend_from_slice(rises);
-    }
-
-    pub fn set_overflow(&self) {
-        self.state().overflow = true;
-    }
-
-    pub fn resets(&self) -> u32 {
-        self.state().resets
-    }
-}
-
-impl traits::EdgeCapture for FakeEdges {
-    fn drain_falls(&mut self, buf: &mut [u16]) -> usize {
-        let mut s = self.state();
-        let n = buf.len().min(s.falls.len());
-        buf[..n].copy_from_slice(&s.falls[..n]);
-        s.falls.drain(..n);
-        n
-    }
-
-    fn drain_rises(&mut self, buf: &mut [u16]) -> usize {
-        let mut s = self.state();
-        let n = buf.len().min(s.rises.len());
-        buf[..n].copy_from_slice(&s.rises[..n]);
-        s.rises.drain(..n);
-        n
-    }
-
-    fn overflow(&self) -> bool {
-        self.state().overflow
-    }
-
-    fn reset(&mut self) {
-        let mut s = self.state();
-        s.falls.clear();
-        s.rises.clear();
-        s.overflow = false;
-        s.resets += 1;
-    }
-}
-
 pub struct TestProviders;
 impl traits::Providers for TestProviders {
     type Ring = FakeRing;
     type Deadline = FakeDeadline;
     type Tx = FakeWire;
     type Baud = FakeBaud;
-    type Edges = FakeEdges;
+    #[cfg(feature = "bench")]
+    type Edges = bench::FakeEdges;
 }
 
 pub fn sealed_status(id: u8, result: ResultCode, payload: &[u8]) -> Vec<u8> {
@@ -248,4 +208,202 @@ pub fn sealed_status(id: u8, result: ResultCode, payload: &[u8]) -> Vec<u8> {
     b.payload_mut()[..payload.len()].copy_from_slice(payload);
     b.finish(payload.len() as u8);
     b.seal().to_vec()
+}
+
+/// The instrument side of the fakes.
+#[cfg(feature = "bench")]
+pub mod bench {
+    use std::vec::Vec;
+
+    use super::traits;
+
+    /// Preloadable edge-capture fake, reached through `HostBus::edges`:
+    /// tests stage ticks, drains pop in order.
+    #[derive(Default)]
+    pub struct FakeEdges {
+        falls: Vec<u16>,
+        rises: Vec<u16>,
+        overflow: bool,
+        resets: u32,
+    }
+
+    impl FakeEdges {
+        pub fn stage(&mut self, falls: &[u16], rises: &[u16]) {
+            self.falls.extend_from_slice(falls);
+            self.rises.extend_from_slice(rises);
+        }
+
+        pub fn set_overflow(&mut self) {
+            self.overflow = true;
+        }
+
+        pub fn resets(&self) -> u32 {
+            self.resets
+        }
+    }
+
+    impl traits::EdgeCapture for FakeEdges {
+        fn drain_falls(&mut self, buf: &mut [u16]) -> usize {
+            let n = buf.len().min(self.falls.len());
+            buf[..n].copy_from_slice(&self.falls[..n]);
+            self.falls.drain(..n);
+            n
+        }
+
+        fn drain_rises(&mut self, buf: &mut [u16]) -> usize {
+            let n = buf.len().min(self.rises.len());
+            buf[..n].copy_from_slice(&self.rises[..n]);
+            self.rises.drain(..n);
+            n
+        }
+
+        fn overflow(&self) -> bool {
+            self.overflow
+        }
+
+        fn reset(&mut self) {
+            self.falls.clear();
+            self.rises.clear();
+            self.overflow = false;
+            self.resets += 1;
+        }
+    }
+}
+
+/// Link-server rig: the production server over the engine on the fakes.
+pub mod link {
+    use std::vec;
+    use std::vec::Vec;
+
+    use osc_protocol::build;
+    use osc_protocol::wire::{BaudRate, Inst, Opcode};
+
+    use crate::engine::HostBus;
+    use crate::link::record::{
+        DONE, ERROR, EXCHANGE_STREAM, FEATURE_ADAPTER_IAP, FEATURE_RAILS, FRAME, OSC_EXCHANGE,
+    };
+    use crate::link::{LinkServer, RecordSink};
+
+    use super::{FakeBaud, FakeDeadline, FakeRing, FakeWire, TestProviders};
+
+    #[derive(Default)]
+    pub struct Sink(pub Vec<Vec<u8>>);
+
+    impl RecordSink for Sink {
+        fn record(&mut self, record: &[u8]) {
+            self.0.push(record.to_vec());
+        }
+    }
+
+    /// One response record, decoded for assertions.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Resp {
+        Frame { seq: u16, slot: u8, bytes: Vec<u8> },
+        Done { seq: u16, kind: u8, result: Vec<u8> },
+        Error { seq: u16, kind: u8, code: u8 },
+    }
+
+    impl Resp {
+        /// Panics unless `r` is exactly one well-formed response.
+        pub fn parse(r: &[u8]) -> Self {
+            let len = u16::from_le_bytes([r[0], r[1]]) as usize;
+            assert_eq!(len + 2, r.len(), "len covers the record");
+            let seq = u16::from_le_bytes([r[3], r[4]]);
+            match r[2] {
+                FRAME => Resp::Frame {
+                    seq,
+                    slot: r[5],
+                    bytes: r[6..].to_vec(),
+                },
+                DONE => Resp::Done {
+                    seq,
+                    kind: r[5],
+                    result: r[6..].to_vec(),
+                },
+                ERROR => {
+                    assert_eq!(r.len(), 7, "ERROR is kind + code");
+                    Resp::Error {
+                        seq,
+                        kind: r[5],
+                        code: r[6],
+                    }
+                }
+                other => panic!("response kind {other:#04x}"),
+            }
+        }
+    }
+
+    pub struct Rig {
+        pub server: LinkServer,
+        pub bus: HostBus<TestProviders>,
+        pub ring: FakeRing,
+        pub clock: FakeDeadline,
+        pub wire: FakeWire,
+        pub baud: FakeBaud,
+        pub sink: Sink,
+    }
+
+    impl Rig {
+        pub fn send(&mut self, bytes: &[u8]) {
+            self.server.on_pipe(bytes, &mut self.bus, &mut self.sink);
+        }
+
+        pub fn pump(&mut self) {
+            self.server.pump(&mut self.bus, &mut self.sink);
+        }
+
+        /// Every response recorded since the last take.
+        pub fn take(&mut self) -> Vec<Resp> {
+            self.sink.0.drain(..).map(|r| Resp::parse(&r)).collect()
+        }
+    }
+
+    /// A server with the chip adapter's features (rails, adapter IAP).
+    pub fn rig() -> Rig {
+        let ring = FakeRing::new();
+        let clock = FakeDeadline::new();
+        let wire = FakeWire::default();
+        let baud = FakeBaud::default();
+        let bus = HostBus::new(
+            ring.clone(),
+            clock.clone(),
+            wire.clone(),
+            baud.clone(),
+            BaudRate::B1000000,
+        );
+        Rig {
+            server: LinkServer::new(FEATURE_RAILS | FEATURE_ADAPTER_IAP),
+            bus,
+            ring,
+            clock,
+            wire,
+            baud,
+            sink: Sink::default(),
+        }
+    }
+
+    /// One request record: `len(2) kind(1) seq(2) body`.
+    pub fn req(kind: u8, seq: u16, body: &[u8]) -> Vec<u8> {
+        let len = 3 + body.len() as u16;
+        let mut v = len.to_le_bytes().to_vec();
+        v.push(kind);
+        v.extend_from_slice(&seq.to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    pub fn ping(seq: u16, id: u8) -> Vec<u8> {
+        let inst = Inst::instruction(Opcode::Ping, 0);
+        req(OSC_EXCHANGE, seq, &[0, id, inst.0, 0, 0, 0, 0])
+    }
+
+    /// A STREAM exchange to servo 5 arming a burst with a WRITE.
+    pub fn stream_arm(seq: u16, window_us: u32) -> Vec<u8> {
+        let mut p = [0u8; 8];
+        let n = build::write(&mut p, 0x0192, &[2, 0]).unwrap();
+        let mut body = vec![EXCHANGE_STREAM, 5, Inst::instruction(Opcode::Write, 0).0];
+        body.extend_from_slice(&window_us.to_le_bytes());
+        body.extend_from_slice(&p[..n]);
+        req(OSC_EXCHANGE, seq, &body)
+    }
 }

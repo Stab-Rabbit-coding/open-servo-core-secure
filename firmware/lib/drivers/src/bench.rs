@@ -6,80 +6,9 @@
 //! symbol address (`nm` the ELF) on a running chip -- no wire traffic, no
 //! table space, and they survive test tails that re-center transport state.
 
-/// Trim chain-pair pipeline counters: where do BURST-food pairs die between
-/// the break stamp and a window verdict? One field per exit of
-/// [`ServoBus::on_drift_break`]'s decision ladder, in ladder order.
-#[repr(C)]
-pub struct TrimProbe {
-    /// Drift stamps taken (fresh break wakes with a break byte newest).
-    pub stamps: u32,
-    /// Stamp with no predecessor (first after boot/restart) -- no pair.
-    pub no_prev: u32,
-    /// Pair rejected: NO verified frame between the stamps (a coalesced or
-    /// spurious service -- the fault-contract starvation class).
-    pub span_none: u32,
-    /// Pair rejected: MORE than one verified frame between the stamps
-    /// (coalesced break service under zero-gap bursts).
-    pub span_many: u32,
-    /// Pair rejected: exactly one verified frame, but a solicited shape (a
-    /// reply's turnaround rides the responder's clock).
-    pub unsilent: u32,
-    /// Pair rejected: ring span != the verified footprint (something else
-    /// ringed -- status, garble, echo).
-    pub inexact: u32,
-    /// Pair rejected by the 1/16 span gate (a real inter-burst pause).
-    pub gated: u32,
-    /// Pair accepted into the seam baseline.
-    pub base_pairs: u32,
-    /// Pair accepted into a drift window (baseline established).
-    pub win_pairs: u32,
-    /// Window verdicts handed to the trim loop.
-    pub verdicts: u32,
-    // --- verdict-content layer ---
-    /// Latest drift verdict's raw window sums at handoff.
-    pub verdict_err: i32,
-    pub verdict_span: u32,
-    /// `poll_clock_trim` consumptions by source.
-    pub poll_cal: u32,
-    pub poll_drift: u32,
-    /// Drift polls discarded by the +/-8k ppm sanity band.
-    pub sanity_drop: u32,
-    /// Latest drift poll's computed ppm (pre-sanity).
-    pub poll_ppm: i32,
-    /// `TrimLoop::on_window` invocations (both sources) and its latest
-    /// measurement, effect estimate, applied steps, and running total.
-    pub windows: u32,
-    pub tw_ppm: i32,
-    pub tw_effect: i32,
-    pub tw_applied: i32,
-    pub tw_total: i32,
-}
+pub use osc_servo_core::budget::probe::TelStep;
 
-impl TrimProbe {
-    pub const ZERO: Self = Self {
-        stamps: 0,
-        no_prev: 0,
-        span_none: 0,
-        span_many: 0,
-        unsilent: 0,
-        inexact: 0,
-        gated: 0,
-        base_pairs: 0,
-        win_pairs: 0,
-        verdicts: 0,
-        verdict_err: 0,
-        verdict_span: 0,
-        poll_cal: 0,
-        poll_drift: 0,
-        sanity_drop: 0,
-        poll_ppm: 0,
-        windows: 0,
-        tw_ppm: 0,
-        tw_effect: 0,
-        tw_applied: 0,
-        tw_total: 0,
-    };
-}
+use crate::traits::bus::Deadline;
 
 /// Message-plane probe (`docs/security-architecture.md` §2.6, §7.4).
 ///
@@ -137,8 +66,7 @@ impl SecProbe {
 }
 
 #[cfg(feature = "bench")]
-#[unsafe(no_mangle)]
-pub static mut TRIM_PROBE: TrimProbe = TrimProbe::ZERO;
+static mut TEL_BANKS: u32 = 0;
 
 #[cfg(feature = "bench")]
 #[unsafe(no_mangle)]
@@ -156,14 +84,130 @@ pub fn sec_probe(f: impl FnOnce(&mut SecProbe)) {
     }
 }
 
-/// Run `f` over the trim probe -- a no-op without the `bench` feature.
+/// The TEL encoder banked a batch (kernel tick, the only writer).
 #[inline(always)]
-#[allow(unused_variables)]
-pub fn trim_probe(f: impl FnOnce(&mut TrimProbe)) {
-    // SAFETY: single-hart; every writer runs at the one transport priority
-    // (HIGH), so accesses never interleave. The debug link only reads.
+pub fn tel_banked() {
+    // SAFETY: single writer; readers take one word.
     #[cfg(feature = "bench")]
     unsafe {
-        f(&mut *core::ptr::addr_of_mut!(TRIM_PROBE));
+        let b = &raw mut TEL_BANKS;
+        b.write_volatile(b.read_volatile().wrapping_add(1));
     }
+}
+
+/// Batches banked so far; 0 without the `bench` feature.
+#[inline(always)]
+pub fn tel_banks() -> u32 {
+    #[cfg(feature = "bench")]
+    // SAFETY: one-word volatile read.
+    unsafe {
+        (&raw const TEL_BANKS).read_volatile()
+    }
+    #[cfg(not(feature = "bench"))]
+    0
+}
+
+#[cfg(feature = "bench-telcost")]
+#[unsafe(no_mangle)]
+pub static mut TEL_COST: osc_servo_core::budget::probe::TelCost =
+    osc_servo_core::budget::probe::TelCost::ZERO;
+
+/// A TEL step's opening stamp on `clock`; 0 without `bench-telcost`.
+#[inline(always)]
+#[allow(unused_variables)]
+pub fn tel_stamp(clock: &impl Deadline) -> u32 {
+    #[cfg(feature = "bench-telcost")]
+    {
+        clock.now()
+    }
+    #[cfg(not(feature = "bench-telcost"))]
+    0
+}
+
+/// Step `s`, stamped at `from`, ends now.
+#[inline(always)]
+#[allow(unused_variables)]
+pub fn tel_step(clock: &impl Deadline, from: u32, s: TelStep) {
+    // SAFETY: the kernel tick is the record's only writer, bringup aside.
+    #[cfg(feature = "bench-telcost")]
+    unsafe {
+        let wall = clock.now().wrapping_sub(from);
+        (*core::ptr::addr_of_mut!(TEL_COST)).add(s, wall);
+    }
+}
+
+/// The TEL hook stamped at `from` ends now: its span joins the running
+/// tick's hook time. Every tick, TEL or not.
+#[inline(always)]
+#[allow(unused_variables)]
+pub fn tel_hook(clock: &impl Deadline, from: u32) {
+    // SAFETY: the kernel tick is the record's only writer, bringup aside.
+    #[cfg(feature = "bench-telcost")]
+    unsafe {
+        let h = &raw mut TEL_COST.hook;
+        h.write(h.read().wrapping_add(clock.now().wrapping_sub(from)));
+    }
+}
+
+/// Price a back-to-back stamp pair. Call once, before interrupts run.
+#[inline(always)]
+#[allow(unused_variables)]
+pub fn tel_calibrate(clock: &impl Deadline) {
+    // SAFETY: pre-IRQ bringup, ahead of the record's only other writer.
+    #[cfg(feature = "bench-telcost")]
+    unsafe {
+        let a = clock.now();
+        let b = clock.now();
+        let cal = &raw mut TEL_COST.cal;
+        cal.write_volatile(b.wrapping_sub(a).min(u16::MAX.into()) as u16);
+    }
+}
+
+/// Arms picked up so far; 0 without `bench-telcost`.
+#[inline(always)]
+pub fn tel_pickups() -> u32 {
+    #[cfg(feature = "bench-telcost")]
+    // SAFETY: one-word volatile read.
+    unsafe {
+        (&raw const TEL_COST.n[TelStep::Pickup as usize]).read_volatile()
+    }
+    #[cfg(not(feature = "bench-telcost"))]
+    0
+}
+
+/// The burst picked up last stamps its steps: every other one does, the
+/// rest run unstamped for the kernel's TEL cost.
+#[inline(always)]
+pub fn tel_stamping() -> bool {
+    tel_pickups() & 1 != 0
+}
+
+/// The running kernel tick's steps, taken: the tick's end calls it.
+#[inline(always)]
+pub fn tel_tick_steps() -> u32 {
+    #[cfg(feature = "bench-telcost")]
+    // SAFETY: the kernel tick's end, the record's only writer's context.
+    unsafe {
+        let t = &raw mut TEL_COST.tick;
+        let steps = t.read();
+        t.write(0);
+        steps
+    }
+    #[cfg(not(feature = "bench-telcost"))]
+    0
+}
+
+/// The running kernel tick's hook time, taken: the tick's end calls it.
+#[inline(always)]
+pub fn tel_tick_hook() -> u32 {
+    #[cfg(feature = "bench-telcost")]
+    // SAFETY: as `tel_tick_steps`.
+    unsafe {
+        let h = &raw mut TEL_COST.hook;
+        let hook = h.read();
+        h.write(0);
+        hook
+    }
+    #[cfg(not(feature = "bench-telcost"))]
+    0
 }

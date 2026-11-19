@@ -14,6 +14,9 @@ pub fn init_pll() {
     RCC.cfgr0().modify(|w| {
         w.set_pllsrc(Pllsrc::HSI);
         w.set_hpre(HPRE);
+        // divided HB clock to the ADC (`clocks::ADCCLK_HZ`); ADCPRE is only
+        // read when ADC_CLK_MODE is 0
+        w.set_adc_clk_mode(false);
         w.set_adcpre(ADCPRE);
     });
 
@@ -40,6 +43,16 @@ pub fn enable_tim1() {
 }
 
 #[inline]
+pub fn enable_tim2() {
+    RCC.pb1pcenr().modify(|w| w.set_tim2en(true));
+}
+
+#[inline]
+pub fn enable_tim3() {
+    RCC.pb1pcenr().modify(|w| w.set_tim3en(true));
+}
+
+#[inline]
 pub fn enable_adc1() {
     RCC.pb2pcenr().modify(|w| w.set_adcen(true));
 }
@@ -52,6 +65,13 @@ pub fn enable_dma1() {
 #[inline]
 pub fn enable_usart1() {
     RCC.pb2pcenr().modify(|w| w.set_usart1en(true));
+}
+
+/// USART2EN lives in PB2PCENR (bit 13) even though the peripheral maps at
+/// the APB1 address - RM sec 3.4.7 (bench-validated, bringup tel_blast).
+#[inline]
+pub fn enable_usart2() {
+    RCC.pb2pcenr().modify(|w| w.set_usart2en(true));
 }
 
 #[inline]
@@ -76,6 +96,8 @@ pub const CLOCK_TRIM_PPM_PER_STEP: u32 =
 /// negates. ~0.25% HSI rate per step; clamped to the register.
 #[inline]
 pub fn apply_clock_trim(slow_steps: i8) {
-    let v = (HSITRIM_DEFAULT - slow_steps as i16).clamp(0, HSITRIM_MAX) as u8;
+    let v = (HSITRIM_DEFAULT - slow_steps as i16)
+        .max(0)
+        .min(HSITRIM_MAX) as u8;
     RCC.ctlr().modify(|w| w.set_hsitrim(v));
 }

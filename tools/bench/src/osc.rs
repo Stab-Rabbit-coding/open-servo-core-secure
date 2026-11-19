@@ -13,7 +13,7 @@
 //! end of its stop bit (1 start + 8 data + 1 stop = 10 bit-times).
 
 use osc_protocol::crc::osc_crc;
-use osc_protocol::frame::Header;
+use osc_protocol::frame::{Header, Reboot};
 use osc_protocol::reply::FrameBuf;
 use osc_protocol::table::{PROFILE_SPANS_PER_SLOT, profile_slot_addr, profile_span_word};
 use osc_protocol::wire::{Id, Inst, MgmtOp, Opcode, ResultCode, UID_LEN};
@@ -117,9 +117,15 @@ pub fn build_factory(id: u8) -> Vec<u8> {
     build_instruction(id, Opcode::Mgmt, 0, &[MgmtOp::Factory as u8])
 }
 
-/// MGMT REBOOT (protocol sec 9.5): acks first, then resets once the ack has drained.
+/// MGMT REBOOT into the app (protocol sec 9.5): acks first, then resets once
+/// the ack has drained.
 pub fn build_reboot(id: u8) -> Vec<u8> {
-    build_instruction(id, Opcode::Mgmt, 0, &[MgmtOp::Reboot as u8])
+    build_instruction(
+        id,
+        Opcode::Mgmt,
+        0,
+        &[MgmtOp::Reboot as u8, Reboot::MODE_APP],
+    )
 }
 
 /// WRITE: `addr(2)` little-endian then the data bytes (mirrors `WriteReq`).
@@ -320,15 +326,15 @@ mod tests {
 
     #[test]
     fn parses_ping_exchange() {
-        // A ping reply carries model(2) + fw(1), status Ok (INST 0x80). Build the
+        // A ping reply carries model(2) + fw(2), status Ok (INST 0x80). Build the
         // frame with a computed CRC-16/ARC (protocol sec 3.2) so it stays valid across CRC
         // changes; the 0x00 break stamp leads on the wire (init-0 no-op).
         const SPACING: u32 = 1440; // 1 Mbaud @ 144 ticks/bit
         const BIT_TICKS: u32 = 144;
         let sent = build_ping(1);
 
-        // ID, LEN, INST(Ok status), model=0x0042, fw=0x56, then CRC.
-        let mut reply = vec![0x01, 0x06, 0x80, 0x42, 0x00, 0x56];
+        // ID, LEN, INST(Ok status), model=0x0042, fw=0x7856, then CRC.
+        let mut reply = vec![0x01, 0x07, 0x80, 0x42, 0x00, 0x56, 0x78];
         reply.extend_from_slice(&osc_crc(&reply).to_le_bytes());
 
         let mut stamps = stamps_from(0, SPACING, &sent);
@@ -340,7 +346,11 @@ mod tests {
         assert_eq!(ex.status.id, 1);
         assert_eq!(ex.status.result, Some(ResultCode::Ok));
         assert!(!ex.status.alert);
-        assert_eq!(ex.status.payload, [0x42, 0x00, 0x56], "model(2) + fw(1)");
+        assert_eq!(
+            ex.status.payload,
+            [0x42, 0x00, 0x56, 0x78],
+            "model(2) + fw(2)"
+        );
         // 20000 - (7200 + 10*144) = 20000 - 8640
         assert_eq!(ex.turnaround_ticks, 11_360);
     }

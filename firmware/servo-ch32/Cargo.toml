@@ -8,11 +8,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ch32-metapac     = { git = "https://github.com/ch32-rs/ch32-metapac", default-features = false, features = ["pac"] }
+ch32-metapac     = { version = "0.1.2", default-features = false, features = ["pac"] }
 osc-servo-core         = { path = "../lib/core" }
 osc-servo-drivers      = { path = "../lib/drivers" }
 osc-protocol     = { path = "../lib/osc-protocol" }
-osc-units        = { path = "../lib/units" }
 osc-log          = { path = "../lib/log" }
 portable-atomic  = { version = "1", default-features = false }
 riscv            = "0.12"
@@ -24,21 +23,28 @@ defmt            = { version = "1", optional = true }
 # builds (clippy, unit tests) use portable-atomic's native x86 path.
 [target.'cfg(target_arch = "riscv32")'.dependencies]
 portable-atomic = { version = "1", default-features = false, features = ["unsafe-assume-single-core"] }
+# Boot confirmation against the board's tinyboot META page.
+tinyboot-ch32   = { version = "0.7.2", default-features = false }
 
 [dev-dependencies]
 critical-section = { version = "1.2", features = ["std"] }
 
 [build-dependencies]
-ch32-metapac = { git = "https://github.com/ch32-rs/ch32-metapac", default-features = false, features = ["metadata"] }
+ch32-metapac = { version = "0.1.2", default-features = false, features = ["metadata"] }
 
 [features]
 default      = ["ch32v006x8x6"]
-ch32v006x8x6 = ["ch32-metapac/ch32v006x8x6"]
+ch32v006x8x6 = ["ch32-metapac/ch32v006x8x6", "tinyboot-ch32/ch32v006x8x6"]
 rt           = ["ch32-metapac/rt"]
 # Forward the drivers' probe counters (crate::bench pattern).
 bench        = ["osc-servo-drivers/bench"]
+# The TEL step measurement image: TEL tallies in place of the bus record.
+bench-telcost = ["bench", "osc-servo-drivers/bench-telcost"]
+# The uncommon tick instruments beside the bench record: gamma(k), long
+# ticks, entry lateness.
+bench-window = ["bench"]
+# The experiment image: the kernel's experiment half (kernel sec 2.7).
+experiment   = ["osc-servo-core/experiment"]
+# The loop-margin stimulus (kernel sec 2.7).
+loop-margin  = ["osc-servo-core/loop-margin"]
 defmt        = ["dep:defmt", "osc-servo-core/defmt", "osc-servo-drivers/defmt", "osc-log/defmt"]
-# Direct single wire (rev C HDSEL, or rev B with the buffer bypassed) --
-# tinyboot's flag. Default (absent) = rev B 74LVC2G241 buffer + TX_EN,
-# full duplex behind it. Reshapes `cfg::BusWiring` to match.
-half-duplex = []

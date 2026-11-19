@@ -8,12 +8,11 @@
 mod control;
 mod services;
 
-pub use control::{Capabilities, ControlIo, DecayMode, Motor, MotorCmd, Sensors};
+pub use control::{Capabilities, ControlIo, Motor, MotorCmd, Sensors, TelStream};
 pub use services::{
-    Dispatch, Dispatched, GATHER_MAX, Reply, Request, RequestCtx, SendError, Status,
+    Dispatch, Dispatched, GATHER_MAX, Reboot, Reply, Request, RequestCtx, SendError, Status,
 };
 
 // Boundary types defined elsewhere that callers of the traits need in scope.
-pub use crate::regions::BootMode;
 pub use crate::regions::config::ConfigDefaults;
-pub use crate::sample::{ConversionVariables, RawSamples, Sample};
+pub use crate::sensor_frame::SensorFrame;

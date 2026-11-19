@@ -2,29 +2,18 @@
 //! board-tunable; anything here is determined by the chip + this board's
 //! schematic and lives in one place.
 
-use crate::hal::{Pin, Tim1Mapping, UsartMapping, adc, opa, timer};
+use crate::hal::{Pin, Tim1Mapping, Tim2Mapping, UsartMapping, adc, timer};
 
-// === osc-native bus (USART1 on PC0/PC1; direct HDSEL single-wire, or the
-// rev B 74LVC2G241 buffered wire by default (`half-duplex` = direct) -- see
-// providers/tx_wire; the TX_EN pin is board wiring, `BusWiring`) ===
+// === osc-native bus (USART1 HDSEL single wire on PC0, see providers/tx_wire) ===
 
 pub const BUS_USART_MAPPING: UsartMapping = UsartMapping::Usart1Remap3;
 
-/// Pin whose input level tracks the bus wire (rescue-break sensing, protocol sec 9.1):
-/// the single-wire pin itself on the direct wire; the buffer's receive
-/// output (the USART RX pin) on the buffered wire.
-#[cfg(feature = "half-duplex")]
-pub const BUS_LINE_PIN: Pin = BUS_USART_MAPPING.tx_pin();
-#[cfg(not(feature = "half-duplex"))]
-pub const BUS_LINE_PIN: Pin = BUS_USART_MAPPING.rx_pin();
-
-// === OPA current sense ===
-
-pub const CURRENT_SENSE_OPA_INPUT: opa::InputMode = opa::InputMode::Differential {
-    pos: opa::PositiveInput::PA2,
-    neg: opa::NegativeInput::PA4,
-};
-pub const CURRENT_SENSE_OPA_OUTPUT: opa::Output = opa::Output::Internal;
+// The break wake (providers/break_wake) is TIM2's TI1 on the bus pin.
+// Remap4 also places CH2 on PC1, CH3 on PC3 and CH4 on PB6; CH2 is an input
+// on TI1, CH3 and CH4 stay disabled, and PC3 (DRV_EN) is a plain GPIO output
+// that takes no AF signal, so no TIM2 function ever drives a pin.
+pub const BREAK_TIM2_MAPPING: Tim2Mapping = Tim2Mapping::Remap4;
+const _: () = assert!(BREAK_TIM2_MAPPING.ch1_pin() as u8 == BUS_USART_MAPPING.tx_pin() as u8);
 
 // === Motor + STAT (TIM1 Remap8) ===
 //
@@ -36,8 +25,8 @@ pub const CURRENT_SENSE_OPA_OUTPUT: opa::Output = opa::Output::Internal;
 // never-enabled OC function's AF signal is its reset state (0), so
 // whenever HDSEL released the pin the mux fell through to CH1N's 0 and
 // clamped the bus (bench: wire stuck low at idle, rose the instant
-// TIM1EN dropped). Remap8 parks the unused CHxN functions on PA3 (analog
-// VPOS -- digital mux disconnected) and PB0/PB1 (not bonded on TSSOP20).
+// TIM1EN dropped). Remap8 parks the unused CHxN functions on PA3/PB0/PB1,
+// none bonded on TSSOP20.
 pub const MOTOR_TIM1_MAPPING: Tim1Mapping = Tim1Mapping::Remap8;
 pub const MOTOR_IN1_CH: timer::Channel = timer::Channel::CH3;
 pub const MOTOR_IN2_CH: timer::Channel = timer::Channel::CH2;
@@ -45,6 +34,11 @@ pub const MOTOR_IN1_PIN: Pin = tim1_channel_pin(MOTOR_TIM1_MAPPING, MOTOR_IN1_CH
 pub const MOTOR_IN2_PIN: Pin = tim1_channel_pin(MOTOR_TIM1_MAPPING, MOTOR_IN2_CH);
 pub const MOTOR_PWM_FREQ_HZ: u32 = 20_000;
 pub const STAT_LED_PIN: Pin = MOTOR_TIM1_MAPPING.ch4_pin();
+/// The compare that starts the injected group (the low-side tap, then the
+/// shunt), whose end is the kernel tick. CH4's output is never enabled, so
+/// its pin stays the STAT LED's GPIO.
+pub const LOW_TAP_TRIGGER_CH: timer::Channel = timer::Channel::CH4;
+pub const LOW_TAP_TRIGGER: adc::Jextsel = adc::Jextsel::TIM1_CC4;
 
 const fn tim1_channel_pin(m: Tim1Mapping, c: timer::Channel) -> Pin {
     match c {
@@ -57,13 +51,39 @@ const fn tim1_channel_pin(m: Tim1Mapping, c: timer::Channel) -> Pin {
 
 // === ADC ===
 
-pub const ADC_SAMPLE_TIME: adc::SampleTime = adc::SampleTime::CYCLES9;
+// Apertures at ADCCLK 24 MHz. TCONV = aperture + 12.5, so 13.5 cycles puts
+// every channel but Vref at 1.083 us, fS 0.92 MHz. That is the binding
+// constraint: V006 datasheet Table 3-23 allows VDD down to 2.4 V only while
+// fS stays at or under 1 MHz, and this board's MCU rail is 3.3 V. Above the
+// line the part wants 4.5 V. 13.5 cycles also clears every source impedance
+// here by a wide margin (RAIN table: 3.5 cycles already holds under 1.5 kOhm,
+// 7.5 under 3 kOhm), which is free once the rate ceiling sets the aperture.
+//
+// The aperture width does not trade against rest current noise at 24 MHz:
+// a 562 ns aperture holds the phase-locked part to 0.76 counts against 0.68
+// for 146 ns. At 48 MHz the same widening (73 to 865 ns) took it from 0.42
+// to 5.11, bus activity coupling into the amplifier output. No RC sits at
+// the amplifier output pin to absorb that coupling.
+
+/// OPA output, low-Z.
+pub const ADC_SHUNT_SAMPLE_TIME: adc::SampleTime = adc::SampleTime::CYCLES15;
+/// Motor-terminal dividers, under 3 kOhm with reservoir caps.
+pub const ADC_TERMINAL_SAMPLE_TIME: adc::SampleTime = adc::SampleTime::CYCLES15;
+/// Cap-backed board taps (pot, rail, NTC).
+pub const ADC_RESERVOIR_SAMPLE_TIME: adc::SampleTime = adc::SampleTime::CYCLES15;
+/// The 1.2 V reference, scanned right behind the pot: at the reservoir
+/// aperture it reads about +62 counts (+4 %) high, at 28.5 cycles +3.6, at
+/// 41.5 within a count of its settled value (measured).
+pub const ADC_VREF_SAMPLE_TIME: adc::SampleTime = adc::SampleTime::CYCLES43;
 
 /// ADC channels available as board-configurable sensor inputs on the V006F8P6.
-/// Excludes A0 (PA0, claimed by the OPA current-sense input pair).
+/// A0 (PA2) doubles as an OPA positive-input route (PSEL=00), so a board
+/// gets it as a sensor only with the amplifier's input elsewhere
+/// (`BoardWiring::assert_valid`).
 #[derive(Copy, Clone)]
 #[repr(u8)]
 pub enum AnalogChannel {
+    A0,
     A1,
     A2,
     A3,
@@ -76,6 +96,7 @@ pub enum AnalogChannel {
 impl AnalogChannel {
     pub const fn channel(self) -> adc::Channel {
         match self {
+            Self::A0 => adc::Channel::IN0,
             Self::A1 => adc::Channel::IN1,
             Self::A2 => adc::Channel::IN2,
             Self::A3 => adc::Channel::IN3,
@@ -88,30 +109,53 @@ impl AnalogChannel {
 
     pub const fn pin(self) -> Pin {
         match self {
+            Self::A0 => Pin::PA2,
             Self::A1 => Pin::PA1,
-            Self::A2 => Pin::PA2,
-            Self::A3 => Pin::PA3,
-            Self::A4 => Pin::PA4,
-            Self::A5 => Pin::PA5,
-            Self::A6 => Pin::PA6,
-            Self::A7 => Pin::PA7,
+            Self::A2 => Pin::PC4,
+            Self::A3 => Pin::PD2,
+            Self::A4 => Pin::PD3,
+            Self::A5 => Pin::PD5,
+            Self::A6 => Pin::PD6,
+            Self::A7 => Pin::PD4,
         }
     }
 }
 
-/// Free GPIOs on this board available as scratch outputs (DBG, motor DRV_EN).
+/// GPIOs this board offers as digital outputs (motor DRV_EN).
 #[derive(Copy, Clone)]
 #[repr(u8)]
 pub enum DigitalPin {
     PC3,
-    PD0,
 }
 
 impl DigitalPin {
     pub const fn pin(self) -> Pin {
         match self {
             Self::PC3 => Pin::PC3,
-            Self::PD0 => Pin::PD0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analog_channel_pin_map_matches_v006_silicon() {
+        const MAP: &[(AnalogChannel, adc::Channel, Pin)] = &[
+            (AnalogChannel::A0, adc::Channel::IN0, Pin::PA2),
+            (AnalogChannel::A1, adc::Channel::IN1, Pin::PA1),
+            (AnalogChannel::A2, adc::Channel::IN2, Pin::PC4),
+            (AnalogChannel::A3, adc::Channel::IN3, Pin::PD2),
+            (AnalogChannel::A4, adc::Channel::IN4, Pin::PD3),
+            (AnalogChannel::A5, adc::Channel::IN5, Pin::PD5),
+            (AnalogChannel::A6, adc::Channel::IN6, Pin::PD6),
+            (AnalogChannel::A7, adc::Channel::IN7, Pin::PD4),
+        ];
+
+        for &(a, ch, pin) in MAP {
+            assert_eq!(a.channel() as u8, ch as u8);
+            assert_eq!(a.pin(), pin, "channel {} pin", ch as u8);
         }
     }
 }

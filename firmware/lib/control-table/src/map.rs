@@ -1,6 +1,6 @@
 use crate::Error;
 use crate::rules;
-use crate::stage::{Snapshot, StagedWrites};
+use crate::stage::StagedWrites;
 
 /// Compile-time description of a flat register map. Implemented by the Table
 /// derive; hand-implemented in tests.
@@ -16,22 +16,107 @@ pub trait RegisterMap {
     const WRITABLE: &'static [u32];
     /// Sorted by `base`, non-overlapping.
     const SECTIONS: &'static [SectionMeta];
-    /// All sections' compare rules concatenated in section order (table-absolute
-    /// addresses); each section owns the `cmp_rules` sub-slice of this array.
+    /// Every compare rule, address-ordered (table-absolute addresses).
     const CMP_RULES: &'static [rules::CmpRule] = &[];
-    /// All sections' enum/bool rules concatenated in section order; each section
-    /// owns the `allowed_rules` sub-slice of this array.
+    /// Every enum/bool rule, address-ordered.
     const ALLOWED_RULES: &'static [rules::AllowedRule] = &[];
+    /// Per [`RULE_CHUNK`] bytes, the first `CMP_RULES` index a write starting
+    /// there can overlap ([`cmp_from`]). Empty scans from the first rule.
+    const CMP_FROM: &'static [u8] = &[];
+    /// As `CMP_FROM`, into `ALLOWED_RULES` ([`allowed_from`]).
+    const ALLOWED_FROM: &'static [u8] = &[];
     fn base(&self) -> *mut u8;
 }
 
 pub struct SectionMeta {
     pub base: u16,
     pub size: u16,
-    /// `[start, end)` range into `RegisterMap::CMP_RULES` for this section.
-    pub cmp_rules: (u16, u16),
-    /// `[start, end)` range into `RegisterMap::ALLOWED_RULES` for this section.
-    pub allowed_rules: (u16, u16),
+}
+
+/// Bytes of map per `*_FROM` entry.
+pub const RULE_CHUNK: usize = 32;
+
+/// A map's `CMP_FROM`: entry `k` is the first rule that ends past byte
+/// `k * RULE_CHUNK`, so no earlier rule can overlap a write starting in chunk
+/// `k`. Const-evaluated by the Table derive.
+pub const fn cmp_from<const N: usize>(rules: &[rules::CmpRule]) -> [u8; N] {
+    assert!(rules.len() <= u8::MAX as usize, "rule index must fit a u8");
+    let mut i = 1;
+    while i < rules.len() {
+        assert!(
+            rules[i - 1].addr <= rules[i].addr,
+            "rules must be address-ordered"
+        );
+        i += 1;
+    }
+    let mut out = [0u8; N];
+    let mut k = 0;
+    while k < N {
+        let mut i = 0;
+        while i < rules.len() && rules[i].end() <= k * RULE_CHUNK {
+            i += 1;
+        }
+        out[k] = i as u8;
+        k += 1;
+    }
+    out
+}
+
+/// [`cmp_from`] for the one-byte enum/bool rules.
+pub const fn allowed_from<const N: usize>(rules: &[rules::AllowedRule]) -> [u8; N] {
+    assert!(rules.len() <= u8::MAX as usize, "rule index must fit a u8");
+    let mut i = 1;
+    while i < rules.len() {
+        assert!(
+            rules[i - 1].addr <= rules[i].addr,
+            "rules must be address-ordered"
+        );
+        i += 1;
+    }
+    let mut out = [0u8; N];
+    let mut k = 0;
+    while k < N {
+        let mut i = 0;
+        while i < rules.len() && (rules[i].addr as usize) < k * RULE_CHUNK {
+            i += 1;
+        }
+        out[k] = i as u8;
+        k += 1;
+    }
+    out
+}
+
+/// Run `allowed` on every enum/bool rule, then `cmp` on every compare rule,
+/// that overlaps `[lo, hi)`, each in address order; the first error stops
+/// the walk. Each walk starts at its `*_FROM` entry for `lo` and stops at
+/// the first rule past `hi`.
+#[inline(always)]
+pub fn for_each_rule<M: RegisterMap + ?Sized>(
+    lo: usize,
+    hi: usize,
+    mut allowed: impl FnMut(&rules::AllowedRule) -> Result<(), Error>,
+    mut cmp: impl FnMut(&rules::CmpRule) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let chunk = lo / RULE_CHUNK;
+    let from = M::ALLOWED_FROM.get(chunk).map_or(0, |&i| i as usize);
+    for r in M::ALLOWED_RULES.get(from..).unwrap_or(&[]) {
+        if r.addr as usize >= hi {
+            break;
+        }
+        if r.addr as usize >= lo {
+            allowed(r)?;
+        }
+    }
+    let from = M::CMP_FROM.get(chunk).map_or(0, |&i| i as usize);
+    for r in M::CMP_RULES.get(from..).unwrap_or(&[]) {
+        if r.addr as usize >= hi {
+            break;
+        }
+        if r.end() > lo {
+            cmp(r)?;
+        }
+    }
+    Ok(())
 }
 
 /// Live base pointer + size plus one pending overlay, so a check sees the value
@@ -94,6 +179,7 @@ impl<'a> View<'a> {
     /// sites measured zero gain for +146 B -- the cost is the loads, not the
     /// call.
     #[inline(never)]
+    #[rustc_align(4)]
     pub fn read_fixed(&self, addr: u16, len: usize) -> Result<[u8; 4], Error> {
         let lo = addr as usize;
         let hi = match lo.checked_add(len) {
@@ -123,6 +209,7 @@ impl<'a> View<'a> {
     /// Overlay-edge straddles and seam splits: pick each byte from live
     /// storage, `o1`, or `o2`. Bounds pre-checked by [`Self::read_fixed`].
     #[cold]
+    #[rustc_align(4)]
     fn read_mixed(&self, lo: usize, len: usize, o_lo: usize, split: usize, o_hi: usize) -> [u8; 4] {
         let mut out = [0u8; 4];
         for (i, slot) in out.iter_mut().take(len).enumerate() {
@@ -210,69 +297,123 @@ fn validate<M: RegisterMap + ?Sized>(m: &M, addr: u16, o1: &[u8], o2: &[u8]) -> 
     }
 
     let view = View::new_split(m.base() as *const u8, M::SIZE, addr, o1, o2);
+    for_each_rule::<M>(
+        lo,
+        hi,
+        |r| rules::check_allowed(&view, r.addr, r.allowed),
+        |r| rules::check_cmp(&view, r.addr, r.spec, r.val),
+    )
+}
 
-    // Within a section allowed rules run before compare rules (previously
-    // interleaved in field order -- only observable when one write spans
-    // multiple invalid fields of different kinds; not spec-pinned).
-    for sec in M::SECTIONS {
-        if !overlaps(sec.base as usize, sec.size as usize, lo, hi) {
-            continue;
-        }
-        // Both stripes are address-ordered (blocks and fields emit in
-        // declaration = address order), so the scan ends at the first rule
-        // past the write.
-        let (a0, a1) = sec.allowed_rules;
-        if let Some(rs) = M::ALLOWED_RULES.get(a0 as usize..a1 as usize) {
-            for r in rs {
-                if r.addr as usize >= hi {
-                    break;
-                }
-                if overlaps(r.addr as usize, 1, lo, hi) {
-                    rules::check_allowed(&view, r.addr, r.allowed)?;
-                }
-            }
-        }
-        let (c0, c1) = sec.cmp_rules;
-        if let Some(rs) = M::CMP_RULES.get(c0 as usize..c1 as usize) {
-            for r in rs {
-                if r.addr as usize >= hi {
-                    break;
-                }
-                let width = (r.spec & 0xF) as usize;
-                if overlaps(r.addr as usize, width, lo, hi) {
-                    let rhs = if r.spec & rules::SPEC_RHS_REG != 0 {
-                        rules::Rhs::Reg(r.val as u16)
-                    } else {
-                        rules::Rhs::Imm(r.val as i32)
-                    };
-                    rules::check_cmp(&view, r.addr, r.spec, rhs)?;
-                }
-            }
-        }
+/// Copy `head` then `tail` to `dst`, one store per naturally aligned unit:
+/// 4 bytes while `dst` is 4-aligned with 4 left, else 2 while 2-aligned with
+/// 2 left, else 1. Every table field is naturally aligned, so a reader that
+/// preempts the copy (the kernel above the bus) sees each field all-old or
+/// all-new; two fields can still disagree, as when a commit lands between
+/// two of the reader's own loads.
+///
+/// # Safety
+/// `dst` must be valid for `head.len() + tail.len()` byte writes.
+#[inline(never)]
+#[rustc_align(4)]
+unsafe fn store_units(dst: *mut u8, head: &[u8], tail: &[u8]) {
+    if !tail.is_empty() {
+        // SAFETY: forwarded.
+        return unsafe { store_seam(dst, head, tail) };
     }
-    Ok(())
-}
-
-/// `[a_lo, a_lo+a_len)` overlaps `[lo, hi)` at all.
-fn overlaps(a_lo: usize, a_len: usize, lo: usize, hi: usize) -> bool {
-    a_lo < hi && a_lo + a_len > lo
-}
-
-/// Copy every staged entry pushed since `snap` into live storage (out-of-bounds
-/// entries skipped). The caller truncates the buffer afterward per its commit
-/// semantics (`clear` for a full COMMIT, `revert_to(snap)` for a verdict).
-fn apply_from<M: RegisterMap + ?Sized>(m: &M, staged: &StagedWrites, snap: &Snapshot) {
-    let base = m.base();
-    for (addr, data) in staged.iter_from(snap) {
-        let end = addr as usize + data.len();
-        if end > M::SIZE {
-            continue;
-        }
-        // SAFETY: bounds guarded above; the caller upholds RegisterMap's
-        // single-writer contract.
+    copy_run(dst as usize, head, &mut |i, u, w| {
+        // SAFETY: caller guarantees the span; `copy_run` picks `w` so the
+        // unit is aligned for its width. Volatile keeps it one store.
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(addr as usize), data.len());
+            let p = dst.add(i);
+            match w {
+                4 => p.cast::<u32>().write_volatile(u32::from_ne_bytes(u)),
+                2 => p
+                    .cast::<u16>()
+                    .write_volatile(u16::from_ne_bytes([u[0], u[1]])),
+                _ => p.write_volatile(u[0]),
+            }
         }
+    });
+}
+
+/// [`store_units`] split at the ring seam: the covered bytes of the aligned
+/// word holding the seam are gathered on the stack, so a unit straddling the
+/// seam still lands whole. Units never cross a 4-aligned address, so each of
+/// the three runs splits into the units the whole copy would.
+///
+/// # Safety
+/// As [`store_units`].
+#[cold]
+#[inline(never)]
+#[rustc_align(4)]
+unsafe fn store_seam(dst: *mut u8, head: &[u8], tail: &[u8]) {
+    let mut word = [0u8; 4];
+    let (pre, n, post) = seam_split(dst as usize, head, tail, &mut word);
+    // SAFETY: `pre`, the `n` gathered bytes and `post` tile the copy in order.
+    unsafe {
+        store_units(dst, pre, &[]);
+        store_units(dst.add(pre.len()), word.get(..n).unwrap_or(&[]), &[]);
+        store_units(dst.add(pre.len() + n), post, &[]);
+    }
+}
+
+/// The seam split of [`store_seam`]: `head` before the seam's aligned word,
+/// the count of that word's covered bytes (gathered into `word`), and `tail`
+/// after it.
+#[inline(always)]
+fn seam_split<'a>(
+    dst: usize,
+    head: &'a [u8],
+    tail: &'a [u8],
+    word: &mut [u8; 4],
+) -> (&'a [u8], usize, &'a [u8]) {
+    let off = (dst + head.len()) & 3;
+    let (pre, lead) = head
+        .split_at_checked(head.len() - off.min(head.len()))
+        .unwrap_or((head, &[]));
+    let (trail, post) = tail
+        .split_at_checked((4 - off).min(tail.len()))
+        .unwrap_or((tail, &[]));
+    for (b, s) in word.iter_mut().zip(lead.iter().chain(trail)) {
+        *b = *s;
+    }
+    (pre, lead.len() + trail.len(), post)
+}
+
+/// One contiguous run of [`store_units`]: hand each unit to
+/// `store(offset, bytes, width)` in address order; `dst` is the run's first
+/// address.
+#[inline(always)]
+fn copy_run(dst: usize, src: &[u8], store: &mut impl FnMut(usize, [u8; 4], usize)) {
+    let mut rest = src;
+    let mut i = 0;
+    if dst & 1 != 0
+        && let [a, r @ ..] = rest
+    {
+        store(i, [*a, 0, 0, 0], 1);
+        rest = r;
+        i += 1;
+    }
+    if (dst + i) & 2 != 0
+        && let [a, b, r @ ..] = rest
+    {
+        store(i, [*a, *b, 0, 0], 2);
+        rest = r;
+        i += 2;
+    }
+    while let [a, b, c, d, r @ ..] = rest {
+        store(i, [*a, *b, *c, *d], 4);
+        rest = r;
+        i += 4;
+    }
+    if let [a, b, r @ ..] = rest {
+        store(i, [*a, *b, 0, 0], 2);
+        rest = r;
+        i += 2;
+    }
+    if let [a] = rest {
+        store(i, [*a, 0, 0, 0], 1);
     }
 }
 
@@ -302,19 +443,27 @@ pub trait RegisterFile: RegisterMap {
     /// As [`write`](RegisterFile::write) but with the source split across the
     /// ring seam: `head` at `addr`, `tail` continuing after it.
     fn write_split(&self, addr: u16, head: &[u8], tail: &[u8]) -> Result<(), Error> {
-        validate(self, addr, head, tail)?;
-        // SAFETY: validate confirmed `[addr, addr+head.len()+tail.len())` is in
-        // bounds; the caller upholds RegisterMap's single-writer contract.
-        unsafe {
-            let base = self.base();
-            core::ptr::copy_nonoverlapping(head.as_ptr(), base.add(addr as usize), head.len());
-            core::ptr::copy_nonoverlapping(
-                tail.as_ptr(),
-                base.add(addr as usize + head.len()),
-                tail.len(),
-            );
-        }
+        self.check_split(addr, head, tail)?;
+        self.store_split(addr, head, tail);
         Ok(())
+    }
+
+    /// The checks of [`write_split`](RegisterFile::write_split) alone: bounds,
+    /// writable mask and rules, the source standing in for the live bytes.
+    fn check_split(&self, addr: u16, head: &[u8], tail: &[u8]) -> Result<(), Error> {
+        validate(self, addr, head, tail)
+    }
+
+    /// The store of [`write_split`](RegisterFile::write_split) alone, for
+    /// bytes [`check_split`](RegisterFile::check_split) passed. A span past the
+    /// map is dropped.
+    fn store_split(&self, addr: u16, head: &[u8], tail: &[u8]) {
+        if addr as usize + head.len() + tail.len() > Self::SIZE {
+            return;
+        }
+        // SAFETY: span bounds-checked above; the caller upholds RegisterMap's
+        // single-writer contract.
+        unsafe { store_units(self.base().add(addr as usize), head, tail) }
     }
 
     fn stage(&self, addr: u16, src: &[u8], staged: &mut StagedWrites) -> Result<(), Error> {
@@ -334,17 +483,12 @@ pub trait RegisterFile: RegisterMap {
         staged.push_split(addr, head, tail)
     }
 
+    /// Store every staged entry, oldest first, then empty the buffer.
     fn commit_staged(&self, staged: &mut StagedWrites) {
-        apply_from(self, staged, &Snapshot::ZERO);
+        for (addr, data) in staged.iter_all() {
+            self.store_split(addr, data, &[]);
+        }
         staged.clear();
-    }
-
-    /// Apply only the entries pushed since `snap`, then truncate the buffer back
-    /// to it -- a pending write's verdict commit, leaving any pre-`snap` HOLD
-    /// entries intact for a later real COMMIT.
-    fn commit_from(&self, staged: &mut StagedWrites, snap: &Snapshot) {
-        apply_from(self, staged, snap);
-        staged.revert_to(snap);
     }
 }
 

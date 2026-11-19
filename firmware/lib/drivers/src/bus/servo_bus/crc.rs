@@ -3,6 +3,7 @@
 use osc_protocol::wire::Inst;
 
 use super::ServoBus;
+use crate::bus::ring_wrap;
 use crate::traits::bus::{CrcEngine, Providers, RxRing};
 
 impl<P: Providers> ServoBus<P> {
@@ -15,8 +16,8 @@ impl<P: Providers> ServoBus<P> {
     /// verify. Direct feed is safe against the live circular ring: the engine
     /// runs ~8x wire speed, so it drains the covered span long before the write
     /// cursor could lap the ring back onto it.
-    #[cfg_attr(target_os = "none", unsafe(link_section = ".highcode"))]
-    #[cfg_attr(target_os = "none", inline(never))]
+    #[cfg_attr(target_arch = "riscv32", inline(never))]
+    #[rustc_align(4)]
     pub(super) fn crc_feed(&mut self, anchor: u16, footprint: u16) {
         let ring = self.ring.bytes();
         let len = ring.len();
@@ -63,7 +64,7 @@ impl<P: Providers> ServoBus<P> {
         loop {
             if let Some(v) = self.crc.result() {
                 let v = match tail {
-                    Some(b) => osc_protocol::crc::osc_crc_continue(v, &[b]),
+                    Some(b) => osc_protocol::crc::osc_crc_byte(v, b),
                     None => v,
                 };
                 return v == wire;
@@ -84,6 +85,13 @@ impl<P: Providers> ServoBus<P> {
         }
         self.crc_feed(anchor, footprint);
         self.crc_verify(anchor, footprint)
+    }
+
+    /// The four header bytes at the anchor (`[0x00][ID][LEN][INST]`).
+    pub(super) fn ring_header(&self, anchor: u16) -> [u8; 4] {
+        let ring = self.ring.bytes();
+        let len = ring.len();
+        core::array::from_fn(|i| ring[ring_wrap(anchor as usize + i, len)])
     }
 
     /// The INST byte, 3 slots past the anchor (`[0x00][ID][LEN][INST]`).

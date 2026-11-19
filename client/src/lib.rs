@@ -1,30 +1,46 @@
 //! osc-client -- the host-side client for the osc-native bus (host-band
 //! phase 4). Transport-generic: an async [`Client`] drives the adapter's
 //! record pipe over any [`pipe::Pipe`]; [`blocking`] wraps it for
-//! synchronous callers. Deliberately model-agnostic: register access is raw
-//! addr+len, protocol-normative common registers arrive as osc-protocol
-//! consts, per-model typed maps are a later band.
+//! synchronous callers. Register access is raw addr+len; protocol-normative
+//! common registers arrive as osc-protocol consts, per-model names through
+//! a [`descriptor`] the caller supplies (none is compiled in).
 //!
 //! All protocol timing lives in the adapter's engine; the only clock here is
 //! a coarse pipe guard that catches an unplugged adapter.
 
+#![deny(unsafe_code)]
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod blocking;
+pub mod boot;
+pub mod calib;
 mod client;
 pub mod common;
 pub mod cyclic;
+pub mod data_state;
+pub mod descriptor;
 mod error;
 pub mod mgmt;
 pub mod pipe;
+pub mod pos_lut;
 pub mod session;
+pub mod stamp;
+#[cfg(feature = "bench")]
 pub mod wire;
 
 #[cfg(feature = "fake-adapter")]
 pub mod fake;
 #[cfg(feature = "nusb")]
 pub mod nusb;
+#[cfg(all(feature = "webusb", target_arch = "wasm32"))]
+pub mod webusb;
 
-pub use client::{Chain, Client, Ping, Reply, Status};
+pub use client::{
+    Chain, Client, DEFAULT_GUARD, Ping, Reply, Status, StreamReply, TbFrame, TbReply,
+};
 pub use error::{Error, LinkError, RejectReason};
+pub use session::BusMode;
 
-pub use osc_host::engine::Outcome;
+pub use osc_host::engine::{Outcome, TbExpect};
+pub use osc_host::link::record;
 pub use osc_protocol::wire::{BaudRate, Id, Inst, MgmtOp, Opcode, ResultCode};

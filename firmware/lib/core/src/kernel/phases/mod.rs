@@ -1,0 +1,224 @@
+//! The kernel's phases. The fast half (`fast`) runs every tick; the medium
+//! half (`Medium`) reads CONTROL, runs the edges, the estimators, the outer
+//! loops, the limits, the detectors and the slow block, publishes, and
+//! leaves the fast half its `Command`. The medium work is split into phases
+//! (`phase`), one stage of the chain each, one file each, dispatched from
+//! the schedule's table; every value is
+//! written by the phase that computes it and read by the later phases and
+//! by the fast half. The experiment image (`experiment`, kernel sec 2.7)
+//! swaps in a medium half of CONTROL, the bus dead-man, the bias
+//! tracker's aging and PUBLISH alone; both halves carry the same dead-man.
+
+#[cfg(not(feature = "experiment"))]
+mod control;
+mod deadman;
+#[cfg(feature = "experiment")]
+mod experiment;
+pub(in crate::kernel) mod fast;
+#[cfg(not(feature = "experiment"))]
+mod lifecycle;
+#[cfg(not(feature = "experiment"))]
+mod limits;
+pub mod loops;
+#[cfg(not(feature = "experiment"))]
+mod observer;
+#[cfg(not(feature = "experiment"))]
+mod publish;
+#[cfg(not(feature = "experiment"))]
+mod rail;
+#[cfg(not(feature = "experiment"))]
+mod slow;
+#[cfg(not(feature = "experiment"))]
+mod speed;
+#[cfg(not(feature = "experiment"))]
+mod trajectory;
+#[cfg(not(feature = "experiment"))]
+mod velocity;
+
+#[cfg(not(feature = "experiment"))]
+pub(in crate::kernel) use control::Control;
+#[cfg(feature = "experiment")]
+pub(in crate::kernel) use experiment::Medium;
+#[cfg(not(feature = "experiment"))]
+pub(in crate::kernel) use lifecycle::Life;
+
+#[cfg(not(feature = "experiment"))]
+use self::fast::Command;
+#[cfg(not(feature = "experiment"))]
+use self::loops::faults::{Detectors, FaultLatch};
+#[cfg(not(feature = "experiment"))]
+use self::loops::limits::{IBand, LimitState};
+#[cfg(not(feature = "experiment"))]
+use self::loops::trajectory::TrajGen;
+#[cfg(not(feature = "experiment"))]
+use self::loops::velocity::VelocityLoop;
+#[cfg(not(feature = "experiment"))]
+use super::config::KernelConfig;
+#[cfg(not(feature = "experiment"))]
+use super::{DECIM_SLOW, KernelTiming};
+#[cfg(not(feature = "experiment"))]
+use crate::Shared;
+#[cfg(not(feature = "experiment"))]
+use crate::estimator::{FusionObs, OmegaBlend, VbusEst, WindingTherm};
+#[cfg(not(feature = "experiment"))]
+use crate::pos_lut;
+#[cfg(not(feature = "experiment"))]
+use crate::regions::control::Mode;
+
+/// The linearized pot (pos_lut module), Q4 counts: the one measurement
+/// behind both seeds and the observer, so theta_hat and everything that
+/// reads it (trajectory, position loop, soft limits, stall gates) are in
+/// linearized counts. The raw pot stays for the sensors publish, TEL `pos`
+/// and the glitch screen.
+#[cfg(not(feature = "experiment"))]
+pub(in crate::kernel) fn pos_q4(shared: &Shared, lut_live: bool, raw: u16) -> u16 {
+    pos_q4_band_gain(shared, lut_live, raw).0
+}
+
+/// [`pos_q4`] and the linearized counts per raw count of its interval:
+/// the table or the identity at the pot channel's code, plus the ADC
+/// wide-code step. The step is raw counts ahead of the table, so a live
+/// table is read again at the corrected raw count, in the interval that
+/// holds it; on the identity it is the bare slot. The band gain stays the
+/// code's own interval's.
+#[cfg(not(feature = "experiment"))]
+#[inline(always)]
+pub(in crate::kernel) fn pos_q4_band_gain(shared: &Shared, lut_live: bool, raw: u16) -> (u16, u16) {
+    let (pos, band_gain_q4) = if lut_live {
+        shared.pos_lut_q4_band_gain(raw)
+    } else {
+        (pos_lut::identity_q4(raw), pos_lut::GRID as u16)
+    };
+    let wide_q4 = shared.adc_wide_q4(raw);
+    if wide_q4 == 0 {
+        return (pos, band_gain_q4);
+    }
+    if lut_live {
+        // keeps the second read out of the steady tick's straight line
+        core::hint::cold_path();
+        return (shared.pos_lut_at_q4(raw, wide_q4 as u8), band_gain_q4);
+    }
+    (pos.wrapping_add(wide_q4), band_gain_q4)
+}
+
+#[cfg(not(feature = "experiment"))]
+pub(in crate::kernel) struct Medium {
+    /// `KernelTiming::dt_med_q32`.
+    dt_med_q32: u32,
+    /// `KernelTiming::recip_arr_q24`.
+    recip_arr_q24: u32,
+    /// Medium periods toward the next SLOW run.
+    pub(in crate::kernel) slow_periods: u8,
+    /// CONTROL as the CONTROL phase read it.
+    ctl: Control,
+    pub(in crate::kernel) life: Life,
+    pub(in crate::kernel) traj: TrajGen,
+    pub(in crate::kernel) fusion: FusionObs,
+    /// The velocity loop's speed, from the observer phase: the observer's
+    /// plus the blend's lead.
+    pub(in crate::kernel) omega_hat: i32,
+    /// The boxcar the SPEED phase closed, for the next period's OBSERVER
+    /// and PUBLISH.
+    pub(in crate::kernel) omega_bemf: Option<i32>,
+    /// Linearized counts per raw count at the observer's sample.
+    band_gain_q4: u16,
+    pub(in crate::kernel) vel: VelocityLoop,
+    pub(in crate::kernel) limits: LimitState,
+    pub(in crate::kernel) i_band: IBand,
+    /// The composed magnitude `i_band` was built from (`limits::Fold::lim`).
+    i_lim: u16,
+    limit_flags: u8,
+    pub(in crate::kernel) vbus: VbusEst,
+    pub(in crate::kernel) thermal: WindingTherm,
+    /// The winding resistance at the estimate's temperature, as published
+    /// (`Medium::r_hat`): the back-EMF boxcar's R.
+    r_hat_q12: u16,
+    /// The boxcar's part in the velocity loop's speed.
+    pub(in crate::kernel) omega_blend: OmegaBlend,
+    /// The duty OpenLoop applies while its ceiling sits under the window
+    /// floor.
+    ol_base_q15: u16,
+    /// SLOW ticks left on the stall permit lease, renewed when HIGH moves
+    /// `Shared::permit_gen` past `permit_gen`.
+    permit_ticks: u8,
+    permit_gen: u8,
+    det: Detectors,
+    deadman: deadman::Deadman,
+    /// The loop-margin stimulus runs on this period's TRAJECTORY (CONTROL's
+    /// gate): both fields nonzero, a burst streams under a loaded dead-man
+    /// and no limit flag but PERMIT is set.
+    #[cfg(feature = "loop-margin")]
+    inj_on: bool,
+    /// The stimulus's phase, medium periods into its cycle of
+    /// `2 x inject_half_periods`.
+    #[cfg(feature = "loop-margin")]
+    inj_p: u16,
+    te_prev: bool,
+    mode_prev: Mode,
+    /// The current command the fast half's loop tracks.
+    pub(in crate::kernel) i_ref_cc: i32,
+    /// Position loop output, held for the velocity step.
+    pub(in crate::kernel) omega_ref_q16: i32,
+    /// Consecutive medium ticks the position loop has reported `near`, up
+    /// to `position::HOLD_SETTLE_TICKS`, where the hold is settled.
+    pub(in crate::kernel) near_ticks: u8,
+}
+
+#[cfg(not(feature = "experiment"))]
+impl Medium {
+    pub fn new(timing: &KernelTiming) -> Self {
+        Self {
+            dt_med_q32: timing.dt_med_q32,
+            recip_arr_q24: timing.recip_arr_q24,
+            // primed so the FIRST period runs the slow block: the winding
+            // estimate exists before any consumer sees it
+            slow_periods: DECIM_SLOW - 1,
+            ctl: Control::default(),
+            life: Life::Off,
+            traj: TrajGen::new(),
+            fusion: FusionObs::new(),
+            omega_hat: 0,
+            omega_bemf: None,
+            band_gain_q4: pos_lut::GRID as u16,
+            vel: VelocityLoop::new(),
+            limits: LimitState::new(),
+            i_band: IBand { lo: 0, hi: 0 },
+            i_lim: 0,
+            limit_flags: 0,
+            vbus: VbusEst::new(timing.vbus_scale_q15),
+            thermal: WindingTherm::new(),
+            r_hat_q12: 0,
+            omega_blend: OmegaBlend::new(),
+            ol_base_q15: 0,
+            permit_ticks: 0,
+            permit_gen: 0,
+            det: Detectors::new(),
+            deadman: deadman::Deadman::new(),
+            #[cfg(feature = "loop-margin")]
+            inj_on: false,
+            #[cfg(feature = "loop-margin")]
+            inj_p: 0,
+            te_prev: false,
+            mode_prev: Mode::OpenLoop,
+            i_ref_cc: 0,
+            omega_ref_q16: 0,
+            near_ticks: 0,
+        }
+    }
+
+    /// First tick: the observer starts at the measurement, the winding
+    /// estimate at the NTC ahead of the first SLOW tick, its fault with
+    /// it, so a failed NTC never drives.
+    pub fn seed(
+        &mut self,
+        pos_q4: u16,
+        ntc_raw: u16,
+        cfg: &KernelConfig,
+        shared: &Shared,
+        faults: &mut FaultLatch,
+        cmd: &mut Command,
+    ) {
+        self.fusion.seed(pos_q4);
+        self.estimate(ntc_raw, cfg, shared, faults, cmd);
+    }
+}

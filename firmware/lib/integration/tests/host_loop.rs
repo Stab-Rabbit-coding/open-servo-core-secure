@@ -4,10 +4,13 @@
 //! and table state (spec style), not raw hex.
 
 use osc_host::engine::{Command, Outcome};
-use osc_integration::sim::{HostEvent, Sim, Source, assert_valid};
+use osc_integration::sim::{HOST_MARK_LAG_US, HostEvent, Sim, Source, assert_valid};
 use osc_protocol::build;
 use osc_protocol::wire::{BaudRate, Id, Inst, Opcode, ResultCode, UID_LEN};
 use osc_servo_core::regions::control::addr::lifecycle::GOAL_VELOCITY;
+use osc_servo_core::regions::control::addr::tel::{CHUNK0_ADDR, TEL_COUNT};
+use osc_servo_core::regions::telemetry::addr::tick::I_TICK_COUNTS;
+use osc_servo_core::tel::Chunks;
 
 const ID5: u8 = 5;
 
@@ -51,7 +54,7 @@ fn ping_round_trips_through_the_engine() {
         } => {
             assert_eq!((*slot, *id), (0, ID5));
             assert_eq!(status_result(*inst), Some(ResultCode::Ok));
-            assert_eq!(payload.len(), 3, "model(2) + fw(1)");
+            assert_eq!(payload.len(), 4, "model(2) + fw(2)");
         }
         other => panic!("expected Status, got {other:?}"),
     }
@@ -167,6 +170,42 @@ fn gread_chains_the_fleet_in_slot_order() {
         }
     }
     assert!(matches!(&ev[3], HostEvent::Done(t) if t.outcome == Outcome::Complete));
+}
+
+/// 3M GREAD of four servos: slot k's break follows slot k-1's last byte,
+/// the tightest spacing a host hears. Statuses delivered.
+fn gread_3m_statuses(mark_lag_us: f64) -> u16 {
+    let mut sim = Sim::new(BaudRate::B3000000);
+    sim.attach_host();
+    sim.set_host_mark_lag_us(mark_lag_us);
+    let ids = [1u8, 2, 3, 4].map(Id::new);
+    for id in ids {
+        sim.add_servo(id.as_byte());
+    }
+    let mut p = [0u8; 16];
+    let n = build::gread_uniform(&mut p, GOAL_VELOCITY, 4, &ids).unwrap();
+    sim.host_submit(Command::Exchange {
+        id: Id::BROADCAST,
+        inst: Inst::instruction(Opcode::Gread, 0),
+        payload: &p[..n],
+    })
+    .unwrap();
+    sim.run();
+    match sim.host_events().last() {
+        Some(HostEvent::Done(t)) => t.evidence.statuses,
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+/// A break mark is the DMA count at the detector's service, so it names the
+/// break's byte only while that service lands inside one byte-time of the
+/// break's end (3.3 us at 3M). The adapter's vector preempts the engine to
+/// hold that bound; at the budget lag every slot resolves, one byte-time
+/// late they do not.
+#[test]
+fn a_3m_chain_resolves_every_slot_while_marks_land_inside_a_byte_time() {
+    assert_eq!(gread_3m_statuses(HOST_MARK_LAG_US as f64), 4);
+    assert!(gread_3m_statuses(3.5) < 4);
 }
 
 #[test]
@@ -293,4 +332,53 @@ fn cal_train_is_wire_invisible_to_the_fleet() {
     let d = sim.servo_diag(s);
     assert_eq!(d.crc_fail_count, 0);
     assert_eq!(d.framing_drop_count, 0);
+}
+
+/// One 3M TEL burst through the engine, the adapter's main loop held off
+/// the engine for `stall_us` from the arm. Returns the burst's terminal.
+fn tel_burst_with_stalled_poll(stall_us: u64) -> osc_host::engine::Terminal {
+    // the ident four: held current, differential, duty, pos
+    const ROW: Chunks = Chunks::one(I_TICK_COUNTS, 8);
+    const SAMPLES: u16 = 160;
+    let mut sim = Sim::new(BaudRate::B3000000);
+    sim.attach_host();
+    sim.add_servo(ID5);
+    let mut p = [0u8; 16];
+    let n = build::write(&mut p, CHUNK0_ADDR, &ROW.to_le_bytes()).unwrap();
+    sim.host_submit(Command::Exchange {
+        id: Id::new(ID5),
+        inst: Inst::instruction(Opcode::Write, 0),
+        payload: &p[..n],
+    })
+    .unwrap();
+    sim.run();
+    sim.host_events();
+
+    let n = build::write(&mut p, TEL_COUNT, &SAMPLES.to_le_bytes()).unwrap();
+    sim.host_submit(Command::ExchangeStream {
+        id: Id::new(ID5),
+        inst: Inst::instruction(Opcode::Write, 0),
+        payload: &p[..n],
+        window_us: 100_000,
+    })
+    .unwrap();
+    sim.stall_host_poll(stall_us);
+    sim.run();
+    match sim.host_events().pop() {
+        Some(HostEvent::Done(t)) => t,
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_stalled_host_poll_reports_the_tel_ring_lap() {
+    let clean = tel_burst_with_stalled_poll(0);
+    assert_eq!(clean.outcome, Outcome::Complete);
+    assert_eq!((clean.evidence.laps, clean.evidence.garble), (0, 0));
+
+    // 6 ms of a ~150 B/ms burst is more than the sim's 512 B ring.
+    let stalled = tel_burst_with_stalled_poll(6_000);
+    assert_eq!(stalled.outcome, Outcome::Complete);
+    assert_eq!(stalled.evidence.laps, 1);
+    assert!(stalled.evidence.statuses < clean.evidence.statuses);
 }

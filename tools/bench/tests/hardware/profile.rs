@@ -4,20 +4,15 @@ use bench::run::Stats;
 use osc_protocol::wire::ResultCode;
 use osc_servo_core::regions::config::addr::common::ID;
 use osc_servo_core::regions::config::addr::common::MODEL_NUMBER;
-use osc_servo_core::regions::telemetry::addr::converted::{
-    PRESENT_CURRENT, PRESENT_POSITION, PRESENT_VBUS_MV,
-};
+use osc_servo_core::regions::telemetry::addr::refs::ENC_A;
+use osc_servo_core::regions::telemetry::addr::tick::{POS, VMOTOR_A};
 use serial_test::serial;
 
 use crate::support::bench;
 
-/// The turnaround scatter: position(4) + current(2) + vbus(2) from the
-/// converted telemetry block -- the protocol sec 5.2 cyclic-telemetry shape.
-const SCATTER: [(u16, u8); 3] = [
-    (PRESENT_POSITION, 4),
-    (PRESENT_CURRENT, 2),
-    (PRESENT_VBUS_MV, 2),
-];
+/// The turnaround scatter: pos+vref_raw(4) + vmotor_a(2) + enc_a(2)
+/// from the raw telemetry block: the protocol sec 5.2 cyclic-telemetry shape.
+const SCATTER: [(u16, u8); 3] = [(POS, 4), (VMOTOR_A, 2), (ENC_A, 2)];
 
 /// A gathered reply is byte-identical to the concatenation of plain READs of
 /// the same spans (odd interior span included -- no parity constraint, protocol sec 5.2).
@@ -55,22 +50,18 @@ fn profile_read_bad_slot_rejects_range() {
     }
 }
 
-/// Per-baud ceiling for the mean profile-read turnaround (us). Measured floor
-/// (3 spans / 8 B): 39.9 / 48.2 / 46.6 / 50.5 at
-/// 0.5M/1M/2M/3M -- the two extra snapshot arms and the span resolution add
-/// ~4-11 us over the same bytes as one contiguous READ. Each ceiling sits
-/// ~6 us above the measured floor (the ping-budget convention: regression
-/// margin plus the +/-5 us flash-layout swing). Measured means on the
-/// current build: 41.2/46.9-55.3/55.8/60.0 ascending baud -- the 1M mean is
-/// bimodal on this layout (run-to-run it settles just before or just after a
-/// reply-grid point, ~a byte-time apart), so its ceiling covers the slow mode.
+/// Per-baud ceiling for the mean profile-read turnaround (us), 3 spans / 8 B:
+/// the two extra snapshot arms and the span resolution add ~10-16 us over a
+/// contiguous READ of the same bytes. Measured means with the kernel above
+/// the bus: 72.4/87.4/89.0/93.1 ascending baud. Each ceiling sits ~8 us above
+/// (the turnaround-budget convention: layout swing plus kernel-phase spread).
 fn profile_turnaround_budget_us(baud: u32) -> f64 {
     match baud {
-        500_000 => 48.0,
-        1_000_000 => 61.0,
-        2_000_000 => 62.0,
-        3_000_000 => 66.0,
-        _ => 70.0,
+        500_000 => 80.0,
+        1_000_000 => 95.0,
+        2_000_000 => 97.0,
+        3_000_000 => 101.0,
+        _ => 105.0,
     }
 }
 

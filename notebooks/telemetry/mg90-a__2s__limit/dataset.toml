@@ -1,0 +1,6 @@
+servo = "mg90-a"
+supply = "2s"
+rule = "limit"
+current_limit_counts = 280
+captured = "2026-09-30"
+notes = "Every recording streamed whole: the servo counted zero dropped TEL rows in each (rows_dropped in the meta), and the frame-boundary step power reads about 1 on every grid rung. Pack at 8.1 to 8.2 V at rest, so the slow grid tops at 45% and the coast ladder at 40%, the highest duties whose braked stop fits the runway. The fast-decay grid is capped at 35%: at 40% under fast decay the current limit cuts in about a second into the rung on this rail. The pos-lin sweep is from the earlier capture of this dataset."

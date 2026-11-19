@@ -1,7 +1,8 @@
 //! The bench's wire transport: the osc-adapter as instrument. Raw
 //! break-framed TX, arbitrary-rate host UART, break trains, and
-//! hardware-timestamped edge capture decoded into [`BStamp`]s -- the
-//! adapter's 0x6x record family through osc-client's blocking facade.
+//! hardware-timestamped edge capture decoded into [`BStamp`]s: the
+//! adapter's instrument kinds (link sec 9) through osc-client's blocking
+//! facade.
 //! Engine-shaped traffic (ENUM walks, rails) rides [`Wire::client`].
 
 use std::time::{Duration, Instant};
@@ -12,13 +13,14 @@ use osc_client::nusb::NusbPipe;
 use osc_client::wire::{Level, WireEdge};
 
 use crate::BOOT_BAUD;
-use crate::edges::{BStamp, stamps_from_edges};
+use crate::edges::{BStamp, stamps_from_capture};
 
 pub struct Wire {
     client: Client<NusbPipe>,
     baud: u32,
     ticks_per_us: u32,
     stall: StallInjector,
+    frames_sent: u64,
 }
 
 /// Capture-drain poll cadence. The client's anchor chain keeps a late
@@ -32,7 +34,7 @@ impl Wire {
     /// Claim the adapter (VID/PID autodetect) and put the bus at `baud`.
     pub fn connect(baud: u32) -> Result<Self> {
         let mut client =
-            Client::connect(NusbPipe::open()?).context("osc-adapter HELLO handshake")?;
+            Client::connect(NusbPipe::open()?).context("osc-adapter GET_INFO handshake")?;
         let ticks_per_us = client.info().ticks_per_us;
         client.wire_baud(BOOT_BAUD)?;
         let mut wire = Self {
@@ -40,6 +42,7 @@ impl Wire {
             baud: BOOT_BAUD,
             ticks_per_us,
             stall: StallInjector::from_env(),
+            frames_sent: 0,
         };
         if baud != BOOT_BAUD {
             wire.set_baud(baud)?;
@@ -62,13 +65,19 @@ impl Wire {
         self.baud
     }
 
+    /// Break-framed frames sent since connect (train announces included,
+    /// bare breaks not). Traffic through [`Wire::client`] is not counted.
+    pub fn frames_sent(&self) -> u64 {
+        self.frames_sent
+    }
+
     /// Capture ticks per wire bit at the current baud.
     pub fn bit_ticks(&self) -> u32 {
         (self.ticks_per_us as u64 * 1_000_000 / self.baud as u64) as u32
     }
 
     /// Host UART rate, raw bps -- off-catalog divisors allowed (the
-    /// clock-tracker's detune injector rides this). Clears capture state:
+    /// trim suite's host-detune probe rides this). Clears capture state:
     /// stamps decoded across a rate change would lie.
     pub fn set_baud(&mut self, bps: u32) -> Result<()> {
         self.client.wire_baud(bps)?;
@@ -85,6 +94,7 @@ impl Wire {
     /// One law break + `bytes`, raw (malformed frames allowed).
     pub fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
         self.client.wire_send(bytes)?;
+        self.frames_sent += 1;
         Ok(())
     }
 
@@ -92,6 +102,7 @@ impl Wire {
     pub fn burst(&mut self, frames: &[Vec<u8>]) -> Result<()> {
         let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
         self.client.wire_burst(&refs)?;
+        self.frames_sent += frames.len() as u64;
         Ok(())
     }
 
@@ -116,19 +127,15 @@ impl Wire {
                 .try_into()
                 .context("train length caps at 255 breaks")?,
         )?;
+        self.frames_sent += 1;
         Ok(())
     }
 
     /// Drain whatever capture currently holds and decode it. One-shot:
     /// callers pacing a longer window use [`Wire::collect_stamps`].
     pub fn drain_stamps(&mut self) -> Result<Vec<BStamp>> {
-        let mut edges = self.drain_edges_dry()?;
-        // The two polarity rings drain at slightly different instants, so
-        // an edge pair straddling that window lands across drain batches
-        // out of order -- time-order the accumulated view before decoding
-        // (the decoder's level timeline binary-searches it).
-        edges.sort_by_key(|e| e.tick);
-        Ok(stamps_from_edges(&edges, self.bit_ticks()))
+        let edges = self.drain_edges_dry()?;
+        Ok(stamps_from_capture(edges, self.bit_ticks()))
     }
 
     /// Poll-drain the capture across `settle_ms`, then decode. The window
@@ -145,9 +152,7 @@ impl Wire {
             std::thread::sleep(DRAIN_POLL);
         }
         edges.extend(self.drain_edges_dry()?);
-        // Cross-batch time order (see drain_stamps).
-        edges.sort_by_key(|e| e.tick);
-        Ok(stamps_from_edges(&edges, self.bit_ticks()))
+        Ok(stamps_from_capture(edges, self.bit_ticks()))
     }
 
     /// Drain until a poll answers empty. Overflow is a hard failure: the

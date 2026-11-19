@@ -57,6 +57,41 @@ met its tolerance from plain clock reads. Lesson: RX jitter does not
 propagate to the wire — only TX jitter does. Spend hardware where error
 reaches the wire; software is fine everywhere else.
 
+### The USART's LIN break detector as the wake
+
+The length-qualified wake first lived on the USART's LIN break detector
+(LBD, enabled without the LIN engine), measured clean on the rev B board's
+buffered wire, where RX had its own pin: law breaks 2000/2000 with its
+flag-selective write-0 clear running mid-traffic, and zero entries across
+framing-error injection and high-baud garble. Rev 2A runs the bus on one
+pin under HDSEL, and there the V006 never sets LBD, in any configuration
+tried; the same die sets it with HDSEL off. The servo received every frame
+into the ring and never woke to resolve one. The wake moved to TIM2 on the
+bus pin: an edge-reset counter whose overflow at 9.25 bit-times latches
+the pin level by DMA. That detector fires a break-length in, not at the
+span's end, so it can beat the break's own `0x00` into the ring; the
+ring-dependent service moved behind a one-byte-time re-inspection, and the
+reply's own break, which the pin sees though the receiver does not, is
+sent with the detector muted. Lesson: a peripheral feature measured in one
+wiring is not measured in another - bring up the production wiring before
+building on it.
+
+### The edge-reset TIM2 detector
+
+The first TIM2 wake zeroed its counter on every wire edge (slave reset
+mode on TI1F_ED) and overflowed after 9.25 bit-times of either level, so
+it timed every quiet span, high or low. A DMA latch of the pin at the
+overflow told a break from idle, the service parked the update, and the
+next edge's trigger interrupt re-armed it. Each ping cost about five
+TIM2 entries (a break, an idle, three re-arms), and the idle entry landed
+inside the turnaround window, where it could hold off the reply-start
+deadline at the same PFIC level; turnaround and kernel ticks lost per ping
+both measured worse than under LBD. Gating the counter on the low level
+and zeroing it by DMA on each rising edge put the whole qualification in
+hardware: an overflow can only be a break, and a ping costs one entry.
+Lesson: qualify in the peripheral, so the interrupt carries only the
+event.
+
 ## Transmit timing the break made obsolete
 
 ### Hardware-timed TX kickoff + RDT
@@ -102,6 +137,19 @@ with a post-trim baseline subtraction that kills every constant (host
 queuing seam, detector latch offset, ISR flavor residue) so only drift
 survives. Lesson: when only the host has the truth — it owns the crystal —
 ask the host to cooperate instead of eavesdropping on it.
+
+The chain-pair tracker was deleted in turn. It needed each break's time
+and its position in the ring, and the V006 delivers those on two separate
+paths: the ISR entry lags the detector by up to two frames under load and
+merges breaks, so stamps moved to a DMA latch (DMA1 CH2 copying TIM3 on
+the detector's update), which then had to be paired with ring positions
+by order after the fact - floors, take-after-reply, clears on CAL marks,
+rate changes and rescues, a 16-bit unwrap. Every pairing heuristic had a
+misfire case, and the transport bugs of a whole week sat in that one
+layer. The trim now moves only on a CAL; the host re-sends CAL
+periodically to follow thermal drift. Lesson: if the hardware cannot tag
+an event with both its time and its place, do not build a mechanism that
+needs both - ask the reference to come to you.
 
 ## Position and time from wake evidence: three dead ends
 
@@ -178,6 +226,24 @@ state machines defeat. The driver is instead a composed set of explicitly
 scheduled state machines driven by two interrupt vectors: the scheduling is
 the design, not plumbing to be abstracted away.
 
+### The thermal derate
+
+The winding estimate once folded the current limit as well as tripping a
+fault: full current under `derate_start_cc`, a linear ramp down to zero at
+`cutoff_cc`, where the overtemperature fault latched. The ramp existed to
+hold "weaker but still holding": less current, less heat, an equilibrium
+short of the fault instead of a shutdown. It went for two reasons. One
+temperature limit with a shutdown at it is what the servos of this class
+do, and a host that wants a soft approach can lower the current limit or
+watch the estimate itself. And a ramp needs its two ends to sit where their
+registers say, which the stored NTC curve could not give: it is a quadratic
+about 25 C, good from 15 to 50 C, and it could not put two limits far above
+that where they said. The cutoff alone stayed. The ramp had one side effect
+worth keeping, a zero ceiling that kept a servo with a failed NTC from
+driving between a host's ack and the next estimate, and the enable edge now
+checks the estimate against the cutoff for that. Lesson: delete the
+machinery rather than tune its second knob.
+
 ### Framing alternatives that lost to the break
 
 Recorded so they are not re-derived. Closing double-break (a break at both
@@ -190,6 +256,45 @@ cost to buy detection the break + CRC + host-retry contract already
 provides, and none deletes receiver machinery. Break framing is the strong
 form of sync — DXL's `FF FF FD` + stuffing is the workaround for not having
 an out-of-band delimiter at all.
+
+### The run-time check for a reversed motor
+
+For a while the kernel checked the wiring itself. The soft-limit walls
+trust `drive_polarity`, and a motor wired the other way round turns them
+inside out, so from boot until a first move had shown the shaft going the
+drive's way, the kernel followed the shaft in legs of about a degree and
+latched a `drive_reversed` fault on two legs against the drive. That asked
+it to tell a reversed motor from a right-wired one losing to a load, with
+only the pot and the drive's sign to go on, and it could not. A load at the
+current limit, let go on a parked hold, back-drove the shaft two legs and
+latched it: a false verdict, and a worse outcome than none, since the latch
+shorted the winding and let fall a load the hold would have stopped and
+handed to the stall timer. It also proved the wiring falsely in two cases:
+a load carrying a reversed motor the way its velocity command pointed, and
+a reversed motor stepped the way it had already drifted. Each fix would
+have added a term and a budget row to a check that servos of this class do
+not carry at all. So the check went. The polarity is a calibration fact
+that `osc cal` measures and the plant stamp covers, a write that changes it
+refuses closed loop until a tool stamps the set again, and a servo that
+carries a wrong one runs to its stop and ends on the position error timer
+or the stall timer. Lesson: a fact the calibration measures is not one for
+the control loop to keep re-deriving from evidence a load can forge.
+
+### The compiled current cap and move speed
+
+A servo with no saved configuration once booted on a compiled 500 mA cap
+and a 1500 c/s move speed, and Current mode ran on them under every data
+reason but a corrupt CONFIG. Both were class guesses: 500 mA already sat
+over what a plastic train holds at a stop, and a board meets motors whose
+stall current and top speed it has never seen, so no compiled value was
+right for the motor at hand. They went when the speed ceiling joined the
+cap as the second limit every closed mode clamps against. Both now boot 0,
+unset, and the kernel's belt refuses every closed mode until calibration
+writes them; OpenLoop, which has no limits by design, runs under the
+board's overcurrent trip, and the host protects the train. The servos of
+this class ship limits for their own motor because their factory is the
+calibration. Lesson: a default that stands in for a measurement is a guess
+the servo will run on; refuse instead.
 
 ## Recurring lessons
 

@@ -1,28 +1,13 @@
 //! Board-tunable wiring. Schematic-fixed pieces (USART/TIM2/TIM1 remaps,
-//! OPA inputs, TX_EN, STAT, PWM frequency, ADC sample time) live in
-//! [`super::chip`]; anything tunable per board (within the analog/digital
-//! pin buckets the chip + this board's free-pin set allow) lives here.
+//! STAT, PWM frequency, ADC sample time) live in [`super::chip`]; anything
+//! tunable per board (within the analog/digital pin buckets the chip + this
+//! board's free-pin set allow) lives here.
 
+use osc_servo_core::estimator::window::SettleGain;
 use osc_servo_drivers::Level;
 
 use crate::cfg::chip::{AnalogChannel, DigitalPin};
-#[cfg(not(feature = "half-duplex"))]
-use crate::hal::Pin;
 use crate::hal::opa;
-
-/// Bus wire wiring -- exists only on the buffered default wire (the
-/// wire mode is a compile-time board choice; see `providers/tx_wire`). The
-/// direct wire needs no bus wiring at all: PC0 carries everything, and on a
-/// buffer-populated board running the direct wire, the board's TX_EN
-/// pull-down is what keeps the buffer released -- no firmware involved.
-#[cfg(not(feature = "half-duplex"))]
-#[derive(Copy, Clone)]
-pub struct BusWiring {
-    /// 74LVC2G241 direction pin: high = the buffer drives TX onto the data
-    /// line and mutes the receive path (inverted enable, same signal);
-    /// low = wire released, the data line feeds RX.
-    pub tx_en: Pin,
-}
 
 #[derive(Copy, Clone)]
 pub struct DrvEn {
@@ -33,61 +18,104 @@ pub struct DrvEn {
 
 impl DrvEn {
     pub const fn inactive(&self) -> Level {
-        match self.active {
-            Level::High => Level::Low,
-            Level::Low => Level::High,
-        }
+        self.active.inverted()
     }
 }
 
 #[derive(Copy, Clone)]
 pub struct CurrentSenseConfig {
-    pub gain: opa::Gain,
-    pub bias: opa::Bias,
+    pub opa: opa::Config,
+    /// External feedback network Rf/Rg x1000. The bare op-amp has no gain of
+    /// its own, so this is board data, not a chip setting.
+    pub gain_milli: u16,
+}
+
+impl CurrentSenseConfig {
+    /// ADC channel the amplifier output lands on.
+    pub const fn current_channel(&self) -> AnalogChannel {
+        match self.opa.out {
+            opa::Output::PD4 => AnalogChannel::A7,
+            // Dead arm: `BoardWiring::assert_valid` rejects a PA5 output at
+            // const-eval, because PA5 is not an ADC pin on this package.
+            opa::Output::PA5 => AnalogChannel::A7,
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
 pub struct AdcPins {
     pub pos: AnalogChannel,
-    pub ntc: AnalogChannel,
-    pub vbus: AnalogChannel,
     pub vmotor: (AnalogChannel, AnalogChannel),
+    /// Direct supply-rail divider tap.
+    pub vbus: AnalogChannel,
+    /// NTC divider tap.
+    pub ntc: AnalogChannel,
 }
 
-/// `V_adc = V_in * bot_ohm / (top_ohm + bot_ohm)`.
+impl AdcPins {
+    const fn all(&self) -> [AnalogChannel; 5] {
+        [self.pos, self.vmotor.0, self.vmotor.1, self.vbus, self.ntc]
+    }
+}
+
+/// `V_adc = V_in * bot_ohm / (top_ohm + bot_ohm)` plus, for a bottom leg
+/// returned to a bias node instead of GND, `V_bias * top_ohm / (top_ohm +
+/// bot_ohm)`. Firmware math uses only the gain: terminal taps enter as
+/// `va - vb`, where the bias cancels.
 #[derive(Copy, Clone)]
 pub struct Divider {
     pub top_ohm: u32,
     pub bot_ohm: u32,
 }
 
-/// beta-model NTC params: `R_ntc(T) = r0_ohm * exp(beta * (1/T - 1/T0))`.
+/// NTC to GND under a pull-up to VDD: `V_adc = VDD * R_ntc / (pullup + R_ntc)`.
 #[derive(Copy, Clone)]
-pub struct NtcCal {
+pub struct Ntc {
+    pub pullup_ohm: u32,
+    pub r25_ohm: u32,
     pub beta: u16,
-    pub r0_ohm: u32,
-    /// T0 in centi-degC (matches `osc_units::CentiCelsius`).
-    pub t0_cc: i16,
-    pub bias_r_ohm: u32,
 }
 
 /// Schematic-derived constants identical across every unit of a PCB design.
 #[derive(Copy, Clone)]
 pub struct Calibration {
     pub shunt_r_mohm: u16,
-    pub vbus_divider: Divider,
     pub vmotor_divider: Divider,
-    pub ntc: NtcCal,
+    /// Direct supply-rail divider (`vbus_raw`).
+    pub vbus_divider: Divider,
+    pub ntc: Ntc,
+    /// VDD divider making the bias both motor-terminal dividers return to;
+    /// its ratio is the nominal bias, the fallback when the boot
+    /// measurement's two taps disagree.
+    pub vmotor_bias: Divider,
+    /// Supply connector -> VSYS drop across the input diode at rest, mV.
+    pub rail_drop_mv: u16,
+    /// DMM-measured VDD at the chip pin; the v006 ADC reference is VDD itself.
+    pub vdd_mv: u16,
+    /// Shortest drive window (TIM1 ticks) with a valid shunt sample.
+    pub i_window_min_ticks: u16,
+    /// Shortest drive window (TIM1 ticks) with a valid vmotor sample.
+    pub v_window_min_ticks: u16,
+    /// Narrowest commanded drive width (TIM1 ticks) the bridge puts out as
+    /// a pulse; 0 when not measured.
+    pub bridge_min_ticks: u16,
+    /// Shortest drive window (TIM1 ticks) the back-EMF observer takes.
+    pub bemf_window_min_ticks: u16,
+    /// Shortest brake half (TIM1 ticks) whose trough shunt sample
+    /// has settled to the amplifier's rest offset: the bias tracker learns
+    /// from no narrower one.
+    pub bias_brake_min_ticks: u16,
+    /// The shunt amplifier's settle gain by drive width; `SettleGain::UNITY`
+    /// for an amplifier that settles inside the current floor.
+    pub i_settle_gain: SettleGain,
 }
 
 /// Board-tunable wiring; consumed during `Ch32ControlIo::new` and not retained.
 #[derive(Copy, Clone)]
 pub struct BoardWiring {
-    /// Scope/probe pad; toggled once per DMA-TC ISR.
-    pub dbg: DigitalPin,
     pub drv_en: DrvEn,
-    #[cfg(not(feature = "half-duplex"))]
-    pub bus: BusWiring,
+    /// Level that lights the STAT LED on `chip::STAT_LED_PIN`.
+    pub stat_led_active: Level,
     pub current_sense: CurrentSenseConfig,
     pub sensors: AdcPins,
 }
@@ -95,34 +123,26 @@ pub struct BoardWiring {
 impl BoardWiring {
     /// Compile-time call site: `const _: () = WIRING.assert_valid();`
     pub const fn assert_valid(&self) {
-        self.assert_scratch_distinct();
-        #[cfg(not(feature = "half-duplex"))]
-        self.assert_bus_distinct();
+        self.assert_current_output_readable();
         self.assert_sensors_distinct();
+        self.assert_sensors_clear_of_opa_inputs();
     }
 
-    const fn assert_scratch_distinct(&self) {
-        if (self.dbg as u8) == (self.drv_en.pin as u8) {
-            panic!("BoardWiring: dbg and drv_en.pin must not share a DigitalPin");
-        }
-    }
-
-    #[cfg(not(feature = "half-duplex"))]
-    const fn assert_bus_distinct(&self) {
-        let tx_en = self.bus.tx_en;
-        if (tx_en as u8) == (self.dbg.pin() as u8) || (tx_en as u8) == (self.drv_en.pin.pin() as u8)
-        {
-            panic!("BoardWiring: bus TX_EN must not share a pin with dbg or drv_en");
+    const fn assert_current_output_readable(&self) {
+        if matches!(self.current_sense.opa.out, opa::Output::PA5) {
+            panic!("BoardWiring: OPA output PA5 has no ADC channel on this package");
         }
     }
 
     const fn assert_sensors_distinct(&self) {
-        let chs: [AnalogChannel; 5] = [
-            self.sensors.pos,
-            self.sensors.ntc,
-            self.sensors.vbus,
-            self.sensors.vmotor.0,
-            self.sensors.vmotor.1,
+        let s = self.sensors.all();
+        let chs: [AnalogChannel; 6] = [
+            self.current_sense.current_channel(),
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+            s[4],
         ];
         let n = chs.len();
         let mut i = 0;
@@ -133,6 +153,21 @@ impl BoardWiring {
                     panic!("BoardWiring: duplicate sensor AnalogChannel");
                 }
                 j += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// An OPA input pad (PA2 = A0, PA1 = A1, ...) is the amplifier's, not a
+    /// sensor's: its analog switch would load the divider.
+    const fn assert_sensors_clear_of_opa_inputs(&self) {
+        let (opa_pos, opa_neg, _) = self.current_sense.opa.pins();
+        let s = self.sensors.all();
+        let mut i = 0;
+        while i < s.len() {
+            let pin = s[i].pin() as u8;
+            if pin == opa_pos as u8 || pin == opa_neg as u8 {
+                panic!("BoardWiring: sensor AnalogChannel shares a pin with an OPA input");
             }
             i += 1;
         }
