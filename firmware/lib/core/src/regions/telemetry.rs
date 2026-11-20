@@ -1,43 +1,5 @@
 use control_table::{Block, Section};
 
-#[repr(C)]
-#[derive(Copy, Clone, Block)]
-pub struct TelemetryConverted {
-    #[ct_field(access = ro)]
-    pub present_position: i32,
-    #[ct_field(access = ro)]
-    pub present_velocity: i32,
-    #[ct_field(access = ro)]
-    pub present_current: i16,
-    #[ct_field(access = ro)]
-    pub present_temp: i16,
-    #[ct_field(access = ro)]
-    pub present_vbus_mv: u16,
-    #[ct_field(skip)]
-    pub _rsvd_tail: u16,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Block)]
-pub struct TelemetryIntermediaries {
-    #[ct_field(access = ro)]
-    pub vbus_filt_mv: u16,
-    #[ct_field(access = ro)]
-    pub t_winding_dc: i16,
-    #[ct_field(access = ro)]
-    pub pwm_duty_actual: i16,
-    #[ct_field(skip)]
-    pub _rsvd_align: u16,
-    #[ct_field(access = ro)]
-    pub pid_error_last: i32,
-    #[ct_field(access = ro)]
-    pub pid_output_last: i32,
-    #[ct_field(access = ro)]
-    pub internal_goal: i32,
-    #[ct_field(access = ro)]
-    pub sample_tick: u32,
-}
-
 /// protocol sec 5.4 TELEMETRY-COMMON block, at the region front. Counters:
 /// host can Write zero to clear (bench instrumentation); the chip publishes
 /// deltas via raw pointer, bypassing the regmap, so a concurrent host clear +
@@ -77,29 +39,173 @@ pub struct TelemetryMode {
     pub mode_active: u8,
     #[ct_field(access = ro)]
     pub fault_code: u8,
-    #[ct_field(skip)]
-    pub _rsvd_align: u16,
+    /// Whether a back-EMF boxcar fed the velocity loop's speed this
+    /// period (`estimator::OmegaBlend`): 1 = `omega_bemf_cps` is that
+    /// boxcar, 0 = none closed.
+    #[ct_field(access = ro)]
+    pub omega_hat_src: u8,
+    /// Why closed loop is refused, one bit per reason (`data_state` module
+    /// consts); 0 = the persisted images and the identified set are this
+    /// servo's own. Written by boot, SAVE and the bus dispatcher's commits
+    /// (a covered write marks STAMP_MISMATCH, a stamp write and a LUT COMMIT
+    /// checkpoint), read by the kernel's entry check - the one
+    /// TELEMETRY-MODE byte the kernel does not own.
+    #[ct_field(access = ro)]
+    pub data_flags: u8,
 }
 
+/// One control tick (protocol sec 5.6). The chip's ADC DMA lands both scans
+/// of each PWM period at the front: the trough scan and the crest scan's
+/// taps and shunt in `_scan`, the crest's `pos` to `ntc_raw` on their
+/// fields. The DMA writes the taps in sample order, so no published name
+/// lies in its way: the tick ISR stamps `sample_tick`, copies the injected
+/// group's shunt and the trough's samples out, and once the crest scan has
+/// landed writes each crest tap under its terminal's name; the kernel
+/// writes its conclusions on the window the scan measured, and the TEL row
+/// is copied. The next scans land mid-tick and a period on
+/// (`budget::NEXT_TROUGH`, `budget::NEXT_CREST`), after every read of this
+/// one, so inside the tick every field is this tick's. Counts-domain
+/// throughout.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Block)]
+pub struct TelemetryTick {
+    #[ct_field(skip)]
+    pub _scan: [u16; 10],
+    #[ct_field(access = ro)]
+    pub pos: u16,
+    /// The chip's 1.2 V internal reference, counted against VDD, which is
+    /// the ADC reference: VDD = 1.2 V x 4096 / vref_raw.
+    #[ct_field(access = ro)]
+    pub vref_raw: u16,
+    /// Direct supply divider tap (the rail `vbus_counts` derives from).
+    #[ct_field(access = ro)]
+    pub vbus_raw: u16,
+    /// NTC divider tap.
+    #[ct_field(access = ro)]
+    pub ntc_raw: u16,
+    /// The shunt at the counter peak, from the injected group.
+    #[ct_field(access = ro)]
+    pub current_raw: u16,
+    #[ct_field(access = ro)]
+    pub vmotor_a: u16,
+    #[ct_field(access = ro)]
+    pub vmotor_b: u16,
+    /// The PWM compare width the window measured was driven at, negative
+    /// in reverse; full scale is CALIB `pwm_period_ticks`.
+    #[ct_field(access = ro)]
+    pub duty_ticks: i16,
+    #[ct_field(access = ro)]
+    pub current_trough: u16,
+    /// Window-selected, bias-subtracted, settle-gained, signed current
+    /// (`window::i_from_frame`) less the window term
+    /// (`window::WindowTerm`): the winding's current, 0 from the first tick
+    /// nothing drives. Through windows the shunt cannot read it holds under
+    /// OpenLoop and is the current reference under the closed loops.
+    #[ct_field(access = ro)]
+    pub i_tick_counts: i16,
+    /// Drive-window `va - vb`, logical sign, held through windows the
+    /// terminal taps cannot read.
+    #[ct_field(access = ro)]
+    pub vdiff_counts: i16,
+    #[ct_field(access = ro)]
+    pub vmotor_a_trough: u16,
+    #[ct_field(access = ro)]
+    pub vmotor_b_trough: u16,
+    /// [`tick_flag`] bits: the shunt window was read, a fault is
+    /// latched, the terminal window was read.
+    #[ct_field(access = ro)]
+    pub tick_flags: u16,
+    #[ct_field(access = ro)]
+    pub sample_tick: u32,
+}
+
+/// `TelemetryTick::tick_flags` bits, written every tick.
+pub mod tick_flag {
+    /// The shunt read the window `duty_ticks` drove: `i_tick_counts` is
+    /// fresh, not held.
+    pub const I_VALID: u16 = 1 << 0;
+    /// A fault is latched.
+    pub const FAULT: u16 = 1 << 1;
+    /// The terminal taps read the window: `vdiff_counts` is fresh.
+    pub const V_VALID: u16 = 1 << 2;
+}
+
+/// Estimator outputs, published at the medium boundary. Counts-domain
+/// throughout; conversion is the host's job.
 #[repr(C)]
 #[derive(Copy, Clone, Block)]
-pub struct TelemetryRaw {
+pub struct TelemetryEstimates {
+    /// Fused position, cQ16 (pot counts x 2^16).
     #[ct_field(access = ro)]
-    pub raw_pos: u16,
+    pub theta_hat_q16: i32,
+    /// Velocity-loop feedback, raw csQ16 ((counts/s) x 2^16) - published
+    /// unshifted: the pot observer's omega plus the back-EMF boxcar's
+    /// fast part (`estimator::OmegaBlend`).
     #[ct_field(access = ro)]
-    pub raw_current: u16,
+    pub omega_hat_cps: i32,
+    /// Disturbance-torque estimate, current counts.
     #[ct_field(access = ro)]
-    pub raw_temp: u16,
+    pub tau_d_counts: i16,
+    /// Effective current ceiling after limit folds.
     #[ct_field(access = ro)]
-    pub raw_vbus: u16,
+    pub i_lim_counts: u16,
+    /// Winding estimate, centi-C: the board NTC plus the rise on the two
+    /// heat nodes; `i16::MIN` while no NTC curve is set (`therm_flags` bit
+    /// 0), `i16::MAX` on a railed NTC or a reading outside the band (bit 1).
     #[ct_field(access = ro)]
-    pub raw_vmotor_a: u16,
+    pub t_winding_cc: i16,
     #[ct_field(access = ro)]
-    pub raw_vmotor_b: u16,
+    pub vbus_counts: u16,
+    /// Back-EMF boxcar, whole c/s; 0 while none closed (`omega_hat_src`
+    /// reads 0 beside it).
     #[ct_field(access = ro)]
-    pub raw_enc_a: u16,
+    pub omega_bemf_cps: i16,
+    /// The winding resistance the control path reads, Q4.12 vcounts per
+    /// ccount: CALIB `r_q12` raised by copper's slope on the winding
+    /// estimate's rise over the NTC, saturating. The heat model's number,
+    /// not a measurement: `r_q12` itself with no heat, while no NTC curve
+    /// is set and on a failed NTC, 0 for an unidentified winding. Published
+    /// at the SLOW finish and at a configuration take.
     #[ct_field(access = ro)]
-    pub raw_enc_b: u16,
+    pub r_hat_q12: u16,
+}
+
+/// The references the raw frame is read against.
+#[repr(C)]
+#[derive(Copy, Clone, Block)]
+pub struct TelemetryRefs {
+    /// Zero-current sense-chain output in use, raw ADC counts, driver
+    /// awake: the boot rest measurement, then tracked from one sample a
+    /// control period while the shunt carries no current - torque off, a
+    /// settled brake or coast, a drive's settled brake trough
+    /// (`estimator::bias`). Published at the medium boundary.
+    #[ct_field(access = ro)]
+    pub current_bias_counts: u16,
+    /// Boot-measured motor-terminal divider bias (terminals high-impedance),
+    /// raw ADC counts; the terminal taps read this with the rail at 0.
+    #[ct_field(access = ro)]
+    pub vmotor_bias_counts: u16,
+    #[ct_field(access = ro)]
+    pub enc_a: u16,
+    #[ct_field(access = ro)]
+    pub enc_b: u16,
+}
+
+/// Which limit governs the command, published at the medium boundary: one
+/// bit per reason (`kernel::phases::loops::limits::flag`), 0 = nothing holds it back.
+#[repr(C)]
+#[derive(Copy, Clone, Block)]
+pub struct TelemetryLimits {
+    #[ct_field(access = ro)]
+    pub limit_flags: u8,
+    #[ct_field(skip)]
+    pub _rsvd_align: u8,
+    /// Smallest duty whose drive window the shunt reads
+    /// (`window::floor_duty`), Q15: where the OpenLoop ceiling restarts and
+    /// its blind band begins. Published once, at the kernel's first tick:
+    /// its input is read-only. 0 until then.
+    #[ct_field(access = ro)]
+    pub window_floor_q15: u16,
 }
 
 #[repr(C)]
@@ -108,9 +214,10 @@ pub struct TelemetryRaw {
 pub struct TelemetryRegs {
     pub common: TelemetryCommon,
     pub mode: TelemetryMode,
-    pub converted: TelemetryConverted,
-    pub intermediaries: TelemetryIntermediaries,
-    pub raw: TelemetryRaw,
+    pub tick: TelemetryTick,
+    pub estimates: TelemetryEstimates,
+    pub refs: TelemetryRefs,
     #[ct_section(skip)]
-    pub _rsvd_tail: [u8; 36],
+    pub _rsvd_ident: [u8; 8],
+    pub limits: TelemetryLimits,
 }

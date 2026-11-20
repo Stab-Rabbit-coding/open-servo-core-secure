@@ -1,7 +1,7 @@
 use crate::regions::config;
 use control_table::{Block, Enum, Section};
 
-/// Position controller mode. `repr(u8)` so the byte-level commit path round-trips
+/// Control mode. `repr(u8)` so the byte-level commit path round-trips
 /// cleanly; validators MUST gate writes to `Mode::ALLOWED` because constructing a
 /// `Mode` from an unlisted discriminant is UB.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Enum)]
@@ -9,63 +9,172 @@ use control_table::{Block, Enum, Section};
 pub enum Mode {
     #[default]
     OpenLoop = 0,
-    PositionPid = 1,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Enum)]
-#[repr(u8)]
-pub enum BootMode {
-    #[default]
-    App = 0,
-    Bootloader = 1,
+    Current = 1,
+    Velocity = 2,
+    Position = 3,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Block)]
+#[derive(Copy, Clone, Default, Block)]
+#[ct_block(hooks = crate::regions::hooks::ControlTableHookEvents)]
 pub struct ControlLifecycle {
     pub torque_enable: bool,
+    /// Let the motor stall on purpose: drops the stall trip and the endstop
+    /// band, and NOTHING else - the peak, rail and goal
+    /// ceilings still compose. Identification pushes into a hard stop to measure R and
+    /// L, which is precisely what those two guards exist to prevent, and no
+    /// soft-limit value can express it because a stop can sit AT the position
+    /// rail. A write of true with torque on grants a lease of about a second
+    /// (`kernel::phases::limits::PERMIT_LEASE_TICKS`) and a rewrite renews it; torque off or
+    /// a write of false revokes it. The byte reads back the last request, not
+    /// the grant: a tool that dies mid-run cannot leave a servo unguarded for
+    /// longer than the lease.
+    pub stall_permit: bool,
+    #[ct_field(skip)]
+    pub _rsvd_mode: u16,
     pub mode: Mode,
     #[ct_field(skip)]
-    pub _rsvd_align: [u8; 2],
-    #[ct_field(
-        ge = &config::addr::pos_limits::POS_MIN_SOFT_URAD,
-        le = &config::addr::pos_limits::POS_MAX_SOFT_URAD,
-    )]
+    pub _rsvd_align: u8,
+    #[ct_field(le = &config::addr::loop_current::DUTY_MAX_Q15, abs)]
+    pub goal_duty: i16,
+    /// Phys-validated, soft-clamped: garbage outside the rails rejects; an
+    /// out-of-soft goal runs to the soft wall (trajectory clamp) instead of
+    /// bouncing the write.
+    #[ct_field(within = (
+        &config::addr::pos_phys::POS_MIN_PHYS_COUNTS,
+        &config::addr::pos_phys::POS_MAX_PHYS_COUNTS,
+    ))]
     pub goal_position: i32,
     pub goal_velocity: i32,
-    #[ct_field(le = &config::addr::ctrl_pos::MAX_EFFORT, abs)]
-    pub goal_effort: i16,
+    /// Current-mode reference; magnitude cap in Velocity and Position.
+    /// Zero requests no cap in those modes. OpenLoop uses goal_duty.
+    #[ct_field(le = &config::addr::limits::CURRENT_LIMIT_COUNTS, abs)]
+    pub goal_current: i16,
+    /// Bus dead-man, kernel ticks (20 kHz: 20000 is one second, 65535 about
+    /// 3.3 s; kernel sec 2.7). A nonzero value with torque on is a countdown
+    /// that every instruction the bus dispatches to this servo reloads and
+    /// a TEL burst holds; at zero the kernel latches `deadman` and the drive
+    /// coasts until the torque enable ack. Torque off clears the countdown;
+    /// a fresh enable starts it from the field. 0 is off.
+    pub bus_deadman_ticks: u16,
+}
+
+/// Shunt-burst request. `arm` is level, not an edge: 1 asks for a capture, 0
+/// releases the result back to Idle, so a host that dies mid-run leaves a
+/// servo that only has to be told 0. `page` selects which slice of the
+/// capture the BURST section publishes. `chans` (`burst::chans`) picks the
+/// extras sampled behind the shunt and their layout; latched with
+/// `duty_q15` at the arm.
+#[repr(C)]
+#[derive(Copy, Clone, Block)]
+pub struct ControlBurst {
+    #[ct_field(le = &config::addr::loop_current::DUTY_MAX_Q15, abs)]
+    pub duty_q15: i16,
+    pub arm: u8,
+    pub page: u8,
+    #[ct_field(le = crate::regions::burst::chans::ALL)]
+    pub chans: u8,
     #[ct_field(skip)]
-    pub _rsvd_tail: [u8; 2],
+    pub _rsvd_align: u8,
 }
 
+/// STAT lamp flash, the bench clapper. A committed nonzero write lights the
+/// lamp for that many control ticks (20 kHz: 2000 is 100 ms, 65535 about
+/// 3.3 s) above every other lamp rule, then the field reads 0 again. The
+/// host's own time of the write is the event; the lamp follows within one
+/// main-loop pass. Sits where `boot_mode` was (now a MGMT REBOOT arg,
+/// protocol sec 9.5), so the burst block keeps its addresses.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Block)]
+pub struct ControlStat {
+    pub stat_flash_ticks: u16,
+}
+
+/// Paged window onto the position table in RAM (`pos_lut` module).
+/// `pos_lut_page` selects `PAGE_POINTS` points of the array; a committed
+/// write carrying `pos_lut_cmd` STOREs the window into that page, FETCHes it
+/// back, or COMMITs the whole array; `pos_lut_state` reports what the kernel
+/// applies. Page, command and points are contiguous so one WRITE carries a
+/// page. Volatile: a reboot is the identity until the CALIB image loads.
 #[repr(C)]
 #[derive(Copy, Clone, Block)]
-pub struct ControlStreaming {
-    pub stream_enable: bool,
-    pub stream_decimation: u8,
-    #[ct_field(ge = 1u16)]
-    pub stream_duration_ms: u16,
-    pub stream_field_mask: u32,
+pub struct ControlPosLut {
+    #[ct_field(le = crate::pos_lut::PAGES as u8 - 1)]
+    pub pos_lut_page: u8,
+    #[ct_field(le = crate::pos_lut::cmd::MAX)]
+    pub pos_lut_cmd: u8,
+    pub pos_lut_points: [i16; crate::pos_lut::PAGE_POINTS],
     #[ct_field(access = ro)]
-    pub stream_dropped: u32,
+    pub pos_lut_state: u8,
+    #[ct_field(skip)]
+    pub _rsvd_align: u8,
 }
 
+/// TEL burst arm (protocol sec 5.6): the row's chunks of the table, then
+/// the count, so one WRITE sets the row and arms. A row is chunk 0 and,
+/// when `chunk1_len` is nonzero, chunk 1 behind it, each copied whole at
+/// its table layout. The chunks carry no rules: the arm admits a row
+/// (`tel::Chunks::valid`) at `tel::BAUD` only and disarms otherwise.
 #[repr(C)]
 #[derive(Copy, Clone, Block)]
-pub struct ControlSystem {
-    pub boot_mode: BootMode,
+#[ct_block(hooks = crate::regions::hooks::ControlTableHookEvents)]
+pub struct ControlTel {
+    pub chunk0_addr: u16,
+    pub chunk0_len: u16,
+    pub chunk1_addr: u16,
+    pub chunk1_len: u16,
+    /// A committed nonzero write streams that many samples (one per fast
+    /// tick, batched 16 per `Stream` frame), then stops and releases the
+    /// line; 0 is disarmed. Composes with HOLD/COMMIT so a goal write and
+    /// the arm apply in the same instant. Any count the field holds arms: the
+    /// host is silent for the whole burst, and the kernel's own limits bound
+    /// the drive under it.
+    #[ct_field(hook = on_tel_count_write)]
+    pub tel_count: u16,
 }
+
+/// The loop-margin stimulus (kernel sec 2.7): a triangle on the velocity
+/// loop's reference in Velocity mode, rising and falling at
+/// `inject_accel_q88` (Q8.8 c/s per medium period) over halves of
+/// `inject_half_periods` medium periods, so its peak is
+/// `inject_accel_q88 x inject_half_periods / 2`. It runs only while a TEL
+/// burst streams under a loaded bus dead-man with no limit flag but the
+/// permit set; 0 in either field is off. The kernel reads the slope at most
+/// [`INJECT_ACCEL_MAX_Q88`] and the half-period at most
+/// [`INJECT_HALF_PERIODS_MAX`]. Read only by an image built with
+/// `loop-margin`, a bench image; the production and experiment images
+/// accept and ignore both. Volatile: a host zeroes both when it is done.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Block)]
+pub struct ControlInject {
+    pub inject_accel_q88: u16,
+    pub inject_half_periods: u16,
+}
+
+/// The ceilings the kernel reads the two fields at: the triangle's peak,
+/// `0x7FFF x 512 / 2` in Q8.8, stays under 2^23, so its csQ16 form fits
+/// i32. 512 half-periods is 1.95 Hz.
+pub const INJECT_HALF_PERIODS_MAX: u16 = 512;
+pub const INJECT_ACCEL_MAX_Q88: u16 = 0x7FFF;
 
 #[repr(C)]
 #[derive(Section)]
-#[ct_section(base = crate::regions::CONTROL_BASE_ADDR, size = crate::regions::CONTROL_REGION_SIZE)]
+#[ct_section(
+    base = crate::regions::CONTROL_BASE_ADDR,
+    size = crate::regions::CONTROL_REGION_SIZE,
+    hooks = crate::regions::hooks::ControlTableHookEvents,
+)]
 pub struct ControlRegs {
     pub lifecycle: ControlLifecycle,
-    pub streaming: ControlStreaming,
-    pub system: ControlSystem,
+    pub stat: ControlStat,
+    pub burst: ControlBurst,
+    pub pos_lut: ControlPosLut,
     #[ct_section(skip)]
-    pub _rsvd_tail: [u8; 99],
+    pub _rsvd_ident: [u8; 2],
+    pub tel: ControlTel,
+    pub inject: ControlInject,
+    #[ct_section(skip)]
+    pub _rsvd_tail: [u8; 16],
 }
 
 #[cfg(test)]

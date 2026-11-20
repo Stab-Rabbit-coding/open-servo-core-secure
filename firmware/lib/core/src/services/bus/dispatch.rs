@@ -1,18 +1,30 @@
+use core::mem::MaybeUninit;
+
 use control_table::{RegisterFile, Snapshot};
 use heapless::Vec;
 use osc_protocol::FrameBytes;
 use osc_protocol::frame::uid_prefix_matches;
 use osc_protocol::table::STATUS_FLAG_CONFIG_DIRTY;
-use osc_protocol::wire::{Id, MAX_PAYLOAD, MgmtOp, ResultCode, UID_LEN};
+use osc_protocol::wire::{Id, MAX_PAYLOAD, MgmtOp, ResultCode};
 
-use crate::persist::{CONFIG_LEN, PROFILE_LEN, StoreError};
+use crate::kernel;
+use crate::persist::{CALIB_LEN, CONFIG_LEN, PROFILE_LEN, StoreError};
+use crate::regions::burst::state as burst_state;
 use crate::regions::hooks::ControlTableHooks;
 use crate::regions::{
-    CONFIG_BASE_ADDR, CONFIG_REGION_SIZE, PROFILE_BASE_ADDR, PROFILE_REGION_SIZE,
+    CALIB_BASE_ADDR, CALIB_REGION_SIZE, CONFIG_BASE_ADDR, CONFIG_REGION_SIZE, PROFILE_BASE_ADDR,
+    PROFILE_REGION_SIZE,
 };
-use crate::traits::{Dispatch, Dispatched, GATHER_MAX, Reply, Request, RequestCtx, Status};
+use crate::tel::{Chunk, Chunks};
+use crate::traits::{Dispatch, Dispatched, GATHER_MAX, Reboot, Reply, Request, RequestCtx, Status};
 use crate::{Error, RegionStorage, Shared, StagedWrites};
 use control_table::STAGE_ENTRY_CAP;
+
+/// A span overlapping the kernel's inputs: its commit runs under an odd
+/// configuration count (`Shared::config_commit_begin`).
+fn reaches_the_kernel(addr: u16, len: u16) -> bool {
+    addr < kernel::SPAN_END && addr + len > kernel::SPAN_START
+}
 
 /// Map a control-table write/stage failure onto an osc-native result code
 /// (sec 5.3 layer 2). Read-only writes are `Access`; field-rule rejections are
@@ -25,21 +37,26 @@ fn error_to_result(e: Error) -> ResultCode {
     }
 }
 
-/// A write staged before its CRC verdict (the dispatch spine). The bus
+/// A write checked before its CRC verdict (the dispatch spine). The bus
 /// rebuilds the [`Dispatcher`] each wake, so this lives in the [`Session`]
-/// and outlives the dispatcher that staged it.
+/// and outlives the dispatcher that checked it.
 ///
 /// [`Session`]: super::session::Session
-pub(crate) struct PendingWrite {
-    /// Staging watermark before this write -- commit/revert operate above it.
-    snap: Snapshot,
-    /// A held write keeps its entries for a later COMMIT; a plain write applies
-    /// them at commit time.
-    hold: bool,
-    /// The written span, for firing hooks at commit.
-    addr: u16,
-    len: u16,
+pub(crate) enum PendingWrite {
+    /// The verdict stores the request bytes in place (the
+    /// [`Dispatch::commit`] contract keeps them readable until then).
+    Plain {
+        addr: u16,
+        head: *const [u8],
+        tail: *const [u8],
+    },
+    /// Staged above `snap`; the verdict keeps it for a later COMMIT.
+    Held { snap: Snapshot },
 }
+
+// SAFETY: the pointers are plain data until `Dispatch::commit` reads them,
+// on the bus, under its contract.
+unsafe impl Sync for PendingWrite {}
 
 /// Stateless single-shot dispatcher. Holds only borrowed shared state, the
 /// HOLD-write staging buffer, and the pending-write slot -- no per-frame
@@ -68,8 +85,8 @@ impl<'a> Dispatcher<'a> {
     /// lazy). MUST run before any path that reads the staging buffer from the
     /// zero watermark -- otherwise a real COMMIT would apply the phantom bytes.
     fn revert_dangling(&mut self) {
-        if let Some(pending) = self.pending.take() {
-            self.staged.revert_to(&pending.snap);
+        if let Some(PendingWrite::Held { snap }) = self.pending.take() {
+            self.staged.revert_to(&snap);
         }
     }
 
@@ -85,7 +102,7 @@ impl<'a> Dispatcher<'a> {
 impl Dispatch for Dispatcher<'_> {
     fn dispatch<R: Reply>(
         &mut self,
-        req: Request<'_>,
+        req: &Request<'_>,
         ctx: RequestCtx,
         reply: &mut R,
     ) -> Dispatched {
@@ -94,7 +111,7 @@ impl Dispatch for Dispatcher<'_> {
         // or stages anything.
         self.revert_dangling();
         let alert = self.alert();
-        match req {
+        let dispatched = match *req {
             Request::Ping => {
                 self.ping(alert, &ctx, reply);
                 Dispatched::Done
@@ -115,11 +132,11 @@ impl Dispatch for Dispatcher<'_> {
                 Dispatched::Done
             }
             Request::Enumerate { prefix_len, prefix } => {
-                self.enumerate(alert, &ctx, prefix_len, &prefix, reply);
+                self.enumerate(alert, &ctx, prefix_len, prefix, reply);
                 Dispatched::Done
             }
             Request::Assign { uid, new_id } => {
-                self.assign(alert, &ctx, &uid, new_id, reply);
+                self.assign(alert, &ctx, uid, new_id, reply);
                 Dispatched::Done
             }
             // sec 9.3: broadcast-only (decode enforces), so no ack precedes the
@@ -128,40 +145,72 @@ impl Dispatch for Dispatcher<'_> {
                 reply.begin_clock_cal(gap_us, gaps);
                 Dispatched::Done
             }
-            Request::Mgmt { op, .. } => {
-                self.mgmt(alert, &ctx, op, reply);
+            Request::Mgmt { op, args } => {
+                self.mgmt(alert, &ctx, op, args, reply);
                 Dispatched::Done
             }
             Request::Unsupported => {
                 self.instruction_error(alert, &ctx, reply);
                 Dispatched::Done
             }
-        }
+        };
+        // behind the arms: a COMMIT applies inside them, and the dead-man
+        // takes a field under the step that follows its store
+        self.shared.bus_touch();
+        dispatched
     }
 
-    fn commit<R: Reply>(&mut self, reply: &mut R) {
-        let Some(pending) = self.pending.take() else {
-            return; // defensive: nothing pending
+    unsafe fn commit<R: Reply>(&mut self, reply: &mut R) {
+        // Held entries stay staged until a real COMMIT.
+        let Some(PendingWrite::Plain { addr, head, tail }) = self.pending.take() else {
+            return;
         };
-        if pending.hold {
-            return; // held entries stay staged until a real COMMIT
+        // SAFETY: the caller keeps the request bytes readable and unchanged
+        // until this verdict (trait contract).
+        let (head, tail) = unsafe { (&*head, &*tail) };
+        let len = (head.len() + tail.len()) as u16;
+        let config = reaches_the_kernel(addr, len);
+        if config {
+            self.shared.config_commit_begin();
         }
-        self.shared.table.commit_from(self.staged, &pending.snap);
-        self.mark_dirty_if_persistent(pending.addr, pending.len);
+        self.shared.table.store_split(addr, head, tail);
+        if config {
+            self.shared.config_commit_end();
+        }
+        self.shared.bus_touch();
+        self.after_commit(addr, len);
         let mut hooks = ControlTableHooks::new(reply);
         self.shared
             .table
-            .with(|t| t.dispatch_events(pending.addr, pending.len, &mut hooks));
+            .with(|t| t.dispatch_events(addr, len, &mut hooks));
+        hooks.finish(|| self.tel_chunks());
     }
 
     fn revert(&mut self) {
-        if let Some(pending) = self.pending.take() {
-            self.staged.revert_to(&pending.snap);
-        }
+        self.revert_dangling();
     }
 }
 
 impl Dispatcher<'_> {
+    /// The row a `tel_count` write arms with: none while a shunt burst is
+    /// ARMED or CAPTURING, or its arm is committed and the kernel has not
+    /// judged it yet (IDLE with `arm` at 1: the kernel judges at its next
+    /// tick, which can land before this arm's lend), so the arm parks and
+    /// the write still acks. DONE holds nothing: the capture is over.
+    fn tel_chunks(&self) -> Chunks {
+        self.shared.table.with(|t| match t.burst.window.state {
+            burst_state::ARMED | burst_state::CAPTURING => Chunks::NONE,
+            burst_state::IDLE if t.control.burst.arm == 1 => Chunks::NONE,
+            _ => {
+                let c = &t.control.tel;
+                Chunks::two(
+                    Chunk::new(c.chunk0_addr, c.chunk0_len),
+                    Chunk::new(c.chunk1_addr, c.chunk1_len),
+                )
+            }
+        })
+    }
+
     fn send<R: Reply>(reply: &mut R, status: Status<'_>) {
         // TX overflow is a sizing bug, not a runtime error -- bench telemetry
         // catches it at integration.
@@ -191,6 +240,16 @@ impl Dispatcher<'_> {
                 data: &[],
             },
         );
+    }
+
+    /// The post-commit bookkeeping every committed span gets: the dirty
+    /// bit, a position table command, a stall permit grant, then the
+    /// data-state consequences of a covered or stamp write.
+    fn after_commit(&self, addr: u16, len: u16) {
+        self.mark_dirty_if_persistent(addr, len);
+        self.shared.pos_lut_after_commit(addr, len);
+        self.shared.permit_after_commit(addr, len);
+        self.shared.data_state_after_commit(addr, len);
     }
 
     /// sec 9.4 modified-since-save: a committed span landing in CONFIG or
@@ -232,7 +291,7 @@ impl Dispatcher<'_> {
         let data = RegisterFile::read(
             &self.shared.table,
             crate::regions::config::addr::common::MODEL_NUMBER,
-            3,
+            4,
         )
         .unwrap_or(&[]);
         Self::send(
@@ -321,7 +380,7 @@ impl Dispatcher<'_> {
         let Some(words) = words else {
             return nack(reply, ResultCode::Range);
         };
-        let mut spans: [&[u8]; GATHER_MAX] = [&[]; GATHER_MAX];
+        let mut spans = [const { MaybeUninit::<&[u8]>::uninit() }; GATHER_MAX];
         let mut n = 0;
         let mut total: u16 = 0;
         for w in words {
@@ -331,7 +390,7 @@ impl Dispatcher<'_> {
             let Ok(data) = RegisterFile::read(&self.shared.table, addr, count) else {
                 return nack(reply, ResultCode::Range);
             };
-            spans[n] = data;
+            spans[n].write(data);
             n += 1;
             total += count;
         }
@@ -341,14 +400,17 @@ impl Dispatcher<'_> {
         if total > MAX_PAYLOAD as u16 {
             return nack(reply, ResultCode::Limit);
         }
-        let _ = reply.send_status_gather(ResultCode::Ok, alert, &spans[..n]);
+        // SAFETY: the loop wrote `spans[i]` for every `i < n` it counted.
+        let spans = unsafe { spans[..n].assume_init_ref() };
+        let _ = reply.send_status_gather(ResultCode::Ok, alert, spans);
     }
 
-    /// Write, the spine way: validate + stage above a watermark, ack per the
-    /// reply contract, but leave the live table untouched until the verdict's
-    /// [`Dispatch::commit`]. A validation reject nacks with nothing staged
-    /// (`Done`, no commit owed); a staging-capacity overflow (held entries
-    /// filled the buffer -- a COMMIT drains it) nacks `Busy`, nothing staged.
+    /// Write, the spine way: check it (a held write also stages above a
+    /// watermark), ack per the reply contract, but leave the live table
+    /// untouched until the verdict's [`Dispatch::commit`]. A validation reject
+    /// nacks with nothing staged (`Done`, no commit owed); a held write
+    /// overflowing the staging buffer (a COMMIT drains it) nacks `Busy`,
+    /// nothing staged.
     fn write<R: Reply>(
         &mut self,
         alert: bool,
@@ -359,16 +421,20 @@ impl Dispatcher<'_> {
         reply: &mut R,
     ) -> Dispatched {
         let (head, tail) = data.segments();
-        let snap = self.staged.snapshot();
-        match self.shared.table.stage_split(addr, head, tail, self.staged) {
+        let mut checked = self.shared.table.check_split(addr, head, tail);
+        let pending = if hold {
+            let snap = self.staged.snapshot();
+            if checked.is_ok() {
+                checked = self.staged.push_split(addr, head, tail);
+            }
+            PendingWrite::Held { snap }
+        } else {
+            PendingWrite::Plain { addr, head, tail }
+        };
+        match checked {
             Ok(()) => {
                 Self::ack(alert, ctx, Ok(()), reply);
-                *self.pending = Some(PendingWrite {
-                    snap,
-                    hold,
-                    addr,
-                    len: data.len() as u16,
-                });
+                *self.pending = Some(pending);
                 Dispatched::Pending
             }
             Err(Error::StagingFull) => {
@@ -397,17 +463,30 @@ impl Dispatcher<'_> {
         // Capture each entry's span before commit_staged clears the buffer, so
         // hooks fire on the applied values (apply-then-events, mirroring write).
         let mut spans: Vec<(u16, u16), STAGE_ENTRY_CAP> = Vec::new();
+        let mut config = false;
         for (addr, data) in self.staged.iter_all() {
-            let _ = spans.push((addr, data.len() as u16));
+            let len = data.len() as u16;
+            config |= reaches_the_kernel(addr, len);
+            let _ = spans.push((addr, len));
+        }
+        // one count pair per frame: every span of the COMMIT is one set
+        if config {
+            self.shared.config_commit_begin();
         }
         self.shared.table.commit_staged(self.staged);
         Self::ack(alert, ctx, Ok(()), reply);
         let mut hooks = ControlTableHooks::new(reply);
-        for (addr, len) in spans {
-            self.mark_dirty_if_persistent(addr, len);
+        for &(addr, len) in &spans {
+            self.after_commit(addr, len);
             self.shared
                 .table
                 .with(|t| t.dispatch_events(addr, len, &mut hooks));
+        }
+        hooks.finish(|| self.tel_chunks());
+        // closed after the hooks, not right behind the stores: the ack
+        // between would be compiled twice, once per outcome
+        if config {
+            self.shared.config_commit_end();
         }
     }
 
@@ -420,7 +499,7 @@ impl Dispatcher<'_> {
         alert: bool,
         ctx: &RequestCtx,
         prefix_len: u8,
-        prefix: &[u8; UID_LEN],
+        prefix: FrameBytes<'_>,
         reply: &mut R,
     ) {
         if !ctx.may_reply {
@@ -449,11 +528,11 @@ impl Dispatcher<'_> {
         &mut self,
         alert: bool,
         ctx: &RequestCtx,
-        uid: &[u8; UID_LEN],
+        uid: FrameBytes<'_>,
         new_id: u8,
         reply: &mut R,
     ) {
-        if uid != self.shared.uid() {
+        if uid != FrameBytes::from(&self.shared.uid()[..]) {
             return;
         }
         if Id::try_unicast(new_id).is_none() {
@@ -468,18 +547,30 @@ impl Dispatcher<'_> {
         Self::ack(alert, ctx, Ok(()), reply);
     }
 
-    fn mgmt<R: Reply>(&mut self, alert: bool, ctx: &RequestCtx, op: MgmtOp, reply: &mut R) {
+    fn mgmt<R: Reply>(
+        &mut self,
+        alert: bool,
+        ctx: &RequestCtx,
+        op: MgmtOp,
+        args: FrameBytes,
+        reply: &mut R,
+    ) {
         match op {
             MgmtOp::Save => self.save(alert, ctx, reply),
             MgmtOp::Factory => self.factory(alert, ctx, reply),
-            MgmtOp::Reboot => {
-                Self::ack(alert, ctx, Ok(()), reply);
-                let mode = self.shared.table.with(|t| t.control.system.boot_mode);
-                reply.stage_reboot(mode);
-            }
+            MgmtOp::Reboot => self.reboot(alert, ctx, args, reply),
             // ENUM/ASSIGN/CAL decode to dedicated Request variants; one
             // arriving Mgmt-wrapped is answered like any unknown op.
             MgmtOp::Enum | MgmtOp::Assign | MgmtOp::Cal => {
+                self.instruction_error(alert, ctx, reply)
+            }
+            // SEC_* sub-ops belong to the secure-element session layer
+            // (`docs/security-architecture.md` sec 3), which is re-based on
+            // new crypto hardware by the parametric-board plan (unit U7).
+            // Until that lands the core answers them as unsupported -- a
+            // compile gate would be better, but the wire enum is shared --
+            // rather than stubbing a handshake that would look authentic.
+            MgmtOp::SecInit | MgmtOp::SecKey | MgmtOp::SecAttest | MgmtOp::SecRekey => {
                 self.instruction_error(alert, ctx, reply)
             }
         }
@@ -488,7 +579,12 @@ impl Dispatcher<'_> {
     /// sec 9.4 SAVE -- the only flash-touching operation. Torque gates it (the
     /// ms-scale program stall is the mid-motion hazard, not the data), and
     /// the ack leaves AFTER the store returns: ack == durable, and a failed
-    /// program surfaces as `hardware` instead of a lie.
+    /// program surfaces as `hardware` instead of a lie. A posted data job
+    /// runs here first (a COMMIT the main loop has not judged yet must not
+    /// persist as the identity), the position table settles to what the kernel
+    /// applies and a data-state checkpoint precedes the program (a stale
+    /// stamp still persists: the reboot recomputes it anyway); success
+    /// retires the fresh-servo reasons (`data_state::SAVE_CLEARS`).
     fn save<R: Reply>(&mut self, alert: bool, ctx: &RequestCtx, reply: &mut R) {
         if self
             .shared
@@ -497,12 +593,16 @@ impl Dispatcher<'_> {
         {
             return Self::ack(alert, ctx, Err(Error::AccessError), reply);
         }
+        self.shared.data_job_service();
+        self.shared.pos_lut_settle();
+        self.shared.data_state_checkpoint();
         let saved = self.persist_table();
         let code = match saved {
             Ok(()) => {
                 self.shared
                     .table
                     .with_mut(|t| t.telemetry.common.status_flags &= !STATUS_FLAG_CONFIG_DIRTY);
+                self.shared.data_state_saved();
                 ResultCode::Ok
             }
             Err(StoreError) => ResultCode::Hardware,
@@ -515,6 +615,7 @@ impl Dispatcher<'_> {
     /// program duration.
     fn persist_table(&self) -> Result<(), StoreError> {
         let store = self.shared.store().ok_or(StoreError)?;
+        self.shared.table.zero_reserved_persistent();
         // Bounded by the region consts -- the reads cannot fail; the fallback
         // keeps the no-panic contract.
         let config: &[u8; CONFIG_LEN] =
@@ -527,7 +628,26 @@ impl Dispatcher<'_> {
                 .ok()
                 .and_then(|s| s.try_into().ok())
                 .ok_or(StoreError)?;
-        store.save(config, profile)
+        let calib: &[u8; CALIB_LEN] =
+            RegisterFile::read(&self.shared.table, CALIB_BASE_ADDR, CALIB_REGION_SIZE)
+                .ok()
+                .and_then(|s| s.try_into().ok())
+                .ok_or(StoreError)?;
+        self.shared.with_pos_lut(|k| {
+            let lut = k.first_chunk().ok_or(StoreError)?;
+            store.save(config, profile, calib, lut)
+        })
+    }
+
+    /// sec 9.5 REBOOT: the mode, and the bootloader's rate (sec 9.6), are
+    /// required args; without them the REBOOT nacks `range` and the servo
+    /// stays up.
+    fn reboot<R: Reply>(&mut self, alert: bool, ctx: &RequestCtx, args: FrameBytes, reply: &mut R) {
+        let Some(reboot) = Reboot::parse(args) else {
+            return Self::ack_code(alert, ctx, ResultCode::Range, reply);
+        };
+        Self::ack(alert, ctx, Ok(()), reply);
+        reply.stage_reboot(reboot);
     }
 
     /// sec 9.5 FACTORY: wipe both saved slots, ack, then stage the reboot that
@@ -546,8 +666,8 @@ impl Dispatcher<'_> {
         match wiped {
             Ok(()) => {
                 Self::ack(alert, ctx, Ok(()), reply);
-                let mode = self.shared.table.with(|t| t.control.system.boot_mode);
-                reply.stage_reboot(mode);
+                // FACTORY takes no args: it always comes back as the app.
+                reply.stage_reboot(Reboot::App);
             }
             Err(StoreError) => Self::ack_code(alert, ctx, ResultCode::Hardware, reply),
         }

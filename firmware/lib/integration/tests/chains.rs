@@ -4,11 +4,14 @@
 //! payloads are hand-built per sec 5's tables and cross-checked against the
 //! `osc_protocol::group` parsers (the layout authority).
 
-use osc_integration::sim::{Source, WireFrame, assert_valid, instruction, status};
-use osc_protocol::wire::{Inst, Opcode, ResultCode};
+use osc_integration::sim::{
+    HandlerCost, Sim, Source, WireFrame, assert_valid, instruction, status, status_frame,
+};
+use osc_protocol::wire::{self, Inst, Opcode, ResultCode};
+use osc_servo_core::BaudRate;
+use osc_servo_core::budget::Frame;
 use osc_servo_core::regions::config::addr::common::{FIRMWARE_VERSION, MODEL_NUMBER};
 use osc_servo_core::regions::control::addr::lifecycle::GOAL_VELOCITY;
-use osc_servo_core::regions::control::addr::streaming::{STREAM_DECIMATION, STREAM_FIELD_MASK};
 use osc_servo_core::regions::profile::span_word;
 use rstest::rstest;
 use rstest_reuse::apply;
@@ -16,7 +19,7 @@ use rstest_reuse::apply;
 mod support;
 use support::{byte_ticks, matrix, sim};
 
-/// The default RESPONSE_DEADLINE (60 us) works at every baud: sec 6 keys reclaim
+/// A 60 us RESPONSE_DEADLINE works at every baud: sec 6 keys reclaim
 /// off the predecessor's *break* (its trigger -> break lead), and an observed
 /// break suspends the window while the frame plays out. The baud sweep is the
 /// regression for that -- at 1 M a short reply spends ~84 us on the wire, so
@@ -134,6 +137,70 @@ fn gread_uniform_chains_in_list_order(baud_idx: u8) {
     }
 }
 
+/// A slot waiting on its predecessor keeps the predecessor status's frame
+/// end (sec 6): it answers a reply gap after that end, within a few
+/// byte-times - never a starve horizon late. Bystander statuses schedule
+/// nothing; a waiting slot's never loses its end.
+#[apply(matrix)]
+fn snooped_slot_answers_a_reply_gap_after_its_predecessor(baud_idx: u8) {
+    let mut sim = sim(baud_idx);
+    for id in [1u8, 2, 3] {
+        sim.add_servo_with(id, 0, CHAIN_DEADLINE_US);
+    }
+    sim.host_send(&instruction(
+        BCAST,
+        Opcode::Gread,
+        0,
+        &gread_uniform(MODEL_NUMBER, 2, &[1, 2, 3]),
+    ));
+    let frames = sim.run();
+    let reps = replies(&frames);
+    assert_eq!(reps.len(), 3, "{frames:#?}");
+    let reply_gap = support::reply_gap_ticks();
+    for w in reps.windows(2) {
+        let gap = w[1].at - w[0].end;
+        assert!(gap >= reply_gap, "chain gap {gap} < reply gap {reply_gap}");
+        assert!(
+            gap <= reply_gap + 4 * byte_ticks(baud_idx),
+            "chain gap {gap} late past reply gap {reply_gap}"
+        );
+    }
+}
+
+/// A uniform GREAD sizes every predecessor's status, so a waiting slot
+/// drops one whose LEN says otherwise before it counts. Garbled short, the
+/// status would end early and time the slot into its own tail; the slot
+/// instead answers at its reclaim, flagged, after the status's real end.
+#[apply(matrix)]
+fn waiting_slot_drops_a_status_len_its_gread_rules_out(baud_idx: u8) {
+    let mut sim = sim(baud_idx);
+    let s = sim.add_servo_with(2, 0, CHAIN_DEADLINE_US);
+    sim.host_send(&instruction(
+        BCAST,
+        Opcode::Gread,
+        0,
+        &gread_uniform(MODEL_NUMBER, 16, &[9, 2]),
+    ));
+    // Slot 0's status, forged by the host: 16 bytes, LEN garbled to 4.
+    let mut pre = status_frame(9, ResultCode::Ok, &[0x5A; 16]);
+    pre[2] = wire::len_for(4);
+    assert!(!pre[1..].contains(&0));
+    sim.host_send(&pre);
+    let frames = sim.run();
+    let pre_end = frames
+        .iter()
+        .find(|f| f.from == Source::Host && responder(f) == 9)
+        .expect("the forged status")
+        .end;
+    let reps = replies(&frames);
+    assert_eq!(reps.len(), 1, "{frames:#?}");
+    assert!(reps[0].at > pre_end, "slot 1 fired into its predecessor");
+    assert_eq!(decoded(reps[0]).0, ResultCode::PredecessorSilent);
+    let d = sim.servo_diag(s);
+    assert_eq!(d.framing_drop_count, 1);
+    assert_eq!(d.crc_fail_count, 0);
+}
+
 #[apply(matrix)]
 fn gread_list_order_beats_id_order(baud_idx: u8) {
     let mut sim = sim(baud_idx);
@@ -161,12 +228,13 @@ fn gread_profile_uniform_chains_gathered_replies(baud_idx: u8) {
     for id in [1u8, 2] {
         sim.add_servo_with(id, 0, CHAIN_DEADLINE_US);
     }
-    // Each servo's slot 0 gathers model(2) + fw(1); distinct values per servo.
+    // Each servo's slot 0 gathers model(2) + the fw low byte; distinct values
+    // per servo.
     let models = [0x1122u16, 0x3344];
     for (i, m) in models.iter().enumerate() {
         sim.servo_table_mut(i, |t| {
             t.config.common.model_number = *m;
-            t.config.common.firmware_version = 0x50 + i as u8;
+            t.config.common.firmware_version = 0x50 + i as u16;
             t.profile.slots.words[0] = span_word(MODEL_NUMBER, 2);
             t.profile.slots.words[1] = span_word(FIRMWARE_VERSION, 1);
         });
@@ -259,8 +327,9 @@ fn gread_per_target_reads_distinct_spans(baud_idx: u8) {
     assert_eq!(by_id(1).1, 0x1122u16.to_le_bytes());
     // Servo 2: 1-byte firmware version.
     assert_eq!(by_id(2).1, vec![0x5A]);
-    // Servo 3: 3-byte model + firmware (the sim's seeded FIRMWARE_VERSION = 1).
-    assert_eq!(by_id(3).1, vec![0x44, 0x33, 0x01]);
+    // Servo 3: 3-byte model + fw low byte (the sim's seeded FIRMWARE_VERSION).
+    let f = osc_servo_core::FIRMWARE_VERSION.to_le_bytes();
+    assert_eq!(by_id(3).1, vec![0x44, 0x33, f[0]]);
 }
 
 #[apply(matrix)]
@@ -395,19 +464,21 @@ fn gwrite_hold_commit_is_atomic_fleet_update(baud_idx: u8) {
 }
 
 #[apply(matrix)]
-fn gwrite_per_target_applies_distinct_fields(baud_idx: u8) {
+fn gwrite_per_target_applies_distinct_entries(baud_idx: u8) {
     let mut sim = sim(baud_idx);
     for id in [1u8, 2, 3] {
         sim.add_servo(id);
     }
     let gv: i32 = 0x1234_5678;
-    let mask: u32 = 0xDEAD_BEEF;
-    let deci: u8 = 7;
+    let gv2: i32 = 0x5EED_F00D;
+    let lo: u8 = 7;
 
+    // Entry strides vary (4, 4, 1): the 1-byte entry pins per-entry length
+    // parsing, landing in goal_velocity's low byte over a zeroed field.
     let payload = gwrite_per_target(&[
         (1, GOAL_VELOCITY, &gv.to_le_bytes()),
-        (2, STREAM_FIELD_MASK, &mask.to_le_bytes()),
-        (3, STREAM_DECIMATION, &[deci]),
+        (2, GOAL_VELOCITY, &gv2.to_le_bytes()),
+        (3, GOAL_VELOCITY, &[lo]),
     ]);
     sim.host_send(&instruction(
         BCAST,
@@ -423,12 +494,12 @@ fn gwrite_per_target_applies_distinct_fields(baud_idx: u8) {
         gv
     );
     assert_eq!(
-        sim.servo_table(1, |t| t.control.streaming.stream_field_mask),
-        mask
+        sim.servo_table(1, |t| t.control.lifecycle.goal_velocity),
+        gv2
     );
     assert_eq!(
-        sim.servo_table(2, |t| t.control.streaming.stream_decimation),
-        deci
+        sim.servo_table(2, |t| t.control.lifecycle.goal_velocity),
+        lo as i32
     );
 }
 
@@ -442,7 +513,7 @@ fn back_to_back_instructions_all_land(baud_idx: u8) {
     let mut sim = sim(baud_idx);
     sim.add_servo(1);
     let gv: i32 = 0x0AA0_1BB1;
-    let mask: u32 = 0x00C0_FFEE;
+    let gv2: i32 = 0x00C0_FFEE;
 
     let addr_gv = GOAL_VELOCITY.to_le_bytes();
     let mut w1 = vec![addr_gv[0], addr_gv[1]];
@@ -454,23 +525,143 @@ fn back_to_back_instructions_all_land(baud_idx: u8) {
     let (res1, data1) = decoded(r1[0]);
     assert_eq!(res1, ResultCode::Ok);
     assert!(data1.is_empty(), "write ack is empty");
+    assert_eq!(
+        sim.servo_table(0, |t| t.control.lifecycle.goal_velocity),
+        gv,
+        "first write applied before the second lands"
+    );
 
-    let addr_mask = STREAM_FIELD_MASK.to_le_bytes();
-    let mut w2 = vec![addr_mask[0], addr_mask[1]];
-    w2.extend_from_slice(&mask.to_le_bytes());
+    let mut w2 = vec![addr_gv[0], addr_gv[1]];
+    w2.extend_from_slice(&gv2.to_le_bytes());
     sim.host_send(&instruction(1, Opcode::Write, 0, &w2));
     let f2 = sim.run();
     let r2 = replies(&f2);
     assert_eq!(r2.len(), 1, "second write acked: {f2:#?}");
     assert_eq!(decoded(r2[0]).0, ResultCode::Ok);
 
-    // Both applied, in order.
     assert_eq!(
         sim.servo_table(0, |t| t.control.lifecycle.goal_velocity),
-        gv
+        gv2,
+        "second write applied"
     );
-    assert_eq!(
-        sim.servo_table(0, |t| t.control.streaming.stream_field_mask),
-        mask
+}
+
+/// A predecessor status of the largest legal frame, streamed in three arms
+/// with a 50 us pause between each (a kernel body above the bus at 3M):
+/// its break suspends the waiting slot's reclaim for the whole frame,
+/// pauses included, and the slot answers after it, unflagged.
+#[test]
+fn chain_slot_survives_a_predecessor_stalled_inside_its_frame() {
+    let mut sim = Sim::new(BaudRate::B3000000);
+    sim.add_servo(2);
+    sim.host_send(&instruction(
+        BCAST,
+        Opcode::Gread,
+        0,
+        &gread_uniform(0, wire::MAX_PAYLOAD as u16, &[9, 2]),
+    ));
+    let pre = status_frame(9, ResultCode::Ok, &[0x5A; wire::MAX_PAYLOAD as usize]);
+    assert_eq!(pre.len(), osc_servo_drivers::bus::FRAME_MAX);
+    assert!(!pre[1..].contains(&0));
+    let arm = pre.len() / 3;
+    sim.host_send_paused(&pre, &[(arm, 50), (2 * arm, 50)]);
+    let frames = sim.run();
+    let pre_end = frames
+        .iter()
+        .find(|f| f.from == Source::Host && responder(f) == 9)
+        .expect("the predecessor status")
+        .end;
+    let reps = replies(&frames);
+    assert_eq!(reps.len(), 1, "{frames:#?}");
+    assert!(reps[0].at > pre_end, "slot 1 reclaimed into a live frame");
+    assert_eq!(decoded(reps[0]).0, ResultCode::Ok);
+}
+
+/// A GREAD both slots dispatch at its covered checkpoint at 3M, whose
+/// verdict each serves 600 us late (the deadline held behind a backlog,
+/// the kernel above the bus): the wire-based window (end + reply gap +
+/// RESPONSE_DEADLINE) has long expired when either is ready. Slot 1's
+/// window counts from its own readiness instead: it sees slot 0's break
+/// inside it and answers after slot 0's status, unflagged.
+#[test]
+fn reclaim_window_counts_from_the_slots_own_readiness() {
+    const START_US: u64 = 1_000;
+    const LAG_US: u64 = 600;
+    let mut sim = Sim::new(BaudRate::B3000000);
+    for id in [1u8, 2] {
+        let s = sim.add_servo_with(id, 0, CHAIN_DEADLINE_US);
+        sim.set_handler_cost(s, HandlerCost::at_budget(Frame::GreadSlot));
+    }
+    sim.host_send_at(
+        START_US,
+        &instruction(
+            BCAST,
+            Opcode::Gread,
+            0,
+            &gread_uniform(GOAL_VELOCITY, 4, &[1, 2]),
+        ),
     );
+    let mut frames = Vec::new();
+    let mut held = [false; 2];
+    for t in START_US..START_US + LAG_US {
+        frames.extend(sim.run_until(t));
+        for (s, h) in held.iter_mut().enumerate() {
+            if !*h && sim.dispatched(s) > 0 {
+                sim.preempt_before_ring_read(s, LAG_US);
+                *h = true;
+            }
+        }
+    }
+    assert_eq!(held, [true; 2]);
+    frames.extend(sim.run());
+    let gread_end = frames.iter().find(|f| f.from == Source::Host).unwrap().end;
+    let reps = replies(&frames);
+    assert_eq!(reps.len(), 2, "{frames:#?}");
+    assert!(reps.iter().all(|f| !f.collided), "{frames:#?}");
+    let window = support::reply_gap_ticks() + CHAIN_DEADLINE_US as u64 * 48;
+    assert!(
+        reps[0].at > gread_end + window,
+        "slot 0 ready inside the window"
+    );
+    assert_eq!(responder(reps[0]), 1);
+    assert_eq!(responder(reps[1]), 2);
+    assert!(reps[1].at > reps[0].end, "slot 1 talked over slot 0");
+    for f in reps {
+        assert_eq!(decoded(f).0, ResultCode::Ok);
+    }
+}
+
+/// Slot 0's TX-done bodies outlast slot 1's reply gap, so its TX releases
+/// after slot 1's break. The pin is open drain and nothing times off the
+/// release (protocol sec 2), so the wire is free from slot 0's last stop bit
+/// and both statuses stand whole.
+#[test]
+fn chain_slot_follows_a_predecessor_still_in_its_release_body() {
+    let mut sim = Sim::new(BaudRate::B3000000);
+    for id in [1u8, 2] {
+        let s = sim.add_servo(id);
+        sim.set_handler_cost(
+            s,
+            HandlerCost {
+                on_tx_complete_us: 40,
+                ..Default::default()
+            },
+        );
+    }
+    sim.host_send(&instruction(
+        BCAST,
+        Opcode::Gread,
+        0,
+        &gread_uniform(GOAL_VELOCITY, 4, &[1, 2]),
+    ));
+    let frames = sim.run();
+    let reps = replies(&frames);
+    assert_eq!(reps.len(), 2, "{frames:#?}");
+    assert!(reps.iter().all(|f| !f.collided), "{frames:#?}");
+    assert_eq!(responder(reps[0]), 1);
+    assert_eq!(responder(reps[1]), 2);
+    assert!(reps[1].at >= reps[0].end + support::reply_gap_ticks());
+    for f in reps {
+        assert_eq!(decoded(f).0, ResultCode::Ok);
+    }
 }

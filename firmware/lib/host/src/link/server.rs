@@ -1,14 +1,16 @@
 //! The chip-agnostic link server: pipe bytes in, engine commands down,
-//! engine events up, records out. Sans-io -- the chip (or a DES harness)
+//! engine events up, records out. Sans-io: the chip (or a DES harness)
 //! feeds `on_pipe` with whatever the carrier delivered and drains records
 //! through a [`RecordSink`]; nothing here knows about USB.
 
 use osc_protocol::wire::{BaudRate, Id, Inst};
 
-use crate::engine::{Command, Event, HostBus, SubmitError};
-use crate::traits::{Deadline, EdgeCapture, Providers};
+use crate::engine::shape::InvalidReason;
+use crate::engine::{Command, Event, HostBus, MAX_TB_PAYLOAD, SubmitError, TbExpect, window_fits};
+use crate::traits::{Deadline, Providers};
 
-use super::record::{self, DRAIN_MAX, SEQ_NONE};
+use super::record::{self as rec, ExchangeResult, HEADER, Info, KIND_NONE, SEQ_NONE};
+use super::wire;
 
 /// Where outbound records go (USB IN endpoint queue, a test log, a DES
 /// pipe). Called once per complete record.
@@ -16,15 +18,8 @@ pub trait RecordSink {
     fn record(&mut self, record: &[u8]);
 }
 
-/// Accumulation bound: comfortably past the largest legal record
-/// (EXCHANGE with a 252 B payload = 262 pipe bytes).
-const RX_CAP: usize = 512;
-/// Outbound scratch: the largest record is a STATUS carrying a full reply
-/// payload.
-const OUT_CAP: usize = 300;
-
-/// An adapter-level action a record requested: nothing the engine serves,
-/// everything the chip must. The server queues it (acking on the pipe);
+/// An adapter-level action a request asked for: nothing the engine serves,
+/// everything the chip must. The server queues it (answering on the pipe);
 /// the chip drains via [`LinkServer::take_adapter_request`] and acts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterRequest {
@@ -34,80 +29,131 @@ pub enum AdapterRequest {
     SetRails { v3v3: bool, v5: bool },
 }
 
+/// The bus request the engine is working on: its DONE echoes the kind and
+/// takes the kind's result layout.
+#[derive(Clone, Copy)]
+struct Active {
+    seq: u16,
+    kind: u8,
+}
+
 /// Adapter-level state the server owns: the queued chip request plus the
-/// rails mirror (the server is the rails' only writer after boot, so acks
-/// and masked sets compose against it).
+/// rails mirror (the server is the rails' only writer after boot, so masked
+/// sets compose against it).
 struct AdapterState {
     req: Option<AdapterRequest>,
     rails: u8,
+    diag: rec::Diag,
+    uptime_ticks: u64,
+}
+
+/// Everything but the inbound buffer, so a request borrowed from it can
+/// drive the rest.
+struct Core {
+    features: u16,
+    /// The bus mode (link sec 5), `MODE_OSC` until a SET_BUS moves it.
+    mode: u8,
+    active: Option<Active>,
+    adapter: AdapterState,
+    out: [u8; rec::MAX_RESPONSE],
 }
 
 pub struct LinkServer {
-    rx: [u8; RX_CAP],
+    rx: [u8; rec::MAX_REQUEST],
     rx_len: usize,
-    /// The seq owning the engine's outstanding command.
-    active: Option<u16>,
-    /// The seq owning the outstanding instrument wire op.
-    wire_active: Option<u16>,
-    adapter: AdapterState,
-    out: [u8; OUT_CAP],
-}
-
-impl Default for LinkServer {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// A framing breach (link sec 3.3) left the stream without a resync
+    /// point: every pipe byte is ignored until the next session.
+    breached: bool,
+    core: Core,
 }
 
 impl LinkServer {
-    pub fn new() -> Self {
+    /// `features`: what the chip has (`FEATURE_RAILS`, `FEATURE_ADAPTER_IAP`,
+    /// `FEATURE_TINYBOOT`).
+    /// The server adds `FEATURE_INSTRUMENT` when it serves the instrument
+    /// kinds and drops any bit it has no handler for.
+    pub fn new(features: u16) -> Self {
+        let instrument = if cfg!(feature = "bench") {
+            rec::FEATURE_INSTRUMENT
+        } else {
+            0
+        };
         Self {
-            rx: [0; RX_CAP],
+            rx: [0; rec::MAX_REQUEST],
             rx_len: 0,
-            active: None,
-            wire_active: None,
-            adapter: AdapterState {
-                req: None,
-                rails: record::RAILS_BOOT_STATE,
+            breached: false,
+            core: Core {
+                features: features
+                    & (rec::FEATURE_RAILS | rec::FEATURE_ADAPTER_IAP | rec::FEATURE_TINYBOOT)
+                    | instrument,
+                mode: rec::MODE_OSC,
+                active: None,
+                adapter: AdapterState {
+                    req: None,
+                    rails: rec::RAILS_BOOT_STATE,
+                    diag: rec::Diag::default(),
+                    uptime_ticks: 0,
+                },
+                out: [0; rec::MAX_RESPONSE],
             },
-            out: [0; OUT_CAP],
         }
     }
 
+    /// Install the chip's boot diagnostics; every INFO carries them.
+    pub fn set_diag(&mut self, diag: rec::Diag) {
+        self.core.adapter.diag = diag;
+    }
+
+    /// The chip's time since boot on the full-width `Deadline` tick count
+    /// (the engine's u32 domain wraps in minutes). Refreshed ahead of
+    /// `on_pipe`; INFO reports it as `uptime_ms`.
+    pub fn set_uptime_ticks(&mut self, ticks: u64) {
+        self.core.adapter.uptime_ticks = ticks;
+    }
+
     /// Drain the pending adapter-level request, if any. The chip polls this
-    /// after `on_pipe`; the matching ack record is already in the sink.
+    /// after `on_pipe`; the matching response is already in the sink.
     pub fn take_adapter_request(&mut self) -> Option<AdapterRequest> {
-        self.adapter.req.take()
+        self.core.adapter.req.take()
+    }
+
+    /// A new host session opened on the pipe (link sec 2): drop the
+    /// half-parsed inbound record and cancel the outstanding op, so the new
+    /// session finds the bus free and in osc mode (the cancel returns a
+    /// non-osc rate to 500000). The carrier drops its own unsent bytes.
+    /// Adapter state (rails, diag, uptime) and the engine's fleet-facing
+    /// state are the bus's, not the session's, and persist.
+    pub fn reset_session<P: Providers>(&mut self, bus: &mut HostBus<P>) {
+        self.rx_len = 0;
+        self.breached = false;
+        self.core.active = None;
+        self.core.mode = rec::MODE_OSC;
+        bus.cancel();
     }
 
     /// Feed bytes as the pipe delivered them (any framing); complete
-    /// records drive the engine, replies stream to `sink`.
+    /// requests drive the engine, responses stream to `sink`.
     pub fn on_pipe<P: Providers>(
         &mut self,
         mut bytes: &[u8],
         bus: &mut HostBus<P>,
         sink: &mut impl RecordSink,
     ) {
-        while !bytes.is_empty() {
-            let room = RX_CAP - self.rx_len;
-            let take = room.min(bytes.len());
+        while !bytes.is_empty() && !self.breached {
+            // Never stalls: a full buffer always holds a whole request,
+            // `extract` having refused any `len` that would not fit.
+            let take = (rec::MAX_REQUEST - self.rx_len).min(bytes.len());
             self.rx[self.rx_len..self.rx_len + take].copy_from_slice(&bytes[..take]);
             self.rx_len += take;
             bytes = &bytes[take..];
             self.extract(bus, sink);
-            if take == 0 {
-                // A full buffer that yields no record is an over-length or
-                // desynced prefix; a reliable pipe never produces one, so
-                // the client is broken -- drop the buffer and say so.
-                self.rx_len = 0;
-                sink.record(record::unknown(&mut self.out, 0xFF));
-            }
         }
     }
 
     /// Drain engine events into records. Call freely (idle loop, after ISR
     /// wakes, after `on_pipe`).
     pub fn pump<P: Providers>(&mut self, bus: &mut HostBus<P>, sink: &mut impl RecordSink) {
+        let c = &mut self.core;
         loop {
             match bus.poll() {
                 Some(Event::Status {
@@ -116,9 +162,9 @@ impl LinkServer {
                     inst,
                     payload,
                 }) => {
-                    let seq = self.active.unwrap_or(SEQ_NONE);
-                    sink.record(record::status(
-                        &mut self.out,
+                    let seq = c.active.map_or(SEQ_NONE, |a| a.seq);
+                    sink.record(rec::osc_frame(
+                        &mut c.out,
                         seq,
                         slot,
                         id.as_byte(),
@@ -126,13 +172,48 @@ impl LinkServer {
                         payload.segments(),
                     ));
                 }
+                Some(Event::TbFrame {
+                    slot,
+                    cmd,
+                    status,
+                    addr,
+                    flags,
+                    data,
+                }) => {
+                    let seq = c.active.map_or(SEQ_NONE, |a| a.seq);
+                    sink.record(rec::tb_frame(
+                        &mut c.out,
+                        seq,
+                        slot,
+                        cmd,
+                        status,
+                        addr,
+                        flags,
+                        data.segments(),
+                    ));
+                }
                 Some(Event::Done(t)) => {
-                    let seq = self.active.take().unwrap_or(SEQ_NONE);
-                    sink.record(record::terminal(&mut self.out, seq, &t));
+                    let a = c.take_active();
+                    let (mode, bps) = (c.mode, bus.bps());
+                    sink.record(rec::done(&mut c.out, a.seq, a.kind, |r| match a.kind {
+                        rec::SET_BUS => {
+                            r[0] = mode;
+                            r[1..5].copy_from_slice(&bps.to_le_bytes());
+                            5
+                        }
+                        rec::OSC_DEADLINE => 0,
+                        _ => ExchangeResult::of(&t).write(r),
+                    }));
                 }
                 Some(Event::WireDone { tick }) => {
-                    let seq = self.wire_active.take().unwrap_or(SEQ_NONE);
-                    sink.record(record::wire_done(&mut self.out, seq, tick));
+                    let a = c.take_active();
+                    sink.record(rec::done(&mut c.out, a.seq, a.kind, |r| {
+                        if a.kind == rec::WIRE_BAUD {
+                            return 0;
+                        }
+                        r[..4].copy_from_slice(&tick.to_le_bytes());
+                        4
+                    }));
                 }
                 None => return,
             }
@@ -140,170 +221,287 @@ impl LinkServer {
     }
 
     fn extract<P: Providers>(&mut self, bus: &mut HostBus<P>, sink: &mut impl RecordSink) {
+        let mut at = 0;
         loop {
-            if self.rx_len < 2 {
-                return;
+            let held = &self.rx[at..self.rx_len];
+            if held.len() < 2 {
+                break;
             }
-            let len = u16::from_le_bytes([self.rx[0], self.rx[1]]) as usize;
-            if len == 0 || len > RX_CAP - 2 {
-                // Framing breach on a reliable pipe = client bug; there is
-                // no resync point in a length-prefixed stream, so drop.
+            let len = u16::from_le_bytes([held[0], held[1]]) as usize;
+            if len < HEADER - 2 || 2 + len > rec::MAX_REQUEST {
                 self.rx_len = 0;
-                sink.record(record::unknown(&mut self.out, 0xFF));
+                self.breached = true;
+                sink.record(rec::error(
+                    &mut self.core.out,
+                    SEQ_NONE,
+                    KIND_NONE,
+                    rec::ERR_FRAMING,
+                ));
                 return;
             }
-            if self.rx_len < 2 + len {
-                return;
+            if held.len() < 2 + len {
+                break;
             }
-            handle(
-                &mut self.active,
-                &mut self.wire_active,
-                &mut self.adapter,
-                &self.rx[2..2 + len],
-                bus,
-                &mut self.out,
-                sink,
-            );
-            self.rx.copy_within(2 + len..self.rx_len, 0);
-            self.rx_len -= 2 + len;
+            let seq = u16::from_le_bytes([held[3], held[4]]);
+            self.core
+                .request(held[2], seq, &held[HEADER..2 + len], bus, sink);
+            at += 2 + len;
         }
+        self.rx.copy_within(at..self.rx_len, 0);
+        self.rx_len -= at;
     }
 }
 
-/// One complete record (type + body).
-fn handle<P: Providers>(
-    active: &mut Option<u16>,
-    wire_active: &mut Option<u16>,
-    adapter: &mut AdapterState,
-    rec: &[u8],
-    bus: &mut HostBus<P>,
-    out: &mut [u8],
-    sink: &mut impl RecordSink,
-) {
-    match rec[0] {
-        record::REC_HELLO => {
-            sink.record(record::info(out, P::Deadline::TICKS_PER_US));
+/// Answered at once whether or not the bus is busy (link sec 3.1); every
+/// other kind is a bus request.
+fn is_immediate(kind: u8) -> bool {
+    matches!(
+        kind,
+        rec::GET_INFO | rec::RAILS | rec::EDGE_DRAIN | rec::CAPTURE_RESET
+    )
+}
+
+/// The INFO feature bit a kind needs (0 = none); `None` for an unassigned
+/// kind.
+fn feature_of(kind: u8) -> Option<u16> {
+    Some(match kind {
+        rec::GET_INFO | rec::SET_BUS | rec::OSC_EXCHANGE | rec::OSC_RESCUE | rec::OSC_DEADLINE => 0,
+        rec::RAILS => rec::FEATURE_RAILS,
+        rec::ADAPTER_IAP => rec::FEATURE_ADAPTER_IAP,
+        rec::TB_EXCHANGE => rec::FEATURE_TINYBOOT,
+        rec::WIRE_SEND..=rec::CAPTURE_RESET => rec::FEATURE_INSTRUMENT,
+        _ => return None,
+    })
+}
+
+/// Whether the bus mode admits a kind (link sec 5): the osc kinds and the
+/// wire ops, which all start with a break, only in osc mode; TB_EXCHANGE
+/// only in tinyboot mode.
+fn mode_admits(mode: u8, kind: u8) -> bool {
+    match kind {
+        0x20..=0x2F | rec::WIRE_SEND..=rec::WIRE_BAUD => mode == rec::MODE_OSC,
+        rec::TB_EXCHANGE => mode == rec::MODE_TINYBOOT,
+        _ => true,
+    }
+}
+
+pub(super) fn invalid_code(r: InvalidReason) -> u8 {
+    match r {
+        InvalidReason::BadId => rec::ERR_BAD_ID,
+        InvalidReason::BadInst => rec::ERR_BAD_INST,
+        InvalidReason::BadPayload => rec::ERR_BAD_PAYLOAD,
+        InvalidReason::TooLong => rec::ERR_TOO_LONG,
+    }
+}
+
+/// A non-instrument request whose body parsed.
+enum Req<'a> {
+    Info,
+    Rails { state: u8, mask: u8 },
+    AdapterIap,
+    SetBus { mode: u8, bps: u32 },
+    Engine(Command<'a>),
+}
+
+/// Parse a body exactly; `Err` carries the ERROR code.
+fn parse<D: Deadline>(kind: u8, body: &[u8], features: u16) -> Result<Req<'_>, u8> {
+    const RAIL_BITS: u8 = 0b11;
+    let malformed = Err(rec::ERR_MALFORMED);
+    match (kind, body) {
+        (rec::GET_INFO, []) => Ok(Req::Info),
+        (rec::RAILS, &[state, mask]) if (state | mask) & !RAIL_BITS == 0 => {
+            Ok(Req::Rails { state, mask })
         }
-        record::REC_ENTER_BOOTLOADER => {
-            adapter.req = Some(AdapterRequest::EnterBootloader);
-            sink.record(record::bootloader_ack(out));
-        }
-        record::REC_SET_RAILS if rec.len() >= 2 => {
-            let mask = rec.get(2).copied().unwrap_or(0b11) & 0b11;
-            adapter.rails = (adapter.rails & !mask) | (rec[1] & mask);
-            if mask != 0 {
-                adapter.req = Some(AdapterRequest::SetRails {
-                    v3v3: adapter.rails & 1 != 0,
-                    v5: adapter.rails & 2 != 0,
-                });
+        (rec::ADAPTER_IAP, []) => Ok(Req::AdapterIap),
+        (rec::SET_BUS, &[mode, b0, b1, b2, b3]) => match mode {
+            rec::MODE_TINYBOOT if features & rec::FEATURE_TINYBOOT == 0 => {
+                Err(rec::ERR_UNSUPPORTED)
             }
-            sink.record(record::rails_ack(out, adapter.rails));
-        }
-        record::REC_WIRE_SEND
-        | record::REC_WIRE_BURST
-        | record::REC_WIRE_PULSE
-        | record::REC_WIRE_TRAIN
-        | record::REC_WIRE_BAUD => {
-            if rec.len() < 3 {
-                sink.record(record::unknown(out, rec[0]));
-                return;
+            rec::MODE_OSC | rec::MODE_TINYBOOT => Ok(Req::SetBus {
+                mode,
+                bps: u32::from_le_bytes([b0, b1, b2, b3]),
+            }),
+            _ => malformed,
+        },
+        (rec::OSC_EXCHANGE, &[flags, id, inst, w0, w1, w2, w3, ref payload @ ..]) => {
+            let window_us = u32::from_le_bytes([w0, w1, w2, w3]);
+            let (id, inst) = (Id::new(id), Inst(inst));
+            match flags {
+                rec::EXCHANGE_STREAM if window_fits::<D>(window_us) => {
+                    Ok(Req::Engine(Command::ExchangeStream {
+                        id,
+                        inst,
+                        payload,
+                        window_us,
+                    }))
+                }
+                0 if window_us == 0 => Ok(Req::Engine(Command::Exchange { id, inst, payload })),
+                _ => malformed,
             }
-            let seq = u16::from_le_bytes([rec[1], rec[2]]);
-            let body = &rec[3..];
-            let res = match rec[0] {
-                record::REC_WIRE_SEND => bus.wire_send(body),
-                record::REC_WIRE_BURST => bus.wire_burst(body),
-                record::REC_WIRE_PULSE if body.len() == 2 => {
-                    bus.wire_pulse_low(u16::from_le_bytes([body[0], body[1]]))
-                }
-                record::REC_WIRE_TRAIN if body.len() >= 4 => {
-                    bus.wire_train(&body[3..], u16::from_le_bytes([body[0], body[1]]), body[2])
-                }
-                record::REC_WIRE_BAUD if body.len() == 4 => {
-                    bus.wire_baud(u32::from_le_bytes(body.try_into().unwrap()))
-                }
-                _ => {
-                    sink.record(record::rejected(out, seq, record::REASON_MALFORMED));
-                    return;
-                }
+        }
+        (rec::OSC_RESCUE, []) => Ok(Req::Engine(Command::Rescue)),
+        (
+            rec::TB_EXCHANGE,
+            &[
+                expect,
+                w0,
+                w1,
+                w2,
+                w3,
+                cmd,
+                a0,
+                a1,
+                a2,
+                flags,
+                ref data @ ..,
+            ],
+        ) => {
+            let window_us = u32::from_le_bytes([w0, w1, w2, w3]);
+            let expect = match (expect, window_us) {
+                (rec::EXPECT_NONE, 0) => TbExpect::None,
+                (_, 0) => return malformed,
+                _ if !window_fits::<D>(window_us) => return malformed,
+                (rec::EXPECT_ONE, _) => TbExpect::One,
+                (rec::EXPECT_COLLECT, _) => TbExpect::Collect,
+                _ => return malformed,
             };
-            match res {
-                Ok(()) => *wire_active = Some(seq),
-                Err(SubmitError::Busy) => {
-                    sink.record(record::rejected(out, seq, record::REASON_BUSY));
+            Ok(Req::Engine(Command::TbExchange {
+                cmd,
+                addr: u32::from_le_bytes([a0, a1, a2, 0]),
+                flags,
+                data,
+                expect,
+                window_us,
+            }))
+        }
+        (rec::OSC_DEADLINE, &[u0, u1]) => Ok(Req::Engine(Command::SetResponseDeadline {
+            us: u16::from_le_bytes([u0, u1]),
+        })),
+        _ => malformed,
+    }
+}
+
+impl Core {
+    fn take_active(&mut self) -> Active {
+        self.active.take().unwrap_or(Active {
+            seq: SEQ_NONE,
+            kind: KIND_NONE,
+        })
+    }
+
+    fn error(&mut self, seq: u16, kind: u8, code: u8, sink: &mut impl RecordSink) {
+        sink.record(rec::error(&mut self.out, seq, kind, code));
+    }
+
+    /// One complete request: `body` follows the header.
+    fn request<P: Providers>(
+        &mut self,
+        kind: u8,
+        seq: u16,
+        body: &[u8],
+        bus: &mut HostBus<P>,
+        sink: &mut impl RecordSink,
+    ) {
+        let Some(need) = feature_of(kind) else {
+            return self.error(seq, kind, rec::ERR_UNKNOWN_KIND, sink);
+        };
+        if self.features & need != need {
+            return self.error(seq, kind, rec::ERR_UNSUPPORTED, sink);
+        }
+        if !mode_admits(self.mode, kind) {
+            return self.error(seq, kind, rec::ERR_WRONG_MODE, sink);
+        }
+        if need == rec::FEATURE_INSTRUMENT {
+            if wire::handle(kind, seq, body, bus, &mut self.out, sink) {
+                self.active = Some(Active { seq, kind });
+            }
+            return;
+        }
+        let req = match parse::<P::Deadline>(kind, body, self.features) {
+            Ok(req) => req,
+            Err(code) => return self.error(seq, kind, code, sink),
+        };
+        if !is_immediate(kind) && bus.busy() {
+            return self.error(seq, kind, rec::ERR_BUSY, sink);
+        }
+        match req {
+            Req::Info => {
+                let ticks_per_ms = P::Deadline::TICKS_PER_US as u64 * 1_000;
+                let info = Info {
+                    features: self.features,
+                    ticks_per_us: P::Deadline::TICKS_PER_US,
+                    max_request: rec::MAX_REQUEST as u16,
+                    max_response: rec::MAX_RESPONSE as u16,
+                    max_tb_payload: if self.features & rec::FEATURE_TINYBOOT != 0 {
+                        MAX_TB_PAYLOAD as u16
+                    } else {
+                        0
+                    },
+                    mode: self.mode,
+                    bps: bus.bps(),
+                    deadline_us: bus.response_deadline_us(),
+                    diag: rec::Diag {
+                        uptime_ms: (self.adapter.uptime_ticks / ticks_per_ms) as u32,
+                        ..self.adapter.diag
+                    },
+                };
+                sink.record(rec::done(&mut self.out, seq, kind, |r| info.write(r)));
+            }
+            Req::Rails { state, mask } => {
+                let a = &mut self.adapter;
+                a.rails = (a.rails & !mask) | (state & mask);
+                if mask != 0 {
+                    a.req = Some(AdapterRequest::SetRails {
+                        v3v3: a.rails & 1 != 0,
+                        v5: a.rails & 2 != 0,
+                    });
                 }
-                Err(SubmitError::Invalid(_)) => {
-                    sink.record(record::rejected(out, seq, record::REASON_MALFORMED));
+                let rails = a.rails;
+                sink.record(rec::done(&mut self.out, seq, kind, |r| {
+                    r[0] = rails;
+                    1
+                }));
+            }
+            Req::AdapterIap => {
+                self.adapter.req = Some(AdapterRequest::EnterBootloader);
+                sink.record(rec::done(&mut self.out, seq, kind, |_| 0));
+            }
+            Req::SetBus { mode, bps } => {
+                let defined = match mode {
+                    rec::MODE_OSC => BaudRate::from_hz(bps).is_some(),
+                    _ => rec::TB_RATES.contains(&bps),
+                };
+                if !defined {
+                    return self.error(seq, kind, rec::ERR_BAD_RATE, sink);
+                }
+                if self.submit(seq, kind, Command::HostBaud { bps }, bus, sink) {
+                    self.mode = mode;
                 }
             }
-        }
-        record::REC_EDGE_DRAIN if rec.len() >= 2 => {
-            let max = (rec[1] as usize).min(DRAIN_MAX);
-            let mut falls = [0u16; DRAIN_MAX];
-            let mut rises = [0u16; DRAIN_MAX];
-            // Rises snapshot FIRST: an edge pair landing between the two
-            // ring reads then tears as fall-now/rise-later, and the client
-            // defers the surplus falls until their rises drain (the wire
-            // idles high, falls lead). Falls-first would tear the other
-            // way -- a rise shipped a batch ahead of its fall.
-            let rn = bus.edges().drain_rises(&mut rises[..max]);
-            let fn_ = bus.edges().drain_falls(&mut falls[..max]);
-            let overflow = bus.edges().overflow();
-            let now = bus.now();
-            sink.record(record::edges(
-                out,
-                overflow,
-                now,
-                &falls[..fn_],
-                &rises[..rn],
-            ));
-        }
-        record::REC_CAPTURE_RESET => {
-            bus.edges().reset();
-            sink.record(record::capture_ack(out));
-        }
-        record::REC_SUBMIT => {
-            if rec.len() < 4 {
-                sink.record(record::unknown(out, record::REC_SUBMIT));
-                return;
-            }
-            let seq = u16::from_le_bytes([rec[1], rec[2]]);
-            let args = &rec[4..];
-            let cmd = match rec[3] {
-                record::VERB_EXCHANGE if args.len() >= 2 => Command::Exchange {
-                    id: Id::new(args[0]),
-                    inst: Inst(args[1]),
-                    payload: &args[2..],
-                },
-                record::VERB_RESCUE if args.is_empty() => Command::Rescue,
-                record::VERB_HOST_BAUD if args.len() == 1 => match BaudRate::from_idx(args[0]) {
-                    Some(rate) => Command::HostBaud(rate),
-                    None => {
-                        sink.record(record::rejected(out, seq, record::REASON_MALFORMED));
-                        return;
-                    }
-                },
-                record::VERB_SET_RESPONSE_DEADLINE if args.len() == 2 => {
-                    Command::SetResponseDeadline {
-                        us: u16::from_le_bytes([args[0], args[1]]),
-                    }
-                }
-                _ => {
-                    sink.record(record::rejected(out, seq, record::REASON_MALFORMED));
-                    return;
-                }
-            };
-            match bus.submit(cmd) {
-                Ok(()) => *active = Some(seq),
-                Err(SubmitError::Busy) => {
-                    sink.record(record::rejected(out, seq, record::REASON_BUSY));
-                }
-                Err(SubmitError::Invalid(r)) => {
-                    sink.record(record::rejected(out, seq, record::reason_code(r)));
-                }
+            Req::Engine(cmd) => {
+                self.submit(seq, kind, cmd, bus, sink);
             }
         }
-        rtype => sink.record(record::unknown(out, rtype)),
+    }
+
+    fn submit<P: Providers>(
+        &mut self,
+        seq: u16,
+        kind: u8,
+        cmd: Command<'_>,
+        bus: &mut HostBus<P>,
+        sink: &mut impl RecordSink,
+    ) -> bool {
+        let code = match bus.submit(cmd) {
+            Ok(()) => {
+                self.active = Some(Active { seq, kind });
+                return true;
+            }
+            Err(SubmitError::Busy) => rec::ERR_BUSY,
+            Err(SubmitError::Invalid(r)) => invalid_code(r),
+        };
+        self.error(seq, kind, code, sink);
+        false
     }
 }
 
@@ -316,190 +514,517 @@ mod tests {
 
     use super::super::record::*;
     use super::*;
-    use crate::testutil::{
-        FakeBaud, FakeDeadline, FakeEdges, FakeRing, FakeWire, TestProviders, WireOp, sealed_status,
-    };
+    use crate::engine::tb_framer::tb_crc;
+    use crate::testutil::link::Rig;
+    use crate::testutil::link::{Resp, ping, req, rig, stream_arm};
+    use crate::testutil::{FakeDeadline, WireOp, sealed_status};
 
-    #[derive(Default)]
-    struct Sink(Vec<Vec<u8>>);
+    /// The adapter's chip features as the rig's server holds them.
+    const CHIP: u16 = FEATURE_RAILS | FEATURE_ADAPTER_IAP;
 
-    impl RecordSink for Sink {
-        fn record(&mut self, record: &[u8]) {
-            self.0.push(record.to_vec());
-        }
-    }
-
-    struct Rig {
-        server: LinkServer,
-        bus: HostBus<TestProviders>,
-        ring: FakeRing,
-        clock: FakeDeadline,
-        wire: FakeWire,
-        baud: FakeBaud,
-        edges: FakeEdges,
-        sink: Sink,
-    }
-
-    fn rig() -> Rig {
-        let ring = FakeRing::new();
-        let clock = FakeDeadline::new();
-        let wire = FakeWire::default();
-        let baud = FakeBaud::default();
-        let edges = FakeEdges::default();
-        let bus = HostBus::new(
-            ring.clone(),
-            clock.clone(),
-            wire.clone(),
-            baud.clone(),
-            edges.clone(),
-            BaudRate::B1000000,
-        );
-        Rig {
-            server: LinkServer::new(),
-            bus,
-            ring,
-            clock,
-            wire,
-            baud,
-            edges,
-            sink: Sink::default(),
-        }
-    }
-
-    /// Length-prefix a type+body into pipe bytes.
-    fn rec(body: &[u8]) -> Vec<u8> {
-        let mut v = vec![body.len() as u8, (body.len() >> 8) as u8];
-        v.extend_from_slice(body);
-        v
-    }
-
-    fn submit_ping(seq: u16, id: u8) -> Vec<u8> {
-        let inst = Inst::instruction(Opcode::Ping, 0);
-        rec(&[
-            REC_SUBMIT,
-            seq as u8,
-            (seq >> 8) as u8,
-            VERB_EXCHANGE,
-            id,
-            inst.0,
-        ])
+    fn claims(r: &Rig) -> usize {
+        r.wire
+            .log()
+            .iter()
+            .filter(|op| **op == WireOp::Claim)
+            .count()
     }
 
     #[test]
-    fn hello_answers_info() {
+    fn get_info_reports_features_limits_and_bus_state() {
         let mut r = rig();
-        let bytes = rec(&[REC_HELLO]);
-        r.server.on_pipe(&bytes, &mut r.bus, &mut r.sink);
+        r.send(&req(GET_INFO, 3, &[]));
+        let [
+            Resp::Done {
+                seq: 3,
+                kind,
+                result,
+            },
+        ] = &r.take()[..]
+        else {
+            panic!("one DONE");
+        };
+        assert_eq!(*kind, GET_INFO);
+        let info = Info::parse(result).expect("INFO result");
+        let instrument = if cfg!(feature = "bench") {
+            FEATURE_INSTRUMENT
+        } else {
+            0
+        };
         assert_eq!(
-            r.sink.0,
-            vec![vec![6, 0, REC_INFO, LINK_VERSION, 1, 0, 0, 0]]
+            info,
+            Info {
+                features: CHIP | instrument,
+                ticks_per_us: 1,
+                max_request: MAX_REQUEST as u16,
+                max_response: MAX_RESPONSE as u16,
+                max_tb_payload: 0,
+                mode: MODE_OSC,
+                bps: 1_000_000,
+                deadline_us: 1000,
+                diag: Diag::default(),
+            }
         );
     }
 
     #[test]
-    fn exchange_round_trip_tags_seq() {
+    fn features_the_server_cannot_serve_are_not_reported() {
         let mut r = rig();
-        r.server
-            .on_pipe(&submit_ping(0x1234, 5), &mut r.bus, &mut r.sink);
-        assert!(r.sink.0.is_empty(), "no reply yet");
+        r.server = LinkServer::new(0xFFFF);
+        r.send(&req(GET_INFO, 0, &[]));
+        let [Resp::Done { result, .. }] = &r.take()[..] else {
+            panic!("one DONE");
+        };
+        let features = Info::parse(result).unwrap().features;
+        assert_eq!(
+            features & !FEATURE_INSTRUMENT,
+            CHIP | FEATURE_TINYBOOT,
+            "no bit 4+"
+        );
+    }
+
+    #[test]
+    fn info_carries_diag_and_live_uptime() {
+        let mut r = rig();
+        let diag = Diag {
+            reset: RESET_IWDG,
+            phase: PHASE_PUMP,
+            crash_seq: 3,
+            mcause: 5,
+            mepc: 0x2a1c,
+            mtval: 0x2000_4000,
+            hse_fail: 1,
+            resets: 4,
+            uptime_ms: 0,
+        };
+        r.server.set_diag(diag);
+        r.server.set_uptime_ticks(5_000_000_123);
+        r.send(&req(GET_INFO, 0, &[]));
+        let [Resp::Done { result, .. }] = &r.take()[..] else {
+            panic!("one DONE");
+        };
+        let info = Info::parse(result).unwrap();
+        assert_eq!(
+            info.diag,
+            Diag {
+                uptime_ms: 5_000_000,
+                ..diag
+            },
+            "1 tick/us"
+        );
+    }
+
+    #[test]
+    fn info_reports_the_bus_rate_and_deadline_it_inherits() {
+        let mut r = rig();
+        r.send(&req(SET_BUS, 1, &[MODE_OSC, 0x80, 0x84, 0x1E, 0]));
+        r.pump();
+        r.send(&req(OSC_DEADLINE, 2, &500u16.to_le_bytes()));
+        r.pump();
+        r.server.reset_session(&mut r.bus);
+        r.take();
+        r.send(&req(GET_INFO, 0, &[]));
+        let [Resp::Done { result, .. }] = &r.take()[..] else {
+            panic!("one DONE");
+        };
+        let info = Info::parse(result).unwrap();
+        assert_eq!((info.bps, info.deadline_us), (2_000_000, 500));
+    }
+
+    #[test]
+    fn exchange_streams_frames_then_done_on_its_seq() {
+        let mut r = rig();
+        r.send(&ping(0x1234, 5));
+        assert!(r.take().is_empty(), "no reply yet");
         assert_eq!(r.wire.log()[0], WireOp::Claim, "engine took the wire");
 
         r.bus.on_tx_complete();
-        r.ring.feed(&sealed_status(5, ResultCode::Ok, &[7, 0, 1]));
-        r.server.pump(&mut r.bus, &mut r.sink);
+        r.ring.frame(&sealed_status(5, ResultCode::Ok, &[7, 0, 1]));
+        r.pump();
+        let got = r.take();
+        let inst = Inst::status(ResultCode::Ok, false).0;
+        assert_eq!(
+            got[0],
+            Resp::Frame {
+                seq: 0x1234,
+                slot: 0,
+                bytes: vec![5, inst, 7, 0, 1]
+            }
+        );
+        let Resp::Done { seq, kind, result } = &got[1] else {
+            panic!("DONE");
+        };
+        assert_eq!((*seq, *kind), (0x1234, OSC_EXCHANGE));
+        let x = ExchangeResult::parse(result).expect("exchange result");
+        assert_eq!(x.outcome, crate::engine::Outcome::Complete);
+        assert_eq!(x.frames, 1);
 
-        // STATUS then TERMINAL, both carrying seq 0x1234.
-        let status = &r.sink.0[0];
-        assert_eq!(status[2], REC_STATUS);
-        assert_eq!(u16::from_le_bytes([status[3], status[4]]), 0x1234);
-        assert_eq!(status[5], 0, "slot");
-        assert_eq!(status[6], 5, "responder id");
-        assert_eq!(&status[8..11], &[7, 0, 1], "payload");
-
-        let term = &r.sink.0[1];
-        assert_eq!(term[2], REC_TERMINAL);
-        assert_eq!(u16::from_le_bytes([term[3], term[4]]), 0x1234);
-        assert_eq!(term[5], OUTCOME_COMPLETE);
-        assert_eq!(term[11], 1, "statuses");
-
-        // The seq is retired: a new submit is accepted.
-        r.server
-            .on_pipe(&submit_ping(0x1235, 5), &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0.len(), 2, "accepted, no rejection");
+        // Retired: the next exchange is accepted.
+        r.send(&ping(0x1235, 5));
+        assert!(r.take().is_empty(), "accepted, no ERROR");
     }
 
     #[test]
-    fn busy_and_invalid_reject_with_reasons() {
+    fn stream_exchange_collects_the_burst_on_its_seq() {
         let mut r = rig();
-        r.server
-            .on_pipe(&submit_ping(1, 5), &mut r.bus, &mut r.sink);
-        r.server
-            .on_pipe(&submit_ping(2, 5), &mut r.bus, &mut r.sink);
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[2], REC_REJECTED);
-        assert_eq!(u16::from_le_bytes([rej[3], rej[4]]), 2);
-        assert_eq!(rej[5], REASON_BUSY);
+        r.send(&stream_arm(9, 100_000));
+        assert_eq!(r.wire.log()[0], WireOp::Claim, "engine took the wire");
 
-        let mut r = rig();
-        r.server
-            .on_pipe(&submit_ping(9, 0), &mut r.bus, &mut r.sink);
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[5], REASON_BAD_ID);
-        assert!(r.wire.log().is_empty(), "nothing reached the wire");
+        r.bus.on_tx_complete();
+        r.ring.frame(&sealed_status(5, ResultCode::Ok, &[]));
+        r.ring
+            .frame(&sealed_status(5, ResultCode::Stream, &[0, 0, 1, 0, 8, 8]));
+        r.ring
+            .frame(&sealed_status(5, ResultCode::Stream, &[1, 1, 1, 0, 9, 9]));
+        r.pump();
+
+        // Ack + two burst frames on seq 9, then the DONE.
+        let got = r.take();
+        assert_eq!(got.len(), 4);
+        for (i, f) in got[..3].iter().enumerate() {
+            let Resp::Frame { seq, slot, .. } = f else {
+                panic!("FRAME");
+            };
+            assert_eq!((*seq, *slot as usize), (9, i), "slot = arrival index");
+        }
+        let Resp::Done { kind, result, .. } = &got[3] else {
+            panic!("DONE");
+        };
+        assert_eq!(*kind, OSC_EXCHANGE);
+        assert_eq!(ExchangeResult::parse(result).unwrap().frames, 3);
     }
 
     #[test]
-    fn records_reassemble_across_pipe_chunks() {
+    fn timeout_names_the_missing_slot() {
         let mut r = rig();
-        let bytes = submit_ping(7, 5);
-        let (a, b) = bytes.split_at(3);
-        r.server.on_pipe(a, &mut r.bus, &mut r.sink);
-        assert!(r.wire.log().is_empty(), "partial record: not submitted");
-        r.server.on_pipe(b, &mut r.bus, &mut r.sink);
-        assert_eq!(r.wire.log()[0], WireOp::Claim);
-
-        // Two records in one delivery both land.
-        let mut r = rig();
-        let mut two = rec(&[REC_HELLO]);
-        two.extend_from_slice(&rec(&[REC_HELLO]));
-        r.server.on_pipe(&two, &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0.len(), 2);
+        r.send(&ping(4, 5));
+        r.bus.on_tx_complete();
+        r.clock.advance(100_000);
+        r.pump();
+        let [Resp::Done { result, .. }] = &r.take()[..] else {
+            panic!("one DONE");
+        };
+        assert_eq!(
+            ExchangeResult::parse(result).unwrap().outcome,
+            crate::engine::Outcome::Timeout { slot: 0 }
+        );
     }
 
     #[test]
-    fn unknown_types_and_malformed_submits_answer() {
-        let mut r = rig();
-        r.server
-            .on_pipe(&rec(&[0x55, 1, 2]), &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0[0][2], REC_UNKNOWN);
-        assert_eq!(r.sink.0[0][3], 0x55);
-
-        // SUBMIT with an unserved verb: rejected on its seq.
-        r.server
-            .on_pipe(&rec(&[REC_SUBMIT, 3, 0, 0x7F]), &mut r.bus, &mut r.sink);
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[2], REC_REJECTED);
-        assert_eq!(rej[5], REASON_MALFORMED);
+    fn exchange_body_checks() {
+        let inst = Inst::instruction(Opcode::Ping, 0).0;
+        let cases: [(&[u8], u8); 5] = [
+            // Short of the fixed fields.
+            (&[0, 5, inst, 0, 0, 0], ERR_MALFORMED),
+            // A window without STREAM.
+            (&[0, 5, inst, 1, 0, 0, 0], ERR_MALFORMED),
+            // A reserved flag bit.
+            (&[0x02, 5, inst, 0, 0, 0, 0], ERR_MALFORMED),
+            (&[0, 0, inst, 0, 0, 0, 0], ERR_BAD_ID),
+            (
+                &[0, 5, Inst::status(ResultCode::Ok, false).0, 0, 0, 0, 0],
+                ERR_BAD_INST,
+            ),
+        ];
+        for (body, code) in cases {
+            let mut r = rig();
+            r.send(&req(OSC_EXCHANGE, 6, body));
+            assert_eq!(
+                r.take(),
+                [Resp::Error {
+                    seq: 6,
+                    kind: OSC_EXCHANGE,
+                    code
+                }],
+                "{body:?}"
+            );
+            assert!(r.wire.log().is_empty(), "nothing reached the wire");
+        }
     }
 
     #[test]
-    fn instant_verbs_terminate_on_their_seq() {
+    fn exchange_payload_errors_map_from_the_engine() {
         let mut r = rig();
-        let body = [REC_SUBMIT, 0x0A, 0x00, VERB_SET_RESPONSE_DEADLINE, 200, 0];
-        r.server.on_pipe(&rec(&body), &mut r.bus, &mut r.sink);
-        r.server.pump(&mut r.bus, &mut r.sink);
-        let term = r.sink.0.last().unwrap();
-        assert_eq!(term[2], REC_TERMINAL);
-        assert_eq!(u16::from_le_bytes([term[3], term[4]]), 0x0A);
-        assert_eq!(term[5], OUTCOME_COMPLETE);
+        // A READ needs addr + count.
+        let inst = Inst::instruction(Opcode::Read, 0).0;
+        r.send(&req(OSC_EXCHANGE, 1, &[0, 5, inst, 0, 0, 0, 0, 1]));
+        let mut body = vec![0, 5, Inst::instruction(Opcode::Write, 0).0, 0, 0, 0, 0];
+        body.extend_from_slice(&[0; 300]);
+        r.send(&req(OSC_EXCHANGE, 2, &body));
+        let codes: Vec<u8> = r
+            .take()
+            .iter()
+            .map(|x| match x {
+                Resp::Error { code, .. } => *code,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(codes, [ERR_BAD_PAYLOAD, ERR_TOO_LONG]);
     }
 
     #[test]
-    fn set_rails_acks_and_queues_absolute_state() {
+    fn stream_window_past_the_tick_horizon_is_malformed() {
+        let max = u32::MAX / 2 / FakeDeadline::TICKS_PER_US;
         let mut r = rig();
-        r.server
-            .on_pipe(&rec(&[REC_SET_RAILS, 0b01]), &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0, vec![vec![2, 0, REC_RAILS_ACK, 0b01]]);
+        r.send(&stream_arm(1, max + 1));
+        r.send(&stream_arm(2, max));
+        // Busy now: MALFORMED still wins.
+        r.send(&stream_arm(3, max + 1));
+        r.send(&stream_arm(4, max));
+        let err = |seq, code| Resp::Error {
+            seq,
+            kind: OSC_EXCHANGE,
+            code,
+        };
+        assert_eq!(
+            r.take(),
+            [
+                err(1, ERR_MALFORMED),
+                err(3, ERR_MALFORMED),
+                err(4, ERR_BUSY)
+            ]
+        );
+        assert_eq!(claims(&r), 1, "only the fitting window reached the wire");
+    }
+
+    #[test]
+    fn bus_requests_answer_busy_while_one_is_outstanding() {
+        let mut r = rig();
+        r.send(&ping(1, 5));
+        r.send(&ping(2, 5));
+        r.send(&req(OSC_RESCUE, 3, &[]));
+        r.send(&req(OSC_DEADLINE, 4, &[0, 1]));
+        r.send(&req(SET_BUS, 5, &[MODE_OSC, 0x20, 0xA1, 0x07, 0]));
+        r.send(&req(ADAPTER_IAP, 6, &[]));
+        let got = r.take();
+        let want: Vec<Resp> = [
+            (2, OSC_EXCHANGE),
+            (3, OSC_RESCUE),
+            (4, OSC_DEADLINE),
+            (5, SET_BUS),
+            (6, ADAPTER_IAP),
+        ]
+        .into_iter()
+        .map(|(seq, kind)| Resp::Error {
+            seq,
+            kind,
+            code: ERR_BUSY,
+        })
+        .collect();
+        assert_eq!(got, want);
+        assert_eq!(r.server.take_adapter_request(), None, "IAP not queued");
+    }
+
+    #[test]
+    fn immediate_requests_answer_while_the_bus_is_busy() {
+        let mut r = rig();
+        r.send(&ping(1, 5));
+        r.send(&req(GET_INFO, 2, &[]));
+        r.send(&req(RAILS, 3, &[0, 0]));
+        let got = r.take();
+        assert!(
+            matches!(
+                &got[..],
+                [
+                    Resp::Done {
+                        seq: 2,
+                        kind: GET_INFO,
+                        ..
+                    },
+                    Resp::Done {
+                        seq: 3,
+                        kind: RAILS,
+                        ..
+                    }
+                ]
+            ),
+            "{got:?}"
+        );
+        // The exchange still closes on its own seq.
+        r.bus.on_tx_complete();
+        r.ring.frame(&sealed_status(5, ResultCode::Ok, &[7, 0, 1]));
+        r.pump();
+        let got = r.take();
+        assert!(matches!(
+            got.last(),
+            Some(Resp::Done {
+                seq: 1,
+                kind: OSC_EXCHANGE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_and_unsupported_kinds() {
+        let mut r = rig();
+        r.server = LinkServer::new(0);
+        for kind in [0x03, 0x11, 0x23, 0x31, 0x67, 0x7F, 0x80, 0xFF] {
+            r.send(&req(kind, 1, &[]));
+            assert_eq!(
+                r.take(),
+                [Resp::Error {
+                    seq: 1,
+                    kind,
+                    code: ERR_UNKNOWN_KIND
+                }],
+                "kind {kind:#04x}"
+            );
+        }
+        let mut unsupported = vec![RAILS, ADAPTER_IAP, TB_EXCHANGE];
+        if !cfg!(feature = "bench") {
+            unsupported.extend(WIRE_SEND..=CAPTURE_RESET);
+        }
+        for kind in unsupported {
+            // Precedence: UNSUPPORTED before the body is looked at.
+            r.send(&req(kind, 2, &[0xEE; 9]));
+            assert_eq!(
+                r.take(),
+                [Resp::Error {
+                    seq: 2,
+                    kind,
+                    code: ERR_UNSUPPORTED
+                }],
+                "kind {kind:#04x}"
+            );
+        }
+        assert!(r.wire.log().is_empty());
+    }
+
+    #[test]
+    fn unknown_kind_wins_over_busy() {
+        let mut r = rig();
+        r.send(&ping(1, 5));
+        r.send(&req(0x40, 2, &[]));
+        r.send(&req(OSC_RESCUE, 3, &[1]));
+        assert_eq!(
+            r.take(),
+            [
+                Resp::Error {
+                    seq: 2,
+                    kind: 0x40,
+                    code: ERR_UNKNOWN_KIND
+                },
+                Resp::Error {
+                    seq: 3,
+                    kind: OSC_RESCUE,
+                    code: ERR_MALFORMED
+                },
+            ],
+            "MALFORMED ahead of BUSY"
+        );
+    }
+
+    #[test]
+    fn malformed_bodies() {
+        let cases: [(u8, &[u8]); 9] = [
+            (GET_INFO, &[0]),
+            (RAILS, &[1]),
+            (RAILS, &[1, 1, 1]),
+            (RAILS, &[0b100, 0b11]),
+            (ADAPTER_IAP, &[0]),
+            (SET_BUS, &[MODE_OSC, 0x20, 0xA1, 0x07]),
+            (SET_BUS, &[2, 0x20, 0xA1, 0x07, 0]),
+            (OSC_RESCUE, &[0]),
+            (OSC_DEADLINE, &[1, 2, 3]),
+        ];
+        for (kind, body) in cases {
+            let mut r = rig();
+            r.send(&req(kind, 7, body));
+            assert_eq!(
+                r.take(),
+                [Resp::Error {
+                    seq: 7,
+                    kind,
+                    code: ERR_MALFORMED
+                }],
+                "kind {kind:#04x} body {body:?}"
+            );
+            assert_eq!(r.server.take_adapter_request(), None);
+        }
+    }
+
+    #[test]
+    fn set_bus_moves_the_rate_and_echoes_it() {
+        let mut r = rig();
+        let mut body = vec![MODE_OSC];
+        body.extend_from_slice(&3_000_000u32.to_le_bytes());
+        r.send(&req(SET_BUS, 8, &body));
+        r.pump();
+        assert_eq!(
+            r.take(),
+            [Resp::Done {
+                seq: 8,
+                kind: SET_BUS,
+                result: body
+            }]
+        );
+        assert_eq!(r.baud.applied(), vec![BaudRate::B3000000]);
+    }
+
+    #[test]
+    fn set_bus_refuses_other_rates_and_the_tinyboot_mode() {
+        let mut r = rig();
+        r.send(&req(SET_BUS, 1, &[MODE_OSC, 0x2F, 0x27, 0x0F, 0]));
+        r.send(&req(SET_BUS, 2, &[MODE_TINYBOOT, 0x00, 0xC2, 0x01, 0]));
+        assert_eq!(
+            r.take(),
+            [
+                Resp::Error {
+                    seq: 1,
+                    kind: SET_BUS,
+                    code: ERR_BAD_RATE
+                },
+                Resp::Error {
+                    seq: 2,
+                    kind: SET_BUS,
+                    code: ERR_UNSUPPORTED
+                },
+            ]
+        );
+        assert!(r.baud.applied().is_empty());
+    }
+
+    #[test]
+    fn rescue_and_deadline_close_with_their_results() {
+        let mut r = rig();
+        r.send(&req(OSC_DEADLINE, 0x0A, &200u16.to_le_bytes()));
+        r.pump();
+        assert_eq!(
+            r.take(),
+            [Resp::Done {
+                seq: 0x0A,
+                kind: OSC_DEADLINE,
+                result: vec![]
+            }]
+        );
+        assert_eq!(r.bus.response_deadline_us(), 200);
+
+        r.send(&req(OSC_RESCUE, 0x0B, &[]));
+        assert_eq!(r.wire.log()[..2], [WireOp::Claim, WireOp::HoldLow]);
+        r.clock.advance(1_000);
+        r.pump();
+        let [Resp::Done { seq, kind, result }] = &r.take()[..] else {
+            panic!("one DONE");
+        };
+        assert_eq!((*seq, *kind), (0x0B, OSC_RESCUE));
+        let x = ExchangeResult::parse(result).unwrap();
+        assert_eq!((x.outcome, x.tick), (crate::engine::Outcome::Sent, 1_000));
+        assert_eq!(r.bus.bps(), 500_000, "rescued to 0.5M");
+    }
+
+    #[test]
+    fn rails_set_and_queue_the_absolute_state() {
+        let mut r = rig();
+        r.send(&req(RAILS, 1, &[0b01, 0b11]));
+        assert_eq!(
+            r.take(),
+            [Resp::Done {
+                seq: 1,
+                kind: RAILS,
+                result: vec![0b01]
+            }]
+        );
         assert_eq!(
             r.server.take_adapter_request(),
             Some(AdapterRequest::SetRails {
@@ -509,10 +1034,8 @@ mod tests {
         );
 
         // Absolute state + single slot: back-to-back sets last-win.
-        r.server
-            .on_pipe(&rec(&[REC_SET_RAILS, 0b10]), &mut r.bus, &mut r.sink);
-        r.server
-            .on_pipe(&rec(&[REC_SET_RAILS, 0b11]), &mut r.bus, &mut r.sink);
+        r.send(&req(RAILS, 2, &[0b10, 0b11]));
+        r.send(&req(RAILS, 3, &[0b11, 0b11]));
         assert_eq!(
             r.server.take_adapter_request(),
             Some(AdapterRequest::SetRails {
@@ -523,45 +1046,49 @@ mod tests {
     }
 
     #[test]
-    fn masked_rails_set_composes_against_the_mirror() {
+    fn masked_rails_compose_against_the_mirror() {
         let mut r = rig();
-        // 5V off, 3V3 untouched: boot mirror is both-on.
-        r.server
-            .on_pipe(&rec(&[REC_SET_RAILS, 0b00, 0b10]), &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0, vec![vec![2, 0, REC_RAILS_ACK, 0b01]]);
-        assert_eq!(
-            r.server.take_adapter_request(),
-            Some(AdapterRequest::SetRails {
-                v3v3: true,
-                v5: false
+        // 5V off, 3V3 untouched: the boot mirror is both on.
+        r.send(&req(RAILS, 1, &[0b00, 0b10]));
+        r.send(&req(RAILS, 2, &[0b00, 0b01]));
+        let states: Vec<Vec<u8>> = r
+            .take()
+            .into_iter()
+            .map(|x| match x {
+                Resp::Done { result, .. } => result,
+                other => panic!("{other:?}"),
             })
-        );
-        // 3V3 off through the other mask: composed state goes dark.
-        r.server
-            .on_pipe(&rec(&[REC_SET_RAILS, 0b00, 0b01]), &mut r.bus, &mut r.sink);
-        assert_eq!(*r.sink.0.last().unwrap(), vec![2, 0, REC_RAILS_ACK, 0b00]);
+            .collect();
+        assert_eq!(states, [vec![0b01], vec![0b00]]);
     }
 
     #[test]
     fn zero_mask_reads_the_rails_without_driving_them() {
         let mut r = rig();
-        r.server
-            .on_pipe(&rec(&[REC_SET_RAILS, 0b11, 0b00]), &mut r.bus, &mut r.sink);
+        r.send(&req(RAILS, 1, &[0b11, 0b00]));
         assert_eq!(
-            r.sink.0,
-            vec![vec![2, 0, REC_RAILS_ACK, record::RAILS_BOOT_STATE]]
+            r.take(),
+            [Resp::Done {
+                seq: 1,
+                kind: RAILS,
+                result: vec![RAILS_BOOT_STATE]
+            }]
         );
         assert_eq!(r.server.take_adapter_request(), None);
     }
 
     #[test]
-    fn enter_bootloader_acks_and_queues_the_request() {
+    fn adapter_iap_answers_and_queues_the_request() {
         let mut r = rig();
-        assert_eq!(r.server.take_adapter_request(), None);
-
-        r.server
-            .on_pipe(&rec(&[REC_ENTER_BOOTLOADER]), &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0, vec![vec![1, 0, REC_BOOTLOADER_ACK]]);
+        r.send(&req(ADAPTER_IAP, 0x55, &[]));
+        assert_eq!(
+            r.take(),
+            [Resp::Done {
+                seq: 0x55,
+                kind: ADAPTER_IAP,
+                result: vec![]
+            }]
+        );
         assert_eq!(
             r.server.take_adapter_request(),
             Some(AdapterRequest::EnterBootloader)
@@ -571,206 +1098,475 @@ mod tests {
     }
 
     #[test]
-    fn timeout_terminal_names_the_slot() {
+    fn records_reassemble_across_deliveries() {
         let mut r = rig();
-        r.server
-            .on_pipe(&submit_ping(4, 5), &mut r.bus, &mut r.sink);
-        r.bus.on_tx_complete();
-        r.clock.advance(100_000);
-        r.server.pump(&mut r.bus, &mut r.sink);
-        let term = r.sink.0.last().unwrap();
-        assert_eq!(term[5], OUTCOME_TIMEOUT);
-        assert_eq!(term[6], 0, "missing slot");
-    }
-
-    #[test]
-    fn wire_send_round_trips_on_its_seq() {
-        let mut r = rig();
-        // seq 0x0BB8, raw bytes DE AD -- no Shape validation applies.
-        r.server.on_pipe(
-            &rec(&[REC_WIRE_SEND, 0xB8, 0x0B, 0xDE, 0xAD]),
-            &mut r.bus,
-            &mut r.sink,
-        );
-        assert!(r.sink.0.is_empty(), "accepted: no reply until TC");
-        assert_eq!(
-            r.wire.log(),
-            vec![WireOp::Claim, WireOp::Break, WireOp::Send(vec![0xDE, 0xAD])]
-        );
-
-        r.clock.advance(55);
-        r.bus.on_tx_complete();
-        r.server.pump(&mut r.bus, &mut r.sink);
-        let done = r.sink.0.last().unwrap();
-        assert_eq!(done[2], REC_WIRE_DONE);
-        assert_eq!(u16::from_le_bytes([done[3], done[4]]), 0x0BB8);
-        assert_eq!(u32::from_le_bytes([done[5], done[6], done[7], done[8]]), 55);
-
-        // Retired: the next wire op is accepted.
-        r.server.on_pipe(
-            &rec(&[REC_WIRE_PULSE, 2, 0, 100, 0]),
-            &mut r.bus,
-            &mut r.sink,
-        );
-        assert_eq!(r.sink.0.len(), 1, "no rejection");
-    }
-
-    #[test]
-    fn wire_ops_and_submits_reject_each_other_busy() {
-        let mut r = rig();
-        r.server
-            .on_pipe(&submit_ping(1, 5), &mut r.bus, &mut r.sink);
-        r.server
-            .on_pipe(&rec(&[REC_WIRE_SEND, 2, 0, 0x55]), &mut r.bus, &mut r.sink);
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[2], REC_REJECTED);
-        assert_eq!(u16::from_le_bytes([rej[3], rej[4]]), 2);
-        assert_eq!(rej[5], REASON_BUSY);
-
-        let mut r = rig();
-        r.server
-            .on_pipe(&rec(&[REC_WIRE_SEND, 2, 0, 0x55]), &mut r.bus, &mut r.sink);
-        r.server
-            .on_pipe(&submit_ping(1, 5), &mut r.bus, &mut r.sink);
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[2], REC_REJECTED);
-        assert_eq!(rej[5], REASON_BUSY);
-    }
-
-    #[test]
-    fn malformed_wire_ops_reject_on_their_seq() {
-        let mut r = rig();
-        // Empty send body: a bare break never raises TC.
-        r.server
-            .on_pipe(&rec(&[REC_WIRE_SEND, 7, 0]), &mut r.bus, &mut r.sink);
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[2], REC_REJECTED);
-        assert_eq!(rej[5], REASON_MALFORMED);
-
-        // Burst stream with a truncated frame.
-        r.server.on_pipe(
-            &rec(&[REC_WIRE_BURST, 8, 0, 5, 0xAA]),
-            &mut r.bus,
-            &mut r.sink,
-        );
-        assert_eq!(r.sink.0.last().unwrap()[5], REASON_MALFORMED);
-
-        // Pulse body must be exactly two bytes.
-        r.server
-            .on_pipe(&rec(&[REC_WIRE_PULSE, 9, 0, 10]), &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0.last().unwrap()[5], REASON_MALFORMED);
-        assert!(r.wire.log().is_empty(), "nothing reached the wire");
-    }
-
-    #[test]
-    fn edge_drain_ships_staged_captures_and_the_drain_anchor() {
-        let mut r = rig();
-        r.edges.stage(&[100, 300, 65500], &[110, 310]);
-        r.clock.advance(0x0001_0032);
-        r.server
-            .on_pipe(&rec(&[REC_EDGE_DRAIN, 64]), &mut r.bus, &mut r.sink);
-        let e = r.sink.0.last().unwrap();
-        assert_eq!(e[2], REC_EDGES);
-        assert_eq!(e[3], 0, "no overflow");
-        assert_eq!(
-            u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
-            0x0001_0032,
-            "now = the anchor floor"
-        );
-        assert_eq!(e[8], 3, "falls");
-        assert_eq!(e[9], 2, "rises");
-        let t = |i: usize| u16::from_le_bytes([e[10 + 2 * i], e[11 + 2 * i]]);
-        assert_eq!([t(0), t(1), t(2)], [100, 300, 65500]);
-        assert_eq!([t(3), t(4)], [110, 310]);
-
-        // Drained: a second drain answers empty.
-        r.server
-            .on_pipe(&rec(&[REC_EDGE_DRAIN, 64]), &mut r.bus, &mut r.sink);
-        let e = r.sink.0.last().unwrap();
-        assert_eq!((e[8], e[9]), (0, 0));
-    }
-
-    #[test]
-    fn edge_drain_clamps_and_reports_sticky_overflow() {
-        let mut r = rig();
-        let many: Vec<u16> = (0..100).collect();
-        r.edges.stage(&many, &[]);
-        r.edges.set_overflow();
-        r.server
-            .on_pipe(&rec(&[REC_EDGE_DRAIN, 255]), &mut r.bus, &mut r.sink);
-        let e = r.sink.0.last().unwrap();
-        assert_eq!(e[8] as usize, DRAIN_MAX, "clamped per ring");
-        assert_eq!(e[3], 1, "overflow flagged");
-
-        // Reset clears captures + the flag.
-        r.server
-            .on_pipe(&rec(&[REC_CAPTURE_RESET]), &mut r.bus, &mut r.sink);
-        assert_eq!(r.sink.0.last().unwrap()[2], REC_CAPTURE_ACK);
-        assert_eq!(r.edges.resets(), 1);
-        r.server
-            .on_pipe(&rec(&[REC_EDGE_DRAIN, 64]), &mut r.bus, &mut r.sink);
-        let e = r.sink.0.last().unwrap();
-        assert_eq!((e[3], e[8], e[9]), (0, 0, 0));
-    }
-
-    #[test]
-    fn wire_train_dispatches_gap_breaks_and_announce() {
-        let mut r = rig();
-        // seq 7, gap 400 us, 4 breaks, announce FE 05 70.
-        r.server.on_pipe(
-            &rec(&[REC_WIRE_TRAIN, 7, 0, 0x90, 0x01, 4, 0xFE, 0x05, 0x70]),
-            &mut r.bus,
-            &mut r.sink,
-        );
-        assert!(
-            r.sink.0.is_empty(),
-            "accepted: no reply until the train ends"
-        );
-        assert_eq!(
-            r.wire.log(),
-            vec![
-                WireOp::Claim,
-                WireOp::Break,
-                WireOp::Send(vec![0xFE, 0x05, 0x70])
-            ]
-        );
-        r.bus.on_tx_complete();
-        for _ in 0..4 {
-            r.bus.on_deadline();
+        let bytes = ping(7, 5);
+        for chunk in bytes.chunks(1) {
+            assert_eq!(claims(&r), 0, "partial request: not submitted");
+            r.send(chunk);
         }
-        r.server.pump(&mut r.bus, &mut r.sink);
-        let done = r.sink.0.last().unwrap();
-        assert_eq!(done[2], REC_WIRE_DONE);
-        assert_eq!(u16::from_le_bytes([done[3], done[4]]), 7);
-        // Short body (no announce byte) is malformed on its seq.
-        r.server.on_pipe(
-            &rec(&[REC_WIRE_TRAIN, 8, 0, 0x90, 0x01, 4]),
-            &mut r.bus,
-            &mut r.sink,
-        );
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[2], REC_REJECTED);
-        assert_eq!(rej[5], REASON_MALFORMED);
+        assert_eq!(claims(&r), 1);
+
+        // Two requests in one delivery both land.
+        let mut r = rig();
+        let mut two = req(GET_INFO, 1, &[]);
+        two.extend_from_slice(&req(RAILS, 2, &[0, 0]));
+        r.send(&two);
+        let seqs: Vec<u16> = r
+            .take()
+            .iter()
+            .map(|x| match x {
+                Resp::Done { seq, .. } => *seq,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, [1, 2]);
     }
 
     #[test]
-    fn wire_baud_dispatches_raw_bps() {
+    fn a_request_at_the_size_limit_is_accepted() {
         let mut r = rig();
-        r.server.on_pipe(
-            &rec(&[REC_WIRE_BAUD, 9, 0, 0xAF, 0x26, 0x0F, 0x00]),
-            &mut r.bus,
-            &mut r.sink,
+        let body = vec![0; MAX_REQUEST - HEADER];
+        r.send(&req(GET_INFO, 1, &body));
+        assert_eq!(
+            r.take(),
+            [Resp::Error {
+                seq: 1,
+                kind: GET_INFO,
+                code: ERR_MALFORMED
+            }],
+            "parsed as a request, not a breach"
         );
-        r.server.pump(&mut r.bus, &mut r.sink);
-        let done = r.sink.0.last().unwrap();
-        assert_eq!(done[2], REC_WIRE_DONE);
-        assert_eq!(u16::from_le_bytes([done[3], done[4]]), 9);
-        assert_eq!(r.baud.applied_raw(), vec![0x000F_26AF]);
-        // Wrong body width rejects.
-        r.server
-            .on_pipe(&rec(&[REC_WIRE_BAUD, 10, 0, 1, 2]), &mut r.bus, &mut r.sink);
-        let rej = r.sink.0.last().unwrap();
-        assert_eq!(rej[2], REC_REJECTED);
-        assert_eq!(rej[5], REASON_MALFORMED);
+    }
+
+    #[test]
+    fn framing_breach_answers_once_and_goes_deaf_until_a_new_session() {
+        for len in [0u16, 2, (MAX_REQUEST - 1) as u16] {
+            let mut r = rig();
+            // A good request ahead of the breach in the same delivery lands.
+            let mut bytes = req(GET_INFO, 1, &[]);
+            bytes.extend_from_slice(&len.to_le_bytes());
+            bytes.extend_from_slice(&ping(2, 5));
+            r.send(&bytes);
+            let got = r.take();
+            assert!(matches!(got[0], Resp::Done { seq: 1, .. }), "{got:?}");
+            assert_eq!(
+                got[1..],
+                [Resp::Error {
+                    seq: SEQ_NONE,
+                    kind: KIND_NONE,
+                    code: ERR_FRAMING
+                }],
+                "len {len}"
+            );
+            // Deaf: neither the rest of the delivery nor later ones parse.
+            r.send(&ping(3, 5));
+            assert!(r.take().is_empty());
+            assert!(r.wire.log().is_empty(), "nothing reached the wire");
+
+            r.server.reset_session(&mut r.bus);
+            r.send(&req(GET_INFO, 4, &[]));
+            assert!(matches!(r.take()[..], [Resp::Done { seq: 4, .. }]));
+        }
+    }
+
+    #[test]
+    fn new_session_drops_the_half_received_request() {
+        let mut r = rig();
+        let bytes = ping(7, 5);
+        r.send(&bytes[..3]);
+        r.server.reset_session(&mut r.bus);
+        r.send(&req(GET_INFO, 0, &[]));
+        assert!(matches!(r.take()[..], [Resp::Done { kind: GET_INFO, .. }]));
+        assert!(r.wire.log().is_empty(), "the fragment never submitted");
+    }
+
+    #[test]
+    fn new_session_cancels_the_exchange_and_frees_the_bus() {
+        let mut r = rig();
+        r.send(&ping(0x1234, 5));
+        r.bus.on_tx_complete();
+        r.server.reset_session(&mut r.bus);
+        // The old reply lands after the cancel: nobody collects it.
+        r.ring.frame(&sealed_status(5, ResultCode::Ok, &[7, 0, 1]));
+        r.pump();
+        assert!(r.take().is_empty(), "old FRAME + DONE never recorded");
+
+        // The bus is free at once; the new frame waits out the quiet.
+        r.send(&ping(0, 5));
+        assert!(r.take().is_empty(), "accepted, no ERROR");
+        assert_eq!(claims(&r), 1, "paced: no frame yet");
+        // Past the old reply's re-armed window.
+        r.clock.advance(3_000);
+        r.pump();
+        assert_eq!(claims(&r), 2, "frame sent after the quiet");
+        r.bus.on_tx_complete();
+        r.ring.frame(&sealed_status(5, ResultCode::Ok, &[7, 0, 1]));
+        r.pump();
+        let got = r.take();
+        assert!(
+            matches!(
+                got[..],
+                [
+                    Resp::Frame { seq: 0, .. },
+                    Resp::Done {
+                        seq: 0,
+                        kind: OSC_EXCHANGE,
+                        ..
+                    }
+                ]
+            ),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn new_session_cuts_a_frame_still_on_the_wire() {
+        let mut r = rig();
+        r.send(&ping(1, 5));
+        r.server.reset_session(&mut r.bus);
+        assert_eq!(r.wire.log().last(), Some(&WireOp::Release));
+        // The cut frame's TC lands late and changes nothing.
+        r.bus.on_tx_complete();
+        r.pump();
+        assert!(r.take().is_empty());
+        assert!(!r.bus.busy());
+    }
+
+    #[test]
+    fn new_session_cancels_a_burst_mid_stream() {
+        let mut r = rig();
+        r.send(&stream_arm(9, 100_000));
+        r.bus.on_tx_complete();
+        r.ring.frame(&sealed_status(5, ResultCode::Ok, &[]));
+        r.pump();
+        assert_eq!(r.take().len(), 1, "the arm's ack reached the old session");
+
+        // Bus reset then SET_CONFIGURATION: two resets, one cancel.
+        r.server.reset_session(&mut r.bus);
+        r.server.reset_session(&mut r.bus);
+        r.ring
+            .frame(&sealed_status(5, ResultCode::Stream, &[0, 0, 1, 0, 8, 8]));
+        r.pump();
+        assert!(r.take().is_empty(), "burst frames never recorded");
+        r.send(&ping(0, 5));
+        assert!(r.take().is_empty(), "accepted: the bus is free");
+    }
+
+    #[test]
+    fn adapter_state_survives_a_new_session() {
+        let mut r = rig();
+        r.send(&req(RAILS, 1, &[0b01, 0b11]));
+        r.server.take_adapter_request();
+        r.server.reset_session(&mut r.bus);
+        r.take();
+        r.send(&req(RAILS, 0, &[0, 0]));
+        assert_eq!(
+            r.take(),
+            [Resp::Done {
+                seq: 0,
+                kind: RAILS,
+                result: vec![0b01]
+            }]
+        );
+    }
+    fn tb_rig() -> Rig {
+        let mut r = rig();
+        r.server = LinkServer::new(CHIP | FEATURE_TINYBOOT);
+        r
+    }
+
+    fn set_bus(seq: u16, mode: u8, bps: u32) -> Vec<u8> {
+        let mut body = vec![mode];
+        body.extend_from_slice(&bps.to_le_bytes());
+        req(SET_BUS, seq, &body)
+    }
+
+    fn to_tinyboot(r: &mut Rig, bps: u32) {
+        r.send(&set_bus(0, MODE_TINYBOOT, bps));
+        r.pump();
+        assert!(
+            matches!(r.take()[..], [Resp::Done { kind: SET_BUS, .. }]),
+            "switched"
+        );
+    }
+
+    /// TB_EXCHANGE with `cmd` 3, `addr` 0x080400, `flags` 0x01.
+    fn tb_req(seq: u16, expect: u8, window_us: u32, data: &[u8]) -> Vec<u8> {
+        let mut body = vec![expect];
+        body.extend_from_slice(&window_us.to_le_bytes());
+        body.extend_from_slice(&[3, 0x00, 0x04, 0x08, 0x01]);
+        body.extend_from_slice(data);
+        req(TB_EXCHANGE, seq, &body)
+    }
+
+    /// A sealed tinyboot frame as it lands on the wire.
+    fn tb_wire(cmd: u8, status: u8, addr: u32, flags: u8, data: &[u8]) -> Vec<u8> {
+        let [a0, a1, a2, _] = addr.to_le_bytes();
+        let [n0, n1] = (data.len() as u16).to_le_bytes();
+        let mut f = vec![0xAA, 0x55, cmd, status, a0, a1, a2, flags, n0, n1];
+        f.extend_from_slice(data);
+        let crc = tb_crc(0xFFFF, &f);
+        f.extend_from_slice(&crc.to_le_bytes());
+        f
+    }
+
+    fn info(r: &mut Rig) -> Info {
+        r.send(&req(GET_INFO, 0, &[]));
+        let [Resp::Done { result, .. }] = &r.take()[..] else {
+            panic!("one DONE");
+        };
+        Info::parse(result).unwrap()
+    }
+
+    fn errors(r: &mut Rig) -> Vec<(u16, u8, u8)> {
+        r.take()
+            .into_iter()
+            .map(|x| match x {
+                Resp::Error { seq, kind, code } => (seq, kind, code),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn info_reports_the_mode_and_tb_payload() {
+        let mut r = tb_rig();
+        let i = info(&mut r);
+        assert_eq!(i.features & FEATURE_TINYBOOT, FEATURE_TINYBOOT);
+        assert_eq!(
+            (i.mode, i.max_tb_payload),
+            (MODE_OSC, MAX_TB_PAYLOAD as u16)
+        );
+        to_tinyboot(&mut r, 115_200);
+        let i = info(&mut r);
+        assert_eq!(
+            (i.mode, i.bps, i.max_tb_payload),
+            (MODE_TINYBOOT, 115_200, MAX_TB_PAYLOAD as u16)
+        );
+
+        let mut r = rig();
+        let i = info(&mut r);
+        assert_eq!(
+            (i.features & FEATURE_TINYBOOT, i.max_tb_payload),
+            (0, 0),
+            "no feature, no payload"
+        );
+    }
+
+    #[test]
+    fn set_bus_tinyboot_takes_catalog_rates_only() {
+        let mut r = tb_rig();
+        r.send(&set_bus(1, MODE_TINYBOOT, 115_200));
+        r.pump();
+        let mut result = vec![MODE_TINYBOOT];
+        result.extend_from_slice(&115_200u32.to_le_bytes());
+        assert_eq!(
+            r.take(),
+            [Resp::Done {
+                seq: 1,
+                kind: SET_BUS,
+                result
+            }]
+        );
+        assert_eq!(r.baud.applied_raw(), [115_200]);
+
+        r.send(&set_bus(2, MODE_TINYBOOT, 115_201));
+        r.send(&set_bus(3, 2, 115_200));
+        let mut plain = rig();
+        plain.send(&set_bus(4, MODE_TINYBOOT, 115_200));
+        assert_eq!(
+            errors(&mut r),
+            [(2, SET_BUS, ERR_BAD_RATE), (3, SET_BUS, ERR_MALFORMED)]
+        );
+        assert_eq!(errors(&mut plain), [(4, SET_BUS, ERR_UNSUPPORTED)]);
+        assert_eq!(r.baud.applied_raw(), [115_200], "refusals move nothing");
+        assert!(plain.baud.applied_raw().is_empty());
+    }
+
+    #[test]
+    fn set_bus_osc_from_tinyboot_mode_returns_to_osc() {
+        let mut r = tb_rig();
+        to_tinyboot(&mut r, 115_200);
+        // A tinyboot-only rate is no osc rate: the mode stays.
+        r.send(&set_bus(1, MODE_OSC, 115_200));
+        assert_eq!(errors(&mut r), [(1, SET_BUS, ERR_BAD_RATE)]);
+        assert_eq!(info(&mut r).mode, MODE_TINYBOOT);
+
+        r.send(&set_bus(2, MODE_OSC, 1_000_000));
+        r.pump();
+        let mut result = vec![MODE_OSC];
+        result.extend_from_slice(&1_000_000u32.to_le_bytes());
+        assert_eq!(
+            r.take(),
+            [Resp::Done {
+                seq: 2,
+                kind: SET_BUS,
+                result
+            }]
+        );
+        assert_eq!(r.baud.applied(), [BaudRate::B1000000]);
+        let i = info(&mut r);
+        assert_eq!((i.mode, i.bps), (MODE_OSC, 1_000_000));
+        r.send(&ping(3, 5));
+        assert!(r.take().is_empty(), "osc kinds accepted again");
+    }
+
+    #[test]
+    fn tinyboot_mode_refuses_osc_and_wire_kinds() {
+        let mut r = tb_rig();
+        to_tinyboot(&mut r, 115_200);
+        let mut kinds = vec![OSC_EXCHANGE, OSC_RESCUE, OSC_DEADLINE];
+        if cfg!(feature = "bench") {
+            kinds.extend(WIRE_SEND..=WIRE_BAUD);
+        }
+        for kind in kinds {
+            r.send(&req(kind, 1, &[]));
+            assert_eq!(errors(&mut r), [(1, kind, ERR_WRONG_MODE)], "{kind:#04x}");
+        }
+        if cfg!(feature = "bench") {
+            r.send(&req(EDGE_DRAIN, 2, &[4]));
+            assert!(
+                matches!(
+                    r.take()[..],
+                    [Resp::Done {
+                        seq: 2,
+                        kind: EDGE_DRAIN,
+                        ..
+                    }]
+                ),
+                "edge capture serves both modes"
+            );
+        }
+        assert_eq!(claims(&r), 0, "nothing reached the wire");
+    }
+
+    #[test]
+    fn osc_mode_refuses_tb_exchange() {
+        let mut r = tb_rig();
+        r.send(&tb_req(1, EXPECT_ONE, 5_000, &[1]));
+        assert_eq!(errors(&mut r), [(1, TB_EXCHANGE, ERR_WRONG_MODE)]);
+        assert!(r.wire.log().is_empty());
+    }
+
+    #[test]
+    fn wrong_mode_outranks_malformed_and_busy() {
+        // osc mode, busy: a malformed TB_EXCHANGE.
+        let mut r = tb_rig();
+        r.send(&ping(1, 5));
+        r.send(&req(TB_EXCHANGE, 2, &[9]));
+        assert_eq!(errors(&mut r), [(2, TB_EXCHANGE, ERR_WRONG_MODE)]);
+
+        // tinyboot mode, busy: a malformed OSC_RESCUE.
+        let mut r = tb_rig();
+        to_tinyboot(&mut r, 115_200);
+        r.send(&tb_req(1, EXPECT_ONE, 5_000, &[1]));
+        r.send(&req(OSC_RESCUE, 2, &[1]));
+        assert_eq!(errors(&mut r), [(2, OSC_RESCUE, ERR_WRONG_MODE)]);
+    }
+
+    #[test]
+    fn unsupported_outranks_wrong_mode() {
+        let mut r = rig();
+        r.send(&tb_req(1, EXPECT_ONE, 5_000, &[1]));
+        assert_eq!(errors(&mut r), [(1, TB_EXCHANGE, ERR_UNSUPPORTED)]);
+
+        if !cfg!(feature = "bench") {
+            let mut r = tb_rig();
+            to_tinyboot(&mut r, 115_200);
+            for kind in WIRE_SEND..=WIRE_BAUD {
+                r.send(&req(kind, 2, &[]));
+                assert_eq!(errors(&mut r), [(2, kind, ERR_UNSUPPORTED)], "{kind:#04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn tb_exchange_body_rules() {
+        let max = u32::MAX / 2 / FakeDeadline::TICKS_PER_US;
+        let cases: [(Vec<u8>, u8); 9] = [
+            // Short of the fixed fields.
+            (
+                req(TB_EXCHANGE, 0, &[EXPECT_ONE, 0x88, 0x13, 0, 0, 3, 0, 4, 8]),
+                ERR_MALFORMED,
+            ),
+            (tb_req(0, 3, 5_000, &[1]), ERR_MALFORMED),
+            (tb_req(0, EXPECT_NONE, 1, &[1]), ERR_MALFORMED),
+            (tb_req(0, EXPECT_ONE, 0, &[1]), ERR_MALFORMED),
+            (tb_req(0, EXPECT_COLLECT, 0, &[1]), ERR_MALFORMED),
+            (tb_req(0, EXPECT_ONE, max + 1, &[1]), ERR_MALFORMED),
+            (tb_req(0, EXPECT_COLLECT, max + 1, &[1]), ERR_MALFORMED),
+            (
+                tb_req(0, EXPECT_ONE, 5_000, &[0; MAX_TB_PAYLOAD + 1]),
+                ERR_TOO_LONG,
+            ),
+            (
+                tb_req(0, EXPECT_NONE, 0, &[0; MAX_TB_PAYLOAD + 1]),
+                ERR_TOO_LONG,
+            ),
+        ];
+        for (record, code) in cases {
+            let mut r = tb_rig();
+            to_tinyboot(&mut r, 115_200);
+            r.send(&record);
+            let head = &record[HEADER..record.len().min(HEADER + 10)];
+            assert_eq!(errors(&mut r), [(0, TB_EXCHANGE, code)], "{head:?}");
+            assert_eq!(claims(&r), 0, "nothing reached the wire");
+        }
+
+        // The fitting window and the largest data are accepted.
+        for record in [
+            tb_req(1, EXPECT_COLLECT, max, &[1]),
+            tb_req(1, EXPECT_NONE, 0, &[0; MAX_TB_PAYLOAD]),
+        ] {
+            let mut r = tb_rig();
+            to_tinyboot(&mut r, 115_200);
+            r.send(&record);
+            assert!(r.take().is_empty(), "accepted");
+        }
+    }
+
+    #[test]
+    fn tb_exchange_streams_frames_then_done() {
+        let mut r = tb_rig();
+        to_tinyboot(&mut r, 115_200);
+        r.send(&tb_req(0x42, EXPECT_ONE, 5_000, &[0xDE]));
+        assert!(r.take().is_empty(), "no reply yet");
+        // Past the switch's quiet: 64 byte-times at 115200 is under 6 ms.
+        r.clock.advance(6_000);
+        r.pump();
+        let sent = r.wire.log();
+        assert!(sent.contains(&WireOp::Claim) && !sent.contains(&WireOp::Break));
+
+        r.bus.on_tx_complete();
+        r.ring
+            .feed(&tb_wire(3, 2, 0x0008_0400, 0x40, &[9, 8, 7, 6]));
+        r.pump();
+        let got = r.take();
+        assert_eq!(
+            got[0],
+            Resp::Frame {
+                seq: 0x42,
+                slot: 0,
+                bytes: vec![3, 2, 0x00, 0x04, 0x08, 0x40, 9, 8, 7, 6]
+            }
+        );
+        let Resp::Done { seq, kind, result } = &got[1] else {
+            panic!("DONE");
+        };
+        assert_eq!((*seq, *kind, got.len()), (0x42, TB_EXCHANGE, 2));
+        let x = ExchangeResult::parse(result).expect("exchange result");
+        assert_eq!((x.outcome, x.frames), (crate::engine::Outcome::Complete, 1));
+    }
+
+    #[test]
+    fn new_session_returns_the_bus_to_osc_mode() {
+        let mut r = tb_rig();
+        to_tinyboot(&mut r, 115_200);
+        r.server.reset_session(&mut r.bus);
+        let i = info(&mut r);
+        assert_eq!((i.mode, i.bps), (MODE_OSC, 500_000));
+        r.send(&tb_req(1, EXPECT_ONE, 5_000, &[1]));
+        assert_eq!(errors(&mut r), [(1, TB_EXCHANGE, ERR_WRONG_MODE)]);
     }
 }

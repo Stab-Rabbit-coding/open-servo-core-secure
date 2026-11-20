@@ -1,5 +1,6 @@
 use ch32_metapac::TIM1;
-use ch32_metapac::timer::vals::{Cms, Mms, Ocm};
+use ch32_metapac::common::{RW, Reg};
+use ch32_metapac::timer::vals::{Cms, Dir, Mms, Ocm};
 
 use crate::hal::clocks::TIM_CLK_HZ;
 
@@ -36,7 +37,10 @@ pub fn init_center_aligned_pwm(prescaler: u16, period: u16) {
     TIM1.psc().write_value(prescaler);
     TIM1.atrlr().write_value(period);
     TIM1.ctlr1().modify(|w| {
-        w.set_cms(Cms::CENTERALIGNED3);
+        // Compare events on the up-count only: under CENTERALIGNED3 a
+        // `compare_trigger` channel would also fire on the down-count
+        // crossing, a second injected conversion per period.
+        w.set_cms(Cms::CENTERALIGNED2);
         w.set_arpe(true);
     });
 }
@@ -53,9 +57,39 @@ pub fn configure_pwm_channel(ch: Channel, polarity: Polarity) {
     });
 }
 
+/// A compare whose event triggers the ADC once per period, at CNT = `ccr`
+/// counting up (with `init_center_aligned_pwm`'s CMS), CCR unbuffered. The
+/// ADC sees no event unless CCxE is set (bench), so the output is enabled:
+/// the caller keeps the channel's pin out of AF mode, where it reaches no pad.
+pub fn configure_compare_trigger(ch: Channel, ccr: u16) {
+    let n = (ch as u8 - 1) as usize;
+    TIM1.chctlr_output(n / 2).modify(|w| {
+        w.set_ocm(n % 2, Ocm::PWMMODE2);
+        w.set_ocpe(n % 2, false);
+    });
+    TIM1.chcvr(n).write_value(ccr);
+    TIM1.ccer().modify(|w| w.set_cce(n, true));
+}
+
 #[inline]
 pub fn set_duty(ch: Channel, value: u16) {
     TIM1.chcvr((ch as u8 - 1) as usize).write_value(value);
+}
+
+/// A channel's compare register, resolved once so a per-tick writer stores
+/// through it without the channel lookup.
+#[derive(Copy, Clone)]
+pub struct DutyReg(Reg<u16, RW>);
+
+impl DutyReg {
+    pub fn new(ch: Channel) -> Self {
+        Self(TIM1.chcvr((ch as u8 - 1) as usize))
+    }
+
+    #[inline(always)]
+    pub fn write(self, value: u16) {
+        self.0.write_value(value);
+    }
 }
 
 /// RCR=0 with center-aligned -> UEV at both peak and trough.
@@ -70,6 +104,21 @@ pub fn set_trgo_update() {
 /// Fires TRGO as a side effect -- arm ADC after, not before.
 pub fn force_update_event() {
     TIM1.swevgr().write(|w| w.set_ug(true));
+}
+
+#[inline]
+pub fn counter() -> u16 {
+    TIM1.cnt().read()
+}
+
+pub fn period() -> u16 {
+    TIM1.atrlr().read()
+}
+
+/// Center-aligned counting phase: `true` between crest and trough.
+#[inline]
+pub fn counting_down() -> bool {
+    matches!(TIM1.ctlr1().read().dir(), Dir::DOWN)
 }
 
 pub fn enable_main_output() {

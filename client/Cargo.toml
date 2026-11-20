@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+members  = ["web"]
 
 [package]
 name    = "osc-client"
@@ -10,8 +11,13 @@ description = "Host-side client for the osc-native bus: transport-generic sessio
 [features]
 default = ["nusb"]
 nusb = ["dep:nusb"]
+# Browser backend over WebUSB; a no-op off wasm32 (its deps are target-gated).
+webusb = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys"]
 # In-process adapter over the DES sim: full-stack tests with no hardware.
-fake-adapter = ["dep:osc-integration"]
+# The servo core comes along for the seeds' stamp and the parity pins.
+fake-adapter = ["dep:osc-integration", "dep:osc-servo-core"]
+# Raw-wire instrument surface (`wire`, the 0x6x records): tools/bench only.
+bench = ["osc-host/bench", "osc-integration?/bench"]
 
 [dependencies]
 futures-lite  = "2"
@@ -20,6 +26,20 @@ nusb          = { version = "0.1", optional = true }
 osc-host      = { path = "../firmware/lib/host" }
 osc-protocol  = { path = "../firmware/lib/osc-protocol", features = ["software-crc"] }
 osc-integration = { path = "../firmware/lib/integration", optional = true }
+osc-servo-core  = { path = "../firmware/lib/core", optional = true }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+tinyboot-protocol = "0.5.1"
+
+[dev-dependencies]
+osc-servo-core = { path = "../firmware/lib/core" }
+
+# The guard timer has no thread to fall back on in a browser.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+wasm-bindgen         = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys               = { version = "0.3", optional = true }
 
 [[example]]
 name = "fleet_smoke"

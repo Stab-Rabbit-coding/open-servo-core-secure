@@ -1,0 +1,1334 @@
+{
+  "format": 2,
+  "model": "osc-servo",
+  "class": "servo",
+  "model_number": 257,
+  "firmware_major": 0,
+  "firmware_minor": 1,
+  "table_size": 1024,
+  "generator": "cargo run -p table-export -- ../../descriptors (firmware/lib)",
+  "stamp": {
+    "tag": "osc-plant-1",
+    "covered": [
+      "pos_min_phys_counts",
+      "pos_max_phys_counts",
+      "pos_min_soft_counts",
+      "pos_max_soft_counts",
+      "i_kp_q88",
+      "i_ki_q412",
+      "i_kaw_q412",
+      "v_kp_q88",
+      "v_ki_q412",
+      "v_kaw_q412",
+      "j_ff_q88",
+      "p_kp_q88",
+      "pos_deadband_counts",
+      "speed_ceiling_cps",
+      "accel_limit_q88",
+      "drive_polarity",
+      "stall_omega_max_cps",
+      "l1_q016",
+      "l2_q88",
+      "l3_q88",
+      "pos_error_counts",
+      "r_q12",
+      "recip_ke_q",
+      "b_i_q313",
+      "fric_fc_counts",
+      "fric_fv_q016",
+      "ke_vpc_q",
+      "r_brush_q12",
+      "brush_cps",
+      "g_window_q016",
+      "th_rise_q016",
+      "th_rise2_q016",
+      "ntc_raw_ref",
+      "ntc_t_ref_cc",
+      "ntc_k1_q88",
+      "ntc_k2_q24",
+      "ke_uvs_per_rad",
+      "fric_breakaway_counts",
+      "raw_min",
+      "raw_max",
+      "angle_min_cdeg",
+      "angle_max_cdeg",
+      "gear_ratio_centi",
+      "gear_class"
+    ],
+    "pos_lut_points": 256
+  },
+  "fields": [
+    {
+      "name": "model_number",
+      "addr": 0,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "firmware_version",
+      "addr": 2,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "capability_flags",
+      "addr": 4,
+      "width": 4,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "hardware_revision",
+      "addr": 8,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "tel_row_bytes_max",
+      "addr": 10,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "tel_chunks_max",
+      "addr": 11,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "id",
+      "addr": 16,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint",
+      "min": 1,
+      "max": 249
+    },
+    {
+      "name": "baud_rate_idx",
+      "addr": 17,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint",
+      "max": 3
+    },
+    {
+      "name": "response_deadline_us",
+      "addr": 18,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "pos_min_phys_counts",
+      "addr": 32,
+      "width": 4,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "pos_max_phys_counts",
+      "addr": 36,
+      "width": 4,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "pos_min_soft_counts",
+      "addr": 40,
+      "width": 4,
+      "access": "rw",
+      "kind": "int",
+      "min": -8192,
+      "max": 8192
+    },
+    {
+      "name": "pos_max_soft_counts",
+      "addr": 44,
+      "width": 4,
+      "access": "rw",
+      "kind": "int",
+      "min": -8192,
+      "max": 8192
+    },
+    {
+      "name": "i_kp_q88",
+      "addr": 48,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "i_ki_q412",
+      "addr": 50,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "i_kaw_q412",
+      "addr": 52,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "duty_max_q15",
+      "addr": 54,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint",
+      "max": 32767
+    },
+    {
+      "name": "v_kp_q88",
+      "addr": 56,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "v_ki_q412",
+      "addr": 58,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "v_kaw_q412",
+      "addr": 60,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "j_ff_q88",
+      "addr": 62,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "p_kp_q88",
+      "addr": 64,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "pos_deadband_counts",
+      "addr": 66,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "speed_ceiling_cps",
+      "addr": 68,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint",
+      "max": 32767
+    },
+    {
+      "name": "velocity_limit_cps",
+      "addr": 70,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "accel_limit_q88",
+      "addr": 72,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "current_limit_counts",
+      "addr": 76,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "stall_response",
+      "addr": 78,
+      "width": 1,
+      "access": "rw",
+      "kind": "enum",
+      "variants": [
+        {
+          "name": "Fault",
+          "value": 0
+        },
+        {
+          "name": "Yield",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "drive_polarity",
+      "addr": 79,
+      "width": 1,
+      "access": "rw",
+      "kind": "bool"
+    },
+    {
+      "name": "stall_time_ticks",
+      "addr": 80,
+      "width": 4,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "stall_omega_max_cps",
+      "addr": 84,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "i_cont_counts",
+      "addr": 86,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "stall_release_counts",
+      "addr": 88,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "stall_tau_trip_counts",
+      "addr": 90,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "oc_trip_counts",
+      "addr": 92,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "oc_trip_ticks",
+      "addr": 94,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "openloop_zero_brake",
+      "addr": 95,
+      "width": 1,
+      "access": "rw",
+      "kind": "bool"
+    },
+    {
+      "name": "thermal_tau_s",
+      "addr": 96,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "cutoff_cc",
+      "addr": 100,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "v_undervolt_counts",
+      "addr": 102,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "thermal_tau2_s",
+      "addr": 104,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "l1_q016",
+      "addr": 106,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "l2_q88",
+      "addr": 108,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "l3_q88",
+      "addr": 110,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "pos_error_time_ticks",
+      "addr": 112,
+      "width": 4,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "pos_error_counts",
+      "addr": 116,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "sensor_delta_max",
+      "addr": 118,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "sensor_bad_count",
+      "addr": 120,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "rail_fold_q8",
+      "addr": 122,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "r_q12",
+      "addr": 128,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "recip_ke_q",
+      "addr": 130,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "b_i_q313",
+      "addr": 132,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "fric_fc_counts",
+      "addr": 134,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "fric_fv_q016",
+      "addr": 136,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "ke_vpc_q",
+      "addr": 138,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "r_brush_q12",
+      "addr": 140,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "brush_cps",
+      "addr": 142,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "g_window_q016",
+      "addr": 144,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "th_rise_q016",
+      "addr": 148,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "th_rise2_q016",
+      "addr": 150,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "ntc_raw_ref",
+      "addr": 152,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "ntc_t_ref_cc",
+      "addr": 154,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "ntc_k1_q88",
+      "addr": 156,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "ntc_k2_q24",
+      "addr": 158,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "ke_uvs_per_rad",
+      "addr": 160,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "fric_breakaway_counts",
+      "addr": 162,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "raw_min",
+      "addr": 164,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "raw_max",
+      "addr": 166,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "angle_min_cdeg",
+      "addr": 168,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "angle_max_cdeg",
+      "addr": 170,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "gear_ratio_centi",
+      "addr": 172,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "plant_stamp",
+      "addr": 174,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "shunt_r_mohm",
+      "addr": 176,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "gain_milli",
+      "addr": 178,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_div_top",
+      "addr": 180,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_div_bot",
+      "addr": 182,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vdd_mv",
+      "addr": 184,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "tick_hz",
+      "addr": 186,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "i_window_min_ticks",
+      "addr": 188,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "v_window_min_ticks",
+      "addr": 190,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vbus_div_top_ohm",
+      "addr": 192,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vbus_div_bot_ohm",
+      "addr": 194,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "ntc_pullup_ohm",
+      "addr": 196,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "ntc_r25_ohm",
+      "addr": 198,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "ntc_beta",
+      "addr": 200,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_bias_nom_counts",
+      "addr": 202,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "rail_drop_mv",
+      "addr": 204,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_bias_top_ohm",
+      "addr": 206,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_bias_bot_ohm",
+      "addr": 208,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "pwm_period_ticks",
+      "addr": 210,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "gear_class",
+      "addr": 212,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "adc_wide_mid_q4",
+      "addr": 213,
+      "width": 16,
+      "access": "rw",
+      "kind": "bytes"
+    },
+    {
+      "name": "torque_enable",
+      "addr": 384,
+      "width": 1,
+      "access": "rw",
+      "kind": "bool"
+    },
+    {
+      "name": "stall_permit",
+      "addr": 385,
+      "width": 1,
+      "access": "rw",
+      "kind": "bool"
+    },
+    {
+      "name": "mode",
+      "addr": 388,
+      "width": 1,
+      "access": "rw",
+      "kind": "enum",
+      "variants": [
+        {
+          "name": "OpenLoop",
+          "value": 0
+        },
+        {
+          "name": "Current",
+          "value": 1
+        },
+        {
+          "name": "Velocity",
+          "value": 2
+        },
+        {
+          "name": "Position",
+          "value": 3
+        }
+      ]
+    },
+    {
+      "name": "goal_duty",
+      "addr": 390,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "goal_position",
+      "addr": 392,
+      "width": 4,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "goal_velocity",
+      "addr": 396,
+      "width": 4,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "goal_current",
+      "addr": 400,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "bus_deadman_ticks",
+      "addr": 402,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "stat_flash_ticks",
+      "addr": 404,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "duty_q15",
+      "addr": 406,
+      "width": 2,
+      "access": "rw",
+      "kind": "int"
+    },
+    {
+      "name": "arm",
+      "addr": 408,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "page",
+      "addr": 409,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "chans",
+      "addr": 410,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint",
+      "max": 15
+    },
+    {
+      "name": "pos_lut_page",
+      "addr": 412,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint",
+      "max": 7
+    },
+    {
+      "name": "pos_lut_cmd",
+      "addr": 413,
+      "width": 1,
+      "access": "rw",
+      "kind": "uint",
+      "max": 3
+    },
+    {
+      "name": "pos_lut_points",
+      "addr": 414,
+      "width": 64,
+      "access": "rw",
+      "kind": "bytes"
+    },
+    {
+      "name": "pos_lut_state",
+      "addr": 478,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "chunk0_addr",
+      "addr": 482,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "chunk0_len",
+      "addr": 484,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "chunk1_addr",
+      "addr": 486,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "chunk1_len",
+      "addr": 488,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "tel_count",
+      "addr": 490,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "inject_accel_q88",
+      "addr": 492,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "inject_half_periods",
+      "addr": 494,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "fault_flags",
+      "addr": 512,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "status_flags",
+      "addr": 513,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "trim_steps",
+      "addr": 514,
+      "width": 1,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "crc_fail_count",
+      "addr": 516,
+      "width": 4,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "framing_drop_count",
+      "addr": 520,
+      "width": 4,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "mode_active",
+      "addr": 544,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "fault_code",
+      "addr": 545,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "omega_hat_src",
+      "addr": 546,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "data_flags",
+      "addr": 547,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "pos",
+      "addr": 568,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vref_raw",
+      "addr": 570,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vbus_raw",
+      "addr": 572,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "ntc_raw",
+      "addr": 574,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "current_raw",
+      "addr": 576,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_a",
+      "addr": 578,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_b",
+      "addr": 580,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "duty_ticks",
+      "addr": 582,
+      "width": 2,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "current_trough",
+      "addr": 584,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "i_tick_counts",
+      "addr": 586,
+      "width": 2,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "vdiff_counts",
+      "addr": 588,
+      "width": 2,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "vmotor_a_trough",
+      "addr": 590,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_b_trough",
+      "addr": 592,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "tick_flags",
+      "addr": 594,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "sample_tick",
+      "addr": 596,
+      "width": 4,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "theta_hat_q16",
+      "addr": 600,
+      "width": 4,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "omega_hat_cps",
+      "addr": 604,
+      "width": 4,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "tau_d_counts",
+      "addr": 608,
+      "width": 2,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "i_lim_counts",
+      "addr": 610,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "t_winding_cc",
+      "addr": 612,
+      "width": 2,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "vbus_counts",
+      "addr": 614,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "omega_bemf_cps",
+      "addr": 616,
+      "width": 2,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "r_hat_q12",
+      "addr": 618,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "current_bias_counts",
+      "addr": 620,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "vmotor_bias_counts",
+      "addr": 622,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "enc_a",
+      "addr": 624,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "enc_b",
+      "addr": 626,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "limit_flags",
+      "addr": 636,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "window_floor_q15",
+      "addr": 638,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "words",
+      "addr": 640,
+      "width": 64,
+      "access": "rw",
+      "kind": "bytes"
+    },
+    {
+      "name": "page_echo",
+      "addr": 704,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "state",
+      "addr": 705,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "samples",
+      "addr": 706,
+      "width": 240,
+      "access": "ro",
+      "kind": "bytes"
+    },
+    {
+      "name": "samples_len",
+      "addr": 946,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "step_index",
+      "addr": 948,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "start_cnt",
+      "addr": 950,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "pwm_arr",
+      "addr": 952,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "start_dir",
+      "addr": 954,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "restore_dir",
+      "addr": 955,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "chans_echo",
+      "addr": 956,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "frame_len",
+      "addr": 957,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "tick_load_mean_q15",
+      "addr": 960,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "tick_over_count",
+      "addr": 962,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "tick_lost_count",
+      "addr": 964,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "tel_drop_count",
+      "addr": 966,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "write_late_count",
+      "addr": 968,
+      "width": 2,
+      "access": "rw",
+      "kind": "uint"
+    },
+    {
+      "name": "stack_free_min",
+      "addr": 970,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "window_v_floor_q15",
+      "addr": 972,
+      "width": 2,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "t_ntc_cc",
+      "addr": 976,
+      "width": 2,
+      "access": "ro",
+      "kind": "int"
+    },
+    {
+      "name": "therm_flags",
+      "addr": 978,
+      "width": 1,
+      "access": "ro",
+      "kind": "uint"
+    },
+    {
+      "name": "omega_ref_cps",
+      "addr": 980,
+      "width": 4,
+      "access": "ro",
+      "kind": "int"
+    }
+  ]
+}

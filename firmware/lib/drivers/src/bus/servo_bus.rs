@@ -1,20 +1,21 @@
 //! osc-native transport composite (`docs/osc-native-protocol.md`, driver-pattern
 //! sec 4, sec 5.4). Routes break/deadline/TX events between the four sub-drivers
-//! (`Framer`, `Chain`, `TxEngine`, `ClockTracker`), owns the one hardware CRC
+//! (`Framer`, `Chain`, `TxEngine`, `ClockDiscipline`), owns the one hardware CRC
 //! engine both TX generation and RX validation share, and muxes their
 //! deadlines onto the single tick-compare.
 
-use osc_protocol::wire::{Id, Opcode};
+use osc_protocol::wire::Opcode;
 use osc_security::{Policy, SecurityContext, SecurityState, SessionKeys};
 use osc_servo_core::traits::Dispatch;
-use osc_servo_core::{BaudRate, BootMode};
+use osc_servo_core::{BaudRate, Reboot};
 
 use super::chain::Chain;
-use super::clock::ClockTracker;
+use super::clock::ClockDiscipline;
+use super::decode::Slot;
 use super::framer::Framer;
-use super::ring_wrap;
 use super::tx::{TxEngine, TxOut};
-use crate::traits::bus::{Deadline, Providers, RxRing, UsartBaud, tick_reached};
+use crate::tel::TelPost;
+use crate::traits::bus::{BreakStamps, Deadline, Providers, RxRing, UsartBaud, tick_reached};
 
 mod crc;
 mod reply;
@@ -24,10 +25,6 @@ mod security;
 /// us-per-byte numerator: 10 bit-times/byte x 1e6 us/s. `tpb = TICKS_PER_US x
 /// this / baud` stays within u32 for all four operational rates.
 const BYTE_TIME_NUMERATOR: u32 = 10_000_000;
-
-/// Slack on the reclaim-suspension frame allowance (sec 6): covers the snooper's
-/// deadline-B margin on the predecessor's frame end.
-const FRAME_ALLOWANCE_SLACK_BYTES: u32 = 8;
 
 /// Bound on same-wake deadline draining. Generous: one frame consumes at most
 /// a handful of due slots per wake (header lock, covered, end, chain, rescue);
@@ -65,7 +62,7 @@ struct Pending {
     anchor: u16,
     footprint: u16,
     packet_end: u32,
-    slot: u8,
+    slot: Slot,
     /// Wire effect staged: a reply awaits the send/don't-send verdict.
     staged: bool,
     /// Table effect staged in the dispatcher: a write awaits commit/revert.
@@ -80,13 +77,14 @@ pub struct ServoBus<P: Providers> {
     ring: P::Ring,
     deadline: P::Deadline,
     baud: P::Baud,
+    stamps: P::Stamps,
     id: u8,
     rate: BaudRate,
     tpb: u32,
     response_deadline_us: u16,
     pending_id: Option<u8>,
     pending_baud: Option<BaudRate>,
-    pending_reboot: Option<BootMode>,
+    pending_reboot: Option<Reboot>,
     crc_fails: u32,
     // The one frame dispatched ahead of its CRC verdict (sec 4: the spine).
     // Backpressure bounds it to one: a pending frame IS the frontier, so the
@@ -95,8 +93,17 @@ pub struct ServoBus<P: Providers> {
     // Deadline mux (sec 4.1/sec 6/sec 9.1): the soonest live slot arms the compare.
     framer_at: Option<u32>,
     chain_at: Option<u32>,
-    // Clock discipline (sec 9.3): MGMT CAL + drift tracker + trim loop.
-    clock: ClockTracker,
+    // A break wake serviced before its 0x00 rang: the wake's entry tick,
+    // re-inspected one byte-time on (the third mux slot).
+    unringed: Option<u32>,
+    // Clock discipline (sec 9.3): MGMT CAL + trim loop.
+    clock: ClockDiscipline,
+    // TEL burst (sec 5.6): armed by tel_count, streamed by the kernel.
+    tel: Option<TelPost>,
+    // Rescue sampler window (sec 9.1): the first low sample's tick and the
+    // cursor the ring must hold until the declaration.
+    rescue_since: Option<u32>,
+    rescue_cursor: u16,
     // The message plane (`docs/security-architecture.md`): the stream digest,
     // the replay window, the policy register and the session state. Folded at
     // the covered checkpoint, gated at the verdict -- the two hooks in
@@ -135,6 +142,7 @@ impl<P: Providers> ServoBus<P> {
         crc: P::Crc,
         tx: P::Tx,
         mut baud: P::Baud,
+        stamps: P::Stamps,
         id: u8,
         rate: BaudRate,
         response_deadline_us: u16,
@@ -148,6 +156,7 @@ impl<P: Providers> ServoBus<P> {
             ring,
             deadline,
             baud,
+            stamps,
             id,
             rate,
             tpb: tpb_for::<P>(rate),
@@ -159,7 +168,11 @@ impl<P: Providers> ServoBus<P> {
             pending: None,
             framer_at: None,
             chain_at: None,
-            clock: ClockTracker::new(<P::Deadline as Deadline>::CLOCK_TRIM_STEP_PPM),
+            unringed: None,
+            clock: ClockDiscipline::new(<P::Deadline as Deadline>::CLOCK_TRIM_STEP_PPM),
+            tel: None,
+            rescue_since: None,
+            rescue_cursor: 0,
             // Boots Unsecured and PERMISSIVE (`docs/security-architecture.md`
             // sec 4.2). Two separate decisions, both deliberate:
             //
@@ -207,120 +220,139 @@ impl<P: Providers> ServoBus<P> {
         }
     }
 
-    /// Break-wake ISR (LBD: a genuine >=10-bit dominant span landed, sec 3.4
-    /// -- garble never reaches this handler) -- a pure wake. It carries
-    /// neither position nor time (both are derived from the stream): the
-    /// resolver reads them from ring data, so a delayed or coalesced entry
-    /// costs nothing (any frames completed meanwhile resolve on the fast path
+    /// Bind the TEL channel's bus half. Bringup-only, before any arm can
+    /// arrive; without it `tel_arm` stays a drop.
+    pub fn attach_tel(&mut self, post: TelPost) {
+        self.tel = Some(post);
+    }
+
+    /// Break-wake ISR (the bus held low a break's length, sec 3.4 -- garble
+    /// never reaches this handler) -- a pure wake. It carries neither
+    /// position nor time (both are derived from the stream): the resolver
+    /// reads them from ring data, so a delayed or coalesced entry costs
+    /// nothing (any frames completed meanwhile resolve on the fast path
     /// right here).
+    ///
+    /// The detector may fire ahead of the stop-bit sample that rings the
+    /// break's 0x00, so the wake can beat its own byte into the ring. A wake
+    /// whose break byte has not rung gets its ring-dependent service
+    /// (resolver, stale-reply kill) one byte-time later in
+    /// [`Self::reinspect`], from ring data alone.
     pub fn on_break<D: Dispatch>(&mut self, d: &mut D) {
-        let now = self.deadline.now();
-        // MGMT CAL train (sec 9.3): while a train is live, breaks are ruler
-        // marks, not frame traffic -- stamp against the announced gap and
-        // return. The ring still collects the break bytes; the framer's
-        // hunt scans them off silently once the train ends (0x00 runs are
-        // implausible candidates, and any junk lock dies CRC-uncounted
-        // under the hunt's probing flag).
-        if self.clock.cal_active() {
-            if let Some(at) = self.clock.on_cal_break(
-                now,
-                self.ring.cursor(),
-                <P::Deadline as Deadline>::TICKS_PER_US,
-            ) {
-                self.framer_at = Some(at);
-                self.arm_deadline();
-            }
+        // sec 5.6: the servo owns the line from a burst's ack to its LAST
+        // frame; a break before LAST has left the wire is ignored.
+        if self.tx.lent() && !self.take_lane() {
             return;
         }
-        // Freshness first, resolve second: the fault service computes one
-        // bit (did bytes ring since the last service?) and nothing else --
-        // the fault contract. The resolve consumes whatever the ring holds.
-        let cursor = self.ring.cursor();
-        let fresh = self.framer.on_wire_fault(cursor);
-        // Drift stamp only when the newest ringed byte IS a break's 0x00 --
-        // classification from ring data, per the contract. A spurious or
-        // lagged wake can land at frame end looking FRESH (the frame's own
-        // bytes drained since the break's service), and stamping it
-        // clobbers the pair in flight -- the tracker starved to zero on
-        // silicon under the FE-era latched re-fires (DES pin:
-        // `tracker_survives_latched_refires_between_frames`). A CRC tail
-        // that happens to end 0x00 leaks one stamp and costs one pair --
-        // the byte-exactness and span gates absorb it.
-        if fresh && self.newest_is_break_byte(cursor) {
-            self.clock
-                .on_drift_break(now, self.ring.cursor(), self.ring.bytes().len(), self.tpb);
+        let now = self.deadline.now();
+        // MGMT CAL train (sec 9.3): while a train is live, breaks are ruler
+        // marks, not frame traffic. A mark is its detector's hardware stamp,
+        // taken in wire order however late or coalesced this service runs
+        // (DES pin `cal_ruler_ignores_wake_lag`). The ring still collects
+        // the break bytes; the framer's hunt scans them off silently once
+        // the train ends (0x00 runs are implausible candidates, and any junk
+        // lock dies CRC-uncounted under the hunt's probing flag).
+        if self.clock.cal_active() {
+            while let Some(stamp) = self.stamps.take() {
+                if let Some(t) =
+                    self.clock
+                        .on_cal_break(stamp, now, <P::Deadline as Deadline>::TICKS_PER_US)
+                {
+                    self.framer_at = Some(t);
+                }
+            }
+            self.arm_deadline();
+            return;
         }
+        self.unringed = (!self.serve_break(d)).then_some(now);
+        // sec 6: a break while we hold a staged chain slot means the
+        // predecessor is alive -- suspend its reclaim window while the
+        // frame plays out.
+        let out = self.chain.on_break_observed(now);
+        self.route_chain(out);
+        self.arm_deadline();
+    }
+
+    /// Drop the staged or streaming reply; a TEL arm waiting on its
+    /// release goes with it.
+    fn abort_reply(&mut self) {
+        if self.tx.abort()
+            && let Some(t) = self.tel.as_mut()
+        {
+            t.end();
+        }
+    }
+
+    /// Take the line back from a burst whose LAST frame has left the wire.
+    /// The ladder resumes at the ring cursor read while LAST streamed (the
+    /// receiver is deaf under own TX, so it was still): whatever a host sent
+    /// during the burst is skipped, and the break being served is the first
+    /// one after it.
+    fn take_lane(&mut self) -> bool {
+        let tx = &self.tx;
+        let Some(t) = self.tel.as_mut() else {
+            return false;
+        };
+        let Some(resume) = t.returned(|| tx.wire_idle()) else {
+            return false;
+        };
+        self.tx.reclaim();
+        t.stop();
+        self.framer.resync(resume);
+        true
+    }
+
+    /// One byte-time after a wake whose break byte had not rung: the frame
+    /// break is wherever the ladder stands. A train that went live meanwhile
+    /// keeps the framer slot as its watchdog.
+    fn reinspect<D: Dispatch>(&mut self, d: &mut D) {
+        if self.unringed.take().is_some() && !self.clock.cal_active() {
+            self.serve_break(d);
+        }
+    }
+
+    /// The ring-dependent half of a frame break's service. Position from
+    /// the stream: the resolver walks the ladder through every frame whole
+    /// in the ring and onto this break's byte once it has rung, however
+    /// late the wake was served - a service lagging a byte-time or more
+    /// finds data bytes newest (DES pin `lagged_break_wakes_resolve_every_frame`).
+    /// Returns false while this wake's byte has not rung: the caller
+    /// re-inspects one byte-time on.
+    fn serve_break<D: Dispatch>(&mut self, d: &mut D) -> bool {
         self.drive_framer(d);
-        // A wake whose evidence isn't ringed yet leaves the resolver with
-        // nothing (a coalesced or lagged service -- the contract's
-        // spurious-wake case): the ring tells the truth one byte-time
-        // later -- arm the recheck. A spurious re-fire costs one empty wake.
-        if !fresh && self.framer_at.is_none() {
-            self.framer_at = Some(now.wrapping_add(self.tpb));
-        }
-        // Wire safety: a staged, not-yet-streaming reply must never fire
-        // into the host's NEXT frame. But an FE alone doesn't mean the host
-        // moved on -- lagged deliveries routinely resolve the reply's own
-        // frame (or reach its covered checkpoint) inside this very wake
-        // (silicon event-trace: COVERED -> KILL 2 us apart, then verify
-        // armed the chain over the emptied engine -- ghost trigger, silent
-        // no-reply). Positional truth from the stream decides: kill only when
-        // ringed bytes FOLLOW the reply's own frame. A pending frame is
-        // mid-verdict by definition (its CRC gate reclaims the reply if this
-        // break garbled the frame); a Waiting chain expects predecessor
-        // breaks and only suspends its reclaim window (sec 6). Broadcast-ENUM
-        // replies are exempt (sec 9.2): colliding with a peer matcher IS their
-        // contract -- a yielded laggard turns the walk's collision signal
-        // into one clean frame and prunes its subtree. A CRC-verified fresh
-        // instruction still supersedes them (route_frame).
+        let ringed = self
+            .framer
+            .break_ringed(self.ring.bytes(), self.ring.cursor());
+        self.kill_stale_reply();
+        ringed
+    }
+
+    /// Wire safety: a staged, not-yet-streaming reply must never fire into
+    /// the host's NEXT frame. But a wake alone doesn't mean the host moved
+    /// on -- lagged deliveries routinely resolve the reply's own frame (or
+    /// reach its covered checkpoint) inside the very wake (silicon
+    /// event-trace: COVERED -> KILL 2 us apart, then verify armed the chain
+    /// over the emptied engine -- ghost trigger, silent no-reply).
+    /// Positional truth from the stream decides: kill only when ringed
+    /// bytes FOLLOW the reply's own frame. A pending frame is mid-verdict by
+    /// definition (its CRC gate reclaims the reply if this break garbled
+    /// the frame); a Waiting chain expects predecessor breaks and only
+    /// suspends its reclaim window (sec 6). Broadcast-ENUM replies are
+    /// exempt (sec 9.2): colliding with a peer matcher IS their contract --
+    /// a yielded laggard turns the walk's collision signal into one clean
+    /// frame and prunes its subtree. A CRC-verified fresh instruction still
+    /// supersedes them (route_frame).
+    fn kill_stale_reply(&mut self) {
         if self.tx.staged()
             && !self.tx.collision_tolerant()
             && !self.chain.waiting()
             && self.pending.is_none()
             && !self.framer.caught_up(self.ring.cursor())
         {
-            self.tx.abort();
+            self.abort_reply();
             self.chain.reset();
             self.chain_at = None;
         }
-        // sec 6: a break while we hold a staged chain slot means the predecessor
-        // is alive -- suspend its reclaim window while the frame plays out.
-        let out = self.chain.on_break_observed(now);
-        self.route_chain(out);
-        self.arm_deadline();
-    }
-
-    /// The newest ringed byte -- the wire-fault service's break/re-fire
-    /// discriminator (a break rings its 0x00 last; a frame-end re-fire
-    /// sees the CRC tail).
-    fn newest_is_break_byte(&self, cursor: u16) -> bool {
-        let ring = self.ring.bytes();
-        let len = ring.len();
-        len != 0 && ring[ring_wrap(cursor as usize + len - 1, len)] == 0x00
-    }
-
-    /// A verified frame between breaks: classify its shape from ring data
-    /// (only silent shapes pair) and record it with the tracker.
-    pub(super) fn drift_note_verified(&mut self, anchor: u16, footprint: u16) {
-        // A second frame collapses the record to Many -- its shape is never
-        // read, so skip the ring classification.
-        if !self.clock.pair_open() {
-            self.clock.note_verified(footprint, false);
-            return;
-        }
-        let inst = self.ring_inst(anchor);
-        let ring = self.ring.bytes();
-        let len = ring.len();
-        if len == 0 {
-            return; // defensive: no ring, no record
-        }
-        let id = ring[ring_wrap(anchor as usize + 1, len)];
-        let silent = match inst.opcode() {
-            Some(Opcode::Gwrite) => true,
-            Some(Opcode::Write | Opcode::Commit) => inst.noreply() || id == Id::BROADCAST.as_byte(),
-            _ => false,
-        };
-        self.clock.note_verified(footprint, silent);
     }
 
     /// Tick-compare ISR: one or more muxed deadlines are due. Every slot a
@@ -331,6 +363,10 @@ impl<P: Providers> ServoBus<P> {
         for _ in 0..DEADLINE_DRAIN_MAX {
             let now = self.deadline.now();
             let mut progressed = false;
+            if due(now, self.reinspect_at()) {
+                progressed = true;
+                self.reinspect(d);
+            }
             if due(now, self.framer_at) {
                 progressed = true;
                 self.framer_at = None;
@@ -359,17 +395,29 @@ impl<P: Providers> ServoBus<P> {
     /// once the whole reply has drained (sec 4.2) -- the ack always leaves at
     /// the old id/baud, the change lands after.
     pub fn on_tx_complete(&mut self) {
-        if self.tx.on_arm_complete(&mut self.crc) == TxOut::Released {
-            if let Some(id) = self.pending_id.take() {
-                self.id = id;
+        let out = self.tx.on_arm_complete(&mut self.crc);
+        if out == TxOut::Armed {
+            return;
+        }
+        if let Some(id) = self.pending_id.take() {
+            self.id = id;
+        }
+        if let Some(baud) = self.pending_baud.take() {
+            self.baud.apply(baud);
+            self.rate = baud;
+            self.tpb = tpb_for::<P>(self.rate);
+        }
+        // A pending reboot waits for the main loop's `take_reboot`.
+        if out == TxOut::Lent {
+            if let Some(t) = self.tel.as_mut() {
+                t.start(self.id);
             }
-            if let Some(baud) = self.pending_baud.take() {
-                self.baud.apply(baud);
-                self.rate = baud;
-                self.tpb = tpb_for::<P>(self.rate);
-                self.clock.restart();
-            }
-            // A pending reboot waits for the main loop's `take_reboot`.
+            return;
+        }
+        // The ladder waited on the CRC engine while the reply streamed.
+        if !self.framer.caught_up(self.ring.cursor()) {
+            self.framer_at = Some(self.deadline.now());
+            self.arm_deadline();
         }
     }
 
@@ -377,7 +425,7 @@ impl<P: Providers> ServoBus<P> {
     /// draining (a reset mid-ack truncates the frame on the wire; bench-
     /// caught), honored on the first poll after the TX released. A silent
     /// (NOREPLY/broadcast) reboot stages no ack and takes immediately.
-    pub fn take_reboot(&mut self) -> Option<BootMode> {
+    pub fn take_reboot(&mut self) -> Option<Reboot> {
         if self.tx.busy() {
             return None;
         }
@@ -392,8 +440,7 @@ impl<P: Providers> ServoBus<P> {
     }
 
     /// Main-loop poll, ISRs masked by the caller (the `diag` idiom): drain a
-    /// completed measurement -- a CAL train (absolute) or a drift window
-    /// (baseline-relative) -- through the trim loop. Returns the new trim
+    /// completed CAL train through the trim loop. Returns the new trim
     /// total -- signed chip steps from the factory default, positive =
     /// slower -- for the caller to apply to the oscillator between frames.
     pub fn poll_clock_trim(&mut self) -> Option<i8> {
@@ -409,9 +456,15 @@ impl<P: Providers> ServoBus<P> {
     }
 
     /// How long an observed predecessor break suspends its reclaim window:
-    /// the largest legal frame plus the snooper's own end-detection slack.
+    /// the largest legal frame plus one RESPONSE_DEADLINE, which covers the
+    /// pauses a kernel above the predecessor's bus puts between its reply's
+    /// arms (sec 6).
     pub(super) fn frame_allowance(&self) -> u32 {
-        (super::FRAME_MAX as u32 + FRAME_ALLOWANCE_SLACK_BYTES) * self.tpb
+        (super::FRAME_MAX as u32 * self.tpb).wrapping_add(self.reclaim())
+    }
+
+    fn reinspect_at(&self) -> Option<u32> {
+        self.unringed.map(|at| at.wrapping_add(self.tpb))
     }
 
     /// Arm the compare at the soonest live slot, or cancel if none. A slot
@@ -420,6 +473,7 @@ impl<P: Providers> ServoBus<P> {
     /// the covered window does, routinely) must pend it, not push it behind
     /// every future slot (bench signature: deadline B riding the +100 us
     /// rescue wake).
+    #[rustc_align(4)]
     fn arm_deadline(&mut self) {
         let now = self.deadline.now();
         let remaining = |at: u32| {
@@ -430,7 +484,10 @@ impl<P: Providers> ServoBus<P> {
             }
         };
         let mut best: Option<u32> = None;
-        for at in [self.framer_at, self.chain_at].into_iter().flatten() {
+        for at in [self.reinspect_at(), self.framer_at, self.chain_at]
+            .into_iter()
+            .flatten()
+        {
             best = Some(match best {
                 Some(b) if remaining(b) <= remaining(at) => b,
                 _ => at,
@@ -442,36 +499,52 @@ impl<P: Providers> ServoBus<P> {
         }
     }
 
-    /// sec 9.1 rescue: the chip's line sampler measured a >=[`RESCUE_LOW_US`]
-    /// dominant low with zero ring progress -- a signal no transport wake can
-    /// observe (the break detector latches only at a span's END). Called from
-    /// the main loop under a critical section; the pulse is still holding the
-    /// line when the sampler declares, so the cursor is provably still.
+    /// sec 9.1 rescue sampler: one call per main-loop wake under a critical
+    /// section, with `low` read inside it. Declares after >= [`RESCUE_LOW_US`]
+    /// of low samples with zero ring progress - a length no transport wake
+    /// can measure (the break detector wakes once per span). A sample taken
+    /// while the servo's own TX holds the wire restarts the window: HDSEL
+    /// keeps own bytes out of the ring, so their low bits would otherwise
+    /// pass for a host's pulse. The TX state is read in the pin's critical
+    /// section, so no TX release can fall between sample and declaration.
     ///
     /// [`RESCUE_LOW_US`]: super::RESCUE_LOW_US
-    pub fn on_rescue_break(&mut self) {
-        // Own-TX guard: unreachable by physics on both wire configs (own
-        // data always carries stop-bit highs; the buffered wire's sense pin
-        // reads forced mark during TX), kept because an abort of a draining
-        // ack is the one real damage a spurious call could do.
-        if self.tx.streaming() {
-            return;
+    pub fn sample_rescue(&mut self, low: bool) {
+        let cursor = self.ring.cursor();
+        let now = self.deadline.now();
+        if !low || self.tx.streaming() || cursor != self.rescue_cursor {
+            self.rescue_since = None;
+            self.rescue_cursor = cursor;
+        } else if let Some(t0) = self.rescue_since {
+            if now.wrapping_sub(t0)
+                >= super::RESCUE_LOW_US * <P::Deadline as Deadline>::TICKS_PER_US
+            {
+                self.rescue_since = None;
+                self.on_rescue_break();
+            }
+        } else {
+            self.rescue_since = Some(now);
         }
+    }
+
+    /// sec 9.1 rescue declaration, reached through [`Self::sample_rescue`]:
+    /// the pulse is still holding the line, so the cursor is provably still.
+    fn on_rescue_break(&mut self) {
         // sec 9.1: volatile rate switch -- the config register is untouched.
         self.baud.apply(BaudRate::B500000);
         self.rate = BaudRate::B500000;
         self.tpb = tpb_for::<P>(self.rate);
-        self.clock.restart();
         // Ladder bootstrap (position from the stream): a rescue pulse delivers
         // no start edges, so the cursor is provably still -- the one
         // sanctioned cursor read.
         let cursor = self.ring.cursor();
         self.framer.resync(cursor);
         self.chain.reset();
-        self.tx.abort();
+        self.abort_reply();
         // A dropped pending frame's staged table effect is reclaimed by the
         // dispatcher's auto-revert on the next dispatch.
         self.pending = None;
+        self.unringed = None;
         self.framer_at = None;
         self.chain_at = None;
         self.arm_deadline();

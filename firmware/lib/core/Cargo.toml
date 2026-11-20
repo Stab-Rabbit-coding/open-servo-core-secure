@@ -1,6 +1,6 @@
 [package]
 name    = "osc-servo-core"
-version = "0.0.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 
@@ -15,7 +15,6 @@ bitflags.workspace         = true
 # resolved here). See osc-log.
 defmt = { version = "1", optional = true }
 
-osc-units.workspace     = true
 osc-log.workspace       = true
 osc-protocol.workspace  = true
 control-table.workspace = true
@@ -27,3 +26,9 @@ crc = { workspace = true }
 default = []
 defmt   = ["dep:defmt", "osc-log/defmt", "control-table/defmt"]
 log     = ["osc-log/log"]
+# The experiment image (kernel sec 2.7): OpenLoop alone, the trip and the
+# bus dead-man its protections; the loops and estimators compile out.
+experiment = []
+# The loop-margin stimulus (kernel sec 2.7), a bench instrument on the
+# production kernel: the margin image and the margin tests build it.
+loop-margin = []

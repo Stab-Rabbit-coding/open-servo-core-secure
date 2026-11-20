@@ -1,39 +1,50 @@
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
-use osc_servo_core::{Kernel, RegionStorageRaw, Session, Shared};
+use osc_servo_core::{Kernel, KernelTiming, Session, Shared};
+use osc_servo_drivers::tel::{TelChannel, TelLane};
 
-use crate::control::Ch32ControlIo;
+use crate::providers::crc::Crc;
+use crate::providers::deadline::Deadline;
+use crate::providers::ring::RxRing;
+use crate::providers::tx_wire::TxWire;
+use crate::runtime::control_io::Ch32ControlIo;
+use crate::runtime::registry::V006Providers;
 
 pub static SHARED: Shared = Shared::new();
 
-/// Initialised by `install`; the ADC DMA TC IRQ is PFIC-masked until then.
-pub(crate) static KERNEL: SyncUnsafeCell<MaybeUninit<Kernel<Ch32ControlIo>>> =
+/// TEL burst seam, split once in `install`: the kernel keeps the `TelLane`
+/// half (its `TelStream` sink and the TX lane while a burst streams) - fed
+/// from the PFIC HIGH kernel tick, so kernel ownership keeps the `&mut`
+/// single-context - and the `TelPost` half rides in the bus composite
+/// (`attach_tel`). The main loop reads only `drops`.
+pub(crate) static TEL_CHANNEL: TelChannel = TelChannel::new();
+
+type Ch32Kernel = Kernel<Ch32ControlIo, TelLane<V006Providers>>;
+
+/// Initialised by `install`; the ADC IRQ, the tick, is PFIC-masked until then.
+pub(crate) static KERNEL: SyncUnsafeCell<MaybeUninit<Ch32Kernel>> =
     SyncUnsafeCell::new(MaybeUninit::uninit());
 
 /// The per-servo dispatch session (write staging + the pending-verdict slot).
-/// Borrowed only by the HIGH transport ISRs (USART1 + SysTick), which
-/// materialize it per `Dispatch` call and share PFIC HIGH -- so dispatch,
-/// commit, and revert never overlap (the `HighDispatcher` invariant in
+/// Borrowed only by the transport ISRs (TIM2 + SysTick), which materialize
+/// it per `Dispatch` call and share the bus level - so dispatch, commit,
+/// and revert never overlap (the `BusDispatcher` invariant in
 /// `runtime::isr`). The main loop never reaches in.
 pub(crate) static SESSION: SyncUnsafeCell<MaybeUninit<Session>> =
     SyncUnsafeCell::new(MaybeUninit::uninit());
 
-pub fn install(io: Ch32ControlIo) {
+/// Out of line: inlined, the kernel's build temporaries stay in `__run`'s
+/// frame, under the painted stack, for the program's life.
+#[inline(never)]
+pub fn install(io: Ch32ControlIo, timing: KernelTiming) {
+    let (lane, post) =
+        TEL_CHANNEL.split::<V006Providers>(TxWire, Crc, RxRing, Deadline, &SHARED.table);
     unsafe {
-        (*KERNEL.get()).write(Kernel::new(io));
+        // SAFETY: pre-IRQ (install_irqs runs after) and `Drivers::install`
+        // already built the bus in bringup, so the reach-in is single-context.
+        crate::runtime::Drivers::bus().attach_tel(post);
+        (*KERNEL.get()).write(Kernel::with_tel(io, lane, timing));
         (*SESSION.get()).write(Session::new());
     }
     crate::log::info!("kernel + session installed");
-}
-
-/// `read_volatile` is load-bearing: a plain read gets hoisted out of spin loops
-/// because LLVM can't see the DMA TC ISR writing this asynchronously.
-pub fn read_sample_tick() -> u32 {
-    unsafe {
-        let p = &raw const (*SHARED.table.region_ptr())
-            .telemetry
-            .intermediaries
-            .sample_tick;
-        p.read_volatile()
-    }
 }

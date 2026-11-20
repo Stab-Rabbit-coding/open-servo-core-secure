@@ -5,13 +5,28 @@
 //! osc-client -- every choreography lives in the library. Wire measurement is
 //! the bench `tool-*` binaries' job, not this tool's.
 
+// clap's derive parses every Cmd variant in one generated function, and an allow on the
+// enum does not reach it.
+#![allow(clippy::large_unopt_stack_frames)]
+
+mod boot;
+mod cal;
+mod capture;
 mod descriptor;
+mod ident;
+mod lut;
+mod rig;
+mod state;
+mod sweep;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use osc_client::blocking::Client;
+use osc_client::calib::GearClass;
 use osc_client::mgmt::Uid;
 use osc_client::nusb::NusbPipe;
+use osc_client::record::{self, Diag};
+use osc_client::session::LinkInfo;
 use osc_client::{BaudRate, Id, Inst, Opcode, ResultCode};
 use osc_protocol::build;
 use osc_protocol::table::{
@@ -25,9 +40,8 @@ use osc_protocol::wire::UID_LEN;
     about = "Operate an osc-native servo bus through the osc-adapter."
 )]
 struct Cli {
-    /// Wire baud, or `auto` to find the bus by ENUM probe.
-    #[arg(short, long, global = true, default_value = "auto")]
-    baud: String,
+    #[command(flatten)]
+    bus: rig::Bus,
     /// Servo id for the unicast verbs.
     #[arg(short, long, global = true, default_value_t = 1)]
     id: u8,
@@ -55,6 +69,35 @@ enum Cmd {
     },
     /// Hand the adapter to the WCH bootloader (4348:55e0, wlink-iap).
     Bootloader,
+    /// Install a firmware image on the roster servos in one session with
+    /// each in its bootloader; one reset ends it. Bootloaders with no app
+    /// are left to `osc boot`.
+    Flash(boot::FlashArgs),
+    /// Firmware update one step at a time: check, enter, list, flash, reset.
+    ///
+    /// Preferred procedure for a firmware update:
+    ///
+    ///   1. Rest the robot: every servo goes limp.
+    ///   2. `osc boot check` prints each servo's rate; bring any odd one
+    ///      to the common rate with `osc baud`.
+    ///   3. `osc boot enter --rate R`
+    ///   4. `osc boot check` exits 0: every servo is in its bootloader.
+    ///   5. `osc boot list --rate R`
+    ///   6. `osc boot flash <bin> --rate R <uid>...` for each image.
+    ///   7. `osc boot reset --rate R`
+    ///   8. `osc discover` shows every servo again; confirm the versions
+    ///      (`osc ping`).
+    ///
+    /// For a single image on a fleet of one board type, `osc flash <bin>
+    /// --rate R` runs steps 3 to 8 in one go. Bootloaders with no app
+    /// (fresh boards, a failed install) take the steps above.
+    #[command(verbatim_doc_comment)]
+    Boot {
+        #[command(subcommand)]
+        cmd: boot::BootCmd,
+    },
+    /// One raw tinyboot exchange at --rate, the bus back in osc mode after.
+    Tb(boot::TbArgs),
     /// Enumerate every servo (id + UID) -- all supported bauds, or just --baud.
     Discover,
     /// Rescue-pulse the bus to 0.5 M and enumerate whoever answers.
@@ -92,19 +135,28 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         ids: Vec<u8>,
     },
-    /// Write the fleet RESPONSE_DEADLINE register + the engine's mirror.
-    Deadline {
-        us: u16,
-        /// Servos to write; defaults to --id.
-        #[arg(long, value_delimiter = ',')]
-        ids: Vec<u8>,
-    },
     /// Persist the live config + profiles (protocol sec 9.4; torque must be off).
     Save,
+    /// Bless the set the servo holds now as the identified set (after
+    /// deliberate manual tuning of stamp-covered fields): torque off, the
+    /// plant stamp over the live set, SAVE with --save.
+    Stamp {
+        /// Persist with MGMT SAVE after the stamp.
+        #[arg(long)]
+        save: bool,
+    },
     /// Wipe both saved slots; the servo reboots itself to board defaults.
     Factory,
     /// Ack, then reset once the ack has drained.
-    Reboot,
+    Reboot {
+        /// Reset into the bootloader instead, which then runs at this rate.
+        #[arg(long, value_name = "BAUD")]
+        bootloader: Option<String>,
+    },
+    /// Recover a servo whose data state refuses closed loop: report it,
+    /// FACTORY-reset a CONFIG_CORRUPT one (the only exit from that state)
+    /// and, with --from, restore a saved table, restamp and SAVE.
+    Recover(state::RecoverArgs),
     /// Read or configure a protocol sec 5.2 profile slot.
     Profile {
         #[command(subcommand)]
@@ -112,7 +164,7 @@ enum Cmd {
     },
     /// Broadcast CAL break trains (protocol sec 9.3) with per-servo
     /// convergence readback.
-    Cal {
+    Syntonize {
         /// Trains to send (>= 2 per the sec 9.3 boot guidance).
         #[arg(long, default_value_t = 3)]
         trains: u8,
@@ -128,7 +180,9 @@ enum Cmd {
     },
     /// One ping: model, firmware, the ALERT bit.
     Ping,
-    /// Identity + health from the common register block (protocol sec 5.4).
+    /// Identity + health from the common register block (protocol sec 5.4),
+    /// then the data state, the plant stamp verdict and the servo's own
+    /// health (protocol sec 5.9).
     Status,
     /// Zero the telemetry transport counters (rw-clear).
     Clear {
@@ -194,6 +248,7 @@ enum Cmd {
         field: String,
         /// Value: decimal/0x-hex int, on|off for bool, variant name or number
         /// for enum, hex bytes for a bytes field.
+        #[arg(allow_hyphen_values = true)]
         value: String,
         /// Stage under HOLD; applied by the next COMMIT.
         #[arg(long)]
@@ -204,6 +259,36 @@ enum Cmd {
     },
     /// Read the whole control table, one decoded line per descriptor field.
     Dump,
+    /// Flash the STAT lamp at logged moments, the bench clapper: one CSV
+    /// line per flash on stdout, `flash,t_before,t_after` in Unix seconds
+    /// taken either side of the write.
+    Clapper {
+        /// Number of flashes.
+        #[arg(long, default_value_t = 12)]
+        flashes: u32,
+        /// Flash length in control ticks (20 kHz, so 2000 is 100 ms).
+        #[arg(long, default_value_t = 2000)]
+        ticks: u16,
+    },
+    /// DEPRECATED, to be removed. Identify the motor and synthesize its
+    /// gains: experiments, fits, write-back.
+    Ident(ident::Args),
+    /// DEPRECATED, to be removed. Calibrate: find the end-stops, confirm the angle range, write limits +
+    /// polarity + angle endpoints, then SAVE.
+    Cal(cal::Args),
+    /// DEPRECATED, to be removed. Replay a saved cal sweep_tel.csv offline: classify capture corruption
+    /// and re-run the position-table / motor-rev pipeline without a servo.
+    CalReplay(cal::replay::Args),
+    /// DEPRECATED, to be removed. Plant-capture campaign on one servo and supply: `pilot` measures the
+    /// servo and writes the dataset's envelope.toml, `plan` shows the session
+    /// it sizes, `session` runs it, `check` re-reads a landed capture.
+    Capture(capture::Args),
+    /// DEPRECATED, to be removed. Position table: `build` stitches one from a capture dataset's settled
+    /// rungs and writes the image JSON, `grade` graphs it, `write` puts it on
+    /// the servo, `show` reads the servo's back, `clear` returns it to the
+    /// identity. A write never stamps: closed loop is refused until
+    /// `osc ident`.
+    Lut(lut::Args),
 }
 
 #[derive(Subcommand, Debug)]
@@ -222,6 +307,29 @@ enum ProfileCmd {
     },
 }
 
+impl Cmd {
+    /// The servos a bus verb addresses by id; the broadcast verbs address
+    /// none.
+    fn targets(&self, id: u8) -> Vec<Id> {
+        match self {
+            Cmd::Baud { ids, .. }
+            | Cmd::Syntonize { ids, .. }
+            | Cmd::Clear { ids }
+            | Cmd::Gread { ids, .. }
+            | Cmd::Gwrite { ids, .. } => ids_or_default(ids, id),
+            Cmd::Enum { .. } | Cmd::Assign { .. } | Cmd::Commit => Vec::new(),
+            _ => vec![Id::new(id)],
+        }
+    }
+}
+
+/// `osc` keeps the bus verbs. Identification and calibration move to their
+/// own tool, written from the characterization notebooks, and the notebooks
+/// capture with their own instrument, `osc-lab`.
+fn deprecated(verb: &str) {
+    eprintln!("warning: `osc {verb}` is deprecated and will be removed");
+}
+
 fn on_off(s: &str) -> Result<bool, String> {
     match s {
         "on" => Ok(true),
@@ -237,6 +345,99 @@ fn print_rails((v3v3, v5): (bool, bool)) -> Result<()> {
         if v5 { "on" } else { "off" },
     );
     Ok(())
+}
+
+fn print_info(info: &LinkInfo) {
+    const FEATURES: [(u16, &str); 4] = [
+        (record::FEATURE_INSTRUMENT, "instrument"),
+        (record::FEATURE_RAILS, "rails"),
+        (record::FEATURE_ADAPTER_IAP, "adapter-iap"),
+        (record::FEATURE_TINYBOOT, "tinyboot"),
+    ];
+    let mut names: Vec<String> = FEATURES
+        .iter()
+        .filter(|(bit, _)| info.features & bit != 0)
+        .map(|(_, name)| name.to_string())
+        .collect();
+    let known = FEATURES.iter().fold(0, |m, (bit, _)| m | bit);
+    if info.features & !known != 0 {
+        names.push(format!("{:#06x}", info.features & !known));
+    }
+    if names.is_empty() {
+        names.push("none".into());
+    }
+    let mode = match info.mode {
+        record::MODE_OSC => "osc".to_string(),
+        record::MODE_TINYBOOT => "tinyboot".to_string(),
+        other => format!("{other:#04x}"),
+    };
+    println!("osc-adapter: {} ticks/us", info.ticks_per_us);
+    println!("features: {}", names.join(" "));
+    println!(
+        "limits: request {} B, response {} B, tinyboot payload {} B",
+        info.max_request, info.max_response, info.max_tb_payload
+    );
+    println!(
+        "bus: {mode} at {} bps, response deadline {} us",
+        info.bps, info.deadline_us
+    );
+    print_diag(&info.diag);
+}
+
+fn print_diag(d: &Diag) {
+    const RESETS: [(u8, &str); 6] = [
+        (record::RESET_PIN, "PIN"),
+        (record::RESET_POR, "POR"),
+        (record::RESET_SFT, "SFT"),
+        (record::RESET_IWDG, "IWDG"),
+        (record::RESET_WWDG, "WWDG"),
+        (record::RESET_LPWR, "LPWR"),
+    ];
+    let mut causes: Vec<&str> = RESETS
+        .iter()
+        .filter(|(bit, _)| d.reset & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if causes.is_empty() {
+        causes.push("none");
+    }
+    let phase = match d.phase {
+        record::PHASE_NONE => "none".to_string(),
+        record::PHASE_BRINGUP => "bringup".to_string(),
+        record::PHASE_USB_POLL => "usb-poll".to_string(),
+        record::PHASE_PIPE => "pipe".to_string(),
+        record::PHASE_ADAPTER_REQ => "adapter-req".to_string(),
+        record::PHASE_PUMP => "pump".to_string(),
+        record::PHASE_USB_TX => "usb-tx".to_string(),
+        record::PHASE_HSE_FAIL => "hse-fail".to_string(),
+        other => format!("{other:#04x}"),
+    };
+    println!("uptime: {}", fmt_uptime(d.uptime_ms));
+    println!("resets since power-on: {}", d.resets);
+    println!(
+        "last reset: {} at phase {phase}; hse failures {}",
+        causes.join("+"),
+        d.hse_fail
+    );
+    if d.crash_seq == 0 {
+        println!("crash record: none");
+    } else {
+        println!(
+            "crash record: #{} mcause {:#010x} mepc {:#010x} mtval {:#010x}",
+            d.crash_seq, d.mcause, d.mepc, d.mtval
+        );
+    }
+}
+
+/// `1h02m13s`, leading zero units dropped (`5s`, `2m05s`).
+fn fmt_uptime(ms: u32) -> String {
+    let s = ms / 1_000;
+    let (h, m, s) = (s / 3_600, s / 60 % 60, s % 60);
+    match (h, m) {
+        (0, 0) => format!("{s}s"),
+        (0, _) => format!("{m}m{s:02}s"),
+        _ => format!("{h}h{m:02}m{s:02}s"),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -258,7 +459,7 @@ fn parse_hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-fn parse_u16(s: &str) -> Result<u16> {
+pub(crate) fn parse_u16(s: &str) -> Result<u16> {
     Ok(match s.strip_prefix("0x") {
         Some(h) => u16::from_str_radix(h, 16)?,
         None => s.parse()?,
@@ -313,22 +514,13 @@ fn connect() -> Result<Client<NusbPipe>> {
     Ok(Client::connect(NusbPipe::open()?)?)
 }
 
-/// Connect for the bus verbs: fixed baud, or `auto` via ENUM probe.
 fn connect_bus(cli: &Cli) -> Result<Client<NusbPipe>> {
-    let mut c = connect()?;
-    match cli.baud.as_str() {
-        "auto" => match c.find_bus_baud()? {
-            Some(rate) => println!("bus at {} baud", rate.as_hz()),
-            None => bail!("no servo bus found at any supported baud"),
-        },
-        s => c.host_baud(parse_rate(s)?)?,
-    }
-    Ok(c)
+    rig::connect(&cli.bus, &cli.cmd.targets(cli.id))
 }
 
 fn discover(cli: &Cli) -> Result<()> {
     let mut c = connect()?;
-    let rates: Vec<BaudRate> = match cli.baud.as_str() {
+    let rates: Vec<BaudRate> = match cli.bus.baud.as_str() {
         "auto" => vec![
             BaudRate::B500000,
             BaudRate::B1000000,
@@ -404,7 +596,16 @@ fn migrate(c: &mut Client<NusbPipe>, ids: &[Id], rate: BaudRate) -> Result<()> {
     Ok(())
 }
 
+/// SAVE, refused on a CONFIG_CORRUPT servo: it would bless board defaults
+/// as this servo's config, which only `osc recover` may decide.
 fn save(c: &mut Client<NusbPipe>, id: Id) -> Result<()> {
+    let s = state::check(c, id)?;
+    if s.flags & osc_client::data_state::CONFIG_CORRUPT != 0 {
+        bail!(
+            "id {}: saved settings are unreadable and board defaults are running; run osc recover",
+            id.as_byte()
+        );
+    }
     match c.save(id) {
         Ok(()) => {
             println!("id {}: saved", id.as_byte());
@@ -469,7 +670,40 @@ fn status(c: &mut Client<NusbPipe>, id: Id) -> Result<()> {
         "      fault {:#04x}  dirty {}  trim {}  crc_fail {}  framing_drop {}",
         h.fault_flags, h.config_dirty, h.trim_steps, h.crc_fail_count, h.framing_drop_count,
     );
+    let d = state::descriptor(c, id)?;
+    state::report(c, id, &d)?;
+    match c.gear_class(id, &d) {
+        Ok(g) => println!("      gears {}", g.name()),
+        Err(osc_client::Error::Descriptor(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    println!("{}", health_line(c, id, &d)?);
     Ok(())
+}
+
+/// The health block (protocol sec 5.9) in one line. Firmware without it
+/// reads 0 there: the block sits in bytes that were reserved.
+fn health_line<P: osc_client::pipe::Pipe>(
+    c: &mut Client<P>,
+    id: Id,
+    d: &descriptor::Descriptor,
+) -> Result<String> {
+    let mut read = |name: &str| -> Result<u16> {
+        let f = descriptor::field(d, name)?;
+        let b = c.read(id, f.addr, 2)?;
+        match b.as_slice() {
+            [lo, hi, ..] => Ok(u16::from_le_bytes([*lo, *hi])),
+            _ => bail!("{name} read returned {} B, expected 2", b.len()),
+        }
+    };
+    let load = read("tick_load_mean_q15")? as f64 * 100.0 / 32768.0;
+    Ok(format!(
+        "      load  {load:.1}%  over_period {}  lost {}  rows_dropped {}  stack_free {} B",
+        read("tick_over_count")?,
+        read("tick_lost_count")?,
+        read("tel_drop_count")?,
+        read("stack_free_min")?,
+    ))
 }
 
 fn profile(c: &mut Client<NusbPipe>, id: Id, cmd: &ProfileCmd) -> Result<()> {
@@ -521,8 +755,8 @@ fn profile(c: &mut Client<NusbPipe>, id: Id, cmd: &ProfileCmd) -> Result<()> {
 
 /// Identity read (protocol sec 5.4 front) plus descriptor selection. Prints
 /// any advisory note at the call site so the codec stays print-free.
-fn select_descriptor<'a>(
-    c: &mut Client<NusbPipe>,
+pub(crate) fn select_descriptor<'a, P: osc_client::pipe::Pipe>(
+    c: &mut Client<P>,
     id: Id,
     reg: &'a descriptor::Registry,
 ) -> Result<&'a descriptor::Descriptor> {
@@ -531,18 +765,16 @@ fn select_descriptor<'a>(
         bail!("identity read returned {} B, expected 4", b.len());
     }
     let model = u16::from_le_bytes([b[0], b[1]]);
-    let fw = b[2];
-    let (d, note) = reg.select(model, fw)?;
+    let fw = u16::from_le_bytes([b[2], b[3]]);
+    let (d, note) = descriptor::select(reg, model, fw)?;
     if let Some(note) = note {
         println!("{note}");
     }
     Ok(d)
 }
 
-fn get(c: &mut Client<NusbPipe>, id: Id, name: &str) -> Result<()> {
-    let reg = descriptor::Registry::load()?;
-    let d = select_descriptor(c, id, &reg)?;
-    let f = d.field(name)?;
+fn get(c: &mut Client<NusbPipe>, id: Id, d: &descriptor::Descriptor, name: &str) -> Result<()> {
+    let f = descriptor::field(d, name)?;
     let bytes = c.read(id, f.addr, f.width)?;
     println!(
         "{} = {}  (addr {:#06x}, {} B, raw {})",
@@ -555,17 +787,18 @@ fn get(c: &mut Client<NusbPipe>, id: Id, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A hand edit; a stamp-covered field leaves the set marked stale until
+/// `osc stamp` or an ident refit blesses it (`state::covered_note`).
 fn set(
     c: &mut Client<NusbPipe>,
     id: Id,
+    d: &descriptor::Descriptor,
     name: &str,
     value: &str,
     hold: bool,
     noreply: bool,
 ) -> Result<()> {
-    let reg = descriptor::Registry::load()?;
-    let d = select_descriptor(c, id, &reg)?;
-    let f = d.field(name)?;
+    let f = descriptor::field(d, name)?;
     let data = descriptor::encode(f, value)?;
     if hold {
         c.write_hold(id, f.addr, &data)?;
@@ -580,12 +813,44 @@ fn set(
         c.write(id, f.addr, &data)?;
         println!("wrote {} = {value} at {:#06x}", f.name, f.addr);
     }
+    state::covered_note(d, f);
     Ok(())
 }
 
-fn dump(c: &mut Client<NusbPipe>, id: Id) -> Result<()> {
-    let reg = descriptor::Registry::load()?;
-    let d = select_descriptor(c, id, &reg)?;
+/// The gaps between flashes, irregular on purpose so the flashes in a
+/// recording match the log in one way only; none shorter than a flash.
+const CLAPPER_GAPS_MS: [u64; 8] = [900, 1700, 800, 2300, 1200, 3100, 1000, 1500];
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn clapper(
+    c: &mut Client<NusbPipe>,
+    id: Id,
+    d: &descriptor::Descriptor,
+    flashes: u32,
+    ticks: u16,
+) -> Result<()> {
+    let f = descriptor::field(d, "stat_flash_ticks")?;
+    let data = ticks.to_le_bytes();
+    println!("flash,t_before,t_after");
+    for k in 0..flashes {
+        std::thread::sleep(std::time::Duration::from_millis(
+            CLAPPER_GAPS_MS[k as usize % CLAPPER_GAPS_MS.len()],
+        ));
+        let before = unix_now();
+        c.write(id, f.addr, &data)?;
+        let after = unix_now();
+        println!("{k},{before:.4},{after:.4}");
+    }
+    Ok(())
+}
+
+fn dump(c: &mut Client<NusbPipe>, id: Id, d: &descriptor::Descriptor) -> Result<()> {
     // A status frame carries <= 252 payload bytes; walk the table in chunks
     // and slice each field's bytes out of the flat image.
     const CHUNK: u16 = 252;
@@ -600,12 +865,15 @@ fn dump(c: &mut Client<NusbPipe>, id: Id) -> Result<()> {
     }
     for f in &d.fields {
         let bytes = &table[f.addr as usize..f.end() as usize];
+        let mut value = descriptor::decode(f, bytes)?;
+        if let ("gear_class", [b]) = (f.name.as_str(), bytes) {
+            value = format!("{value} ({})", GearClass::from_byte(*b).name());
+        }
         println!(
-            "{:#06x}  {:<28} {:<2}  {}",
+            "{:#06x}  {:<28} {:<2}  {value}",
             f.addr,
             f.name,
             f.access.as_str(),
-            descriptor::decode(f, bytes)?,
         );
     }
     Ok(())
@@ -617,11 +885,7 @@ fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Info => {
             let c = connect()?;
-            let info = c.info();
-            println!(
-                "osc-adapter: link v{}, {} ticks/us",
-                info.version, info.ticks_per_us
-            );
+            print_info(&c.info());
             Ok(())
         }
         Cmd::Rails => print_rails(connect()?.rails()?),
@@ -633,6 +897,9 @@ fn main() -> Result<()> {
             println!("adapter resets to the WCH bootloader (4348:55e0); use wlink-iap");
             Ok(())
         }
+        Cmd::Flash(a) => boot::flash(a, &cli.bus),
+        Cmd::Boot { cmd } => boot::boot(cmd, &cli.bus),
+        Cmd::Tb(a) => boot::tb(a),
         Cmd::Discover => discover(&cli),
         Cmd::Rescue { set_baud, save } => rescue(set_baud.as_deref(), *save),
         Cmd::Enum { prefix_len, prefix } => {
@@ -649,23 +916,11 @@ fn main() -> Result<()> {
             &ids_or_default(ids, cli.id),
             parse_rate(to)?,
         ),
-        Cmd::Deadline { us, ids } => {
-            let mut c = connect_bus(&cli)?;
-            for &id in &ids_or_default(ids, cli.id) {
-                c.write(
-                    id,
-                    osc_protocol::table::RESPONSE_DEADLINE_US,
-                    &us.to_le_bytes(),
-                )?;
-                println!("id {}: response_deadline_us = {us}", id.as_byte());
-            }
-            c.set_response_deadline(*us)?;
-            println!("engine mirror set");
-            Ok(())
-        }
         Cmd::Save => save(&mut connect_bus(&cli)?, id),
+        Cmd::Stamp { save } => state::stamp(&mut connect_bus(&cli)?, id, *save),
         Cmd::Factory => {
             let mut c = connect_bus(&cli)?;
+            state::check(&mut c, id)?;
             c.factory(id)?;
             println!(
                 "id {}: slots wiped, rebooting to board defaults",
@@ -673,22 +928,38 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Reboot => {
+        Cmd::Recover(args) => state::recover(args, cli.bus.clone(), cli.id),
+        Cmd::Reboot { bootloader } => {
             let mut c = connect_bus(&cli)?;
-            c.reboot(id)?;
-            println!(
-                "id {}: rebooting (back at its configured baud)",
-                id.as_byte()
-            );
+            state::check(&mut c, id)?;
+            match bootloader {
+                None => {
+                    c.reboot(id)?;
+                    println!(
+                        "id {}: rebooting (back at its configured baud)",
+                        id.as_byte()
+                    );
+                }
+                Some(rate) => {
+                    let rate = parse_rate(rate)?;
+                    c.reboot_bootloader(id, rate)?;
+                    println!(
+                        "id {}: rebooting into the bootloader at {} baud",
+                        id.as_byte(),
+                        rate.as_hz()
+                    );
+                }
+            }
             Ok(())
         }
-        Cmd::Cal {
+        Cmd::Syntonize {
             trains,
             gap_us,
             gaps,
             ids,
         } => {
             let mut c = connect_bus(&cli)?;
+            state::check_each(&mut c, &ids_or_default(ids, cli.id))?;
             let traces = c.cal_verify(&ids_or_default(ids, cli.id), *trains, *gap_us, *gaps)?;
             println!("{trains} train(s) x {gaps} gaps x {gap_us} us");
             for t in traces {
@@ -712,11 +983,17 @@ fn main() -> Result<()> {
                 p.fw,
                 if p.alert { "  ALERT" } else { "" },
             );
+            if p.alert {
+                state::alert(&mut c, id)?;
+            } else {
+                state::check(&mut c, id)?;
+            }
             Ok(())
         }
         Cmd::Status => status(&mut connect_bus(&cli)?, id),
         Cmd::Clear { ids } => {
             let mut c = connect_bus(&cli)?;
+            state::check_each(&mut c, &ids_or_default(ids, cli.id))?;
             for &id in &ids_or_default(ids, cli.id) {
                 c.clear_counters(id)?;
                 println!("id {}: counters cleared", id.as_byte());
@@ -725,6 +1002,7 @@ fn main() -> Result<()> {
         }
         Cmd::Read { addr, len } => {
             let mut c = connect_bus(&cli)?;
+            state::check(&mut c, id)?;
             let addr = parse_u16(addr)?;
             let data = c.read(id, addr, *len)?;
             for (i, chunk) in data.chunks(16).enumerate() {
@@ -739,6 +1017,7 @@ fn main() -> Result<()> {
             noreply,
         } => {
             let mut c = connect_bus(&cli)?;
+            state::check(&mut c, id)?;
             let data = parse_hex(data)?;
             let a = parse_u16(addr)?;
             if *hold {
@@ -756,6 +1035,7 @@ fn main() -> Result<()> {
         Cmd::Gread { addr, count, ids } => {
             let mut c = connect_bus(&cli)?;
             let ids = ids_or_default(ids, cli.id);
+            state::check_each(&mut c, &ids)?;
             let chain = c.gread(&ids, parse_u16(addr)?, *count)?;
             for s in &chain.statuses {
                 println!(
@@ -766,6 +1046,9 @@ fn main() -> Result<()> {
                     if s.alert { " ALERT" } else { "" },
                     hex(&s.payload),
                 );
+            }
+            for s in chain.statuses.iter().filter(|s| s.alert) {
+                state::alert(&mut c, Id::new(s.id))?;
             }
             match chain.timeout_slot {
                 Some(slot) => bail!("chain timed out at slot {slot}"),
@@ -780,6 +1063,7 @@ fn main() -> Result<()> {
         } => {
             let mut c = connect_bus(&cli)?;
             let ids = ids_or_default(ids, cli.id);
+            state::check_each(&mut c, &ids)?;
             let data = parse_hex(data)?;
             let pairs: Vec<(Id, &[u8])> = ids.iter().map(|&id| (id, data.as_slice())).collect();
             let a = parse_u16(addr)?;
@@ -805,14 +1089,96 @@ fn main() -> Result<()> {
             println!("committed");
             Ok(())
         }
-        Cmd::Profile { cmd } => profile(&mut connect_bus(&cli)?, id, cmd),
-        Cmd::Get { field } => get(&mut connect_bus(&cli)?, id, field),
+        Cmd::Profile { cmd } => {
+            let mut c = connect_bus(&cli)?;
+            state::check(&mut c, id)?;
+            profile(&mut c, id, cmd)
+        }
+        Cmd::Get { field } => {
+            let mut c = connect_bus(&cli)?;
+            let d = state::descriptor(&mut c, id)?;
+            state::warn(&mut c, id, &d)?;
+            get(&mut c, id, &d, field)
+        }
         Cmd::Set {
             field,
             value,
             hold,
             noreply,
-        } => set(&mut connect_bus(&cli)?, id, field, value, *hold, *noreply),
-        Cmd::Dump => dump(&mut connect_bus(&cli)?, id),
+        } => {
+            let mut c = connect_bus(&cli)?;
+            let d = state::descriptor(&mut c, id)?;
+            state::warn(&mut c, id, &d)?;
+            set(&mut c, id, &d, field, value, *hold, *noreply)
+        }
+        Cmd::Dump => {
+            let mut c = connect_bus(&cli)?;
+            let d = state::descriptor(&mut c, id)?;
+            state::warn(&mut c, id, &d)?;
+            dump(&mut c, id, &d)
+        }
+        Cmd::Clapper { flashes, ticks } => {
+            let mut c = connect_bus(&cli)?;
+            let d = state::descriptor(&mut c, id)?;
+            state::warn(&mut c, id, &d)?;
+            clapper(&mut c, id, &d, *flashes, *ticks)
+        }
+        Cmd::Ident(args) => {
+            deprecated("ident");
+            ident::run(args, cli.bus.clone(), cli.id)
+        }
+        Cmd::Cal(args) => {
+            deprecated("cal");
+            cal::run(args, cli.bus.clone(), cli.id)
+        }
+        Cmd::CalReplay(a) => {
+            deprecated("cal-replay");
+            cal::replay::run(a)
+        }
+        Cmd::Capture(args) => {
+            deprecated("capture");
+            capture::run(args, cli.bus.clone(), cli.id)
+        }
+        Cmd::Lut(args) => {
+            deprecated("lut");
+            lut::run(args, cli.bus.clone(), cli.id)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fmt_uptime, health_line};
+
+    #[test]
+    fn uptime_drops_leading_zero_units() {
+        assert_eq!(fmt_uptime(999), "0s");
+        assert_eq!(fmt_uptime(5_400), "5s");
+        assert_eq!(fmt_uptime(125_000), "2m05s");
+        assert_eq!(fmt_uptime(3_733_000), "1h02m13s");
+        assert_eq!(fmt_uptime(u32::MAX), "1193h02m47s");
+    }
+
+    #[test]
+    fn status_prints_the_health_block() {
+        let (mut c, id) = crate::rig::servo::bench::table(1961);
+        let d = crate::state::descriptor(&mut c, id).unwrap();
+        assert_eq!(
+            health_line(&mut c, id, &d).unwrap(),
+            "      load  0.0%  over_period 0  lost 0  rows_dropped 0  stack_free 0 B",
+            "a fresh table reads zeros"
+        );
+        c.pipe_mut().sim_mut().servo_table_mut(0, |t| {
+            let h = &mut t.telemetry_ext.health;
+            h.tick_load_mean_q15 = 11928;
+            h.tick_over_count = 12;
+            h.tick_lost_count = 3;
+            h.tel_drop_count = 27;
+            h.stack_free_min = 1516;
+        });
+        assert_eq!(
+            health_line(&mut c, id, &d).unwrap(),
+            "      load  36.4%  over_period 12  lost 3  rows_dropped 27  stack_free 1516 B"
+        );
     }
 }

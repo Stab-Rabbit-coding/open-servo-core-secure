@@ -1,39 +1,74 @@
 #![no_std]
 #![feature(sync_unsafe_cell)]
+#![feature(fn_align)]
+// Ord::clamp asserts min <= max, a panic path wherever the bounds are not
+// provably ordered; firmware clamps are max().min() (check-no-panic.sh).
+#![allow(clippy::manual_clamp)]
 
+pub mod adc;
+pub mod budget;
+pub mod data_state;
 pub mod debug;
+pub mod estimator;
 pub mod kernel;
 
-/// Firmware version stamped into the identity block (protocol sec 5.4). A
-/// table-ABI counter, bumped when a client-visible table ABI change lands;
-/// 0 is reserved for an unversioned dev build.
-pub const FIRMWARE_VERSION: u8 = 1;
+/// Firmware version stamped into the identity block (protocol sec 5.4): this
+/// crate's Cargo version packed 5.5.6, the number the bootloader reports too.
+pub const FIRMWARE_VERSION: u16 = osc_protocol::version::pack_version(
+    parse_decimal(env!("CARGO_PKG_VERSION_MAJOR")),
+    parse_decimal(env!("CARGO_PKG_VERSION_MINOR")),
+    parse_decimal(env!("CARGO_PKG_VERSION_PATCH")),
+);
+
+const _: () = assert!(
+    parse_decimal(env!("CARGO_PKG_VERSION_MAJOR")) < 32
+        && parse_decimal(env!("CARGO_PKG_VERSION_MINOR")) < 32
+        && parse_decimal(env!("CARGO_PKG_VERSION_PATCH")) < 64,
+    "Cargo version exceeds the 5.5.6 packing"
+);
+
+const fn parse_decimal(s: &str) -> u8 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut v: u8 = 0;
+    while i < b.len() {
+        v = v * 10 + (b[i] - b'0');
+        i += 1;
+    }
+    v
+}
 
 pub mod log;
+pub mod math;
 pub mod persist;
+pub mod pos_lut;
 pub mod regions;
-pub mod sample;
+pub mod sensor_frame;
 pub mod services;
 pub mod shared;
+pub mod stamp;
+pub mod tel;
 pub mod traits;
 
 pub use control_table::{
     Error, Region, RegionStorage, RegionStorageRaw, StagedWrites, ValidationKind,
 };
-pub use kernel::{Kernel, KernelState};
+pub use data_state::ImageState;
+pub use kernel::{Kernel, KernelTiming};
 pub use persist::{ConfigStore, StoreError};
-pub use regions::config::{BaudRate, ConfigDefaults};
+pub use regions::config::{BaudRate, ConfigDefaults, CurrentDefaults};
 pub use regions::{
-    BemfCalibBlock, BootMode, CalibRegs, ConfigCalibration, ConfigCommon, ConfigControlPosition,
-    ConfigPosLimits, ConfigRegs, ConfigStall, ConfigThermal, ControlLifecycle, ControlRegs,
-    ControlStreaming, ControlSystem, ControlTable, ControlTableCell, Mode, PotLutBlock,
-    StallResponse, TelemetryCommon, TelemetryConverted, TelemetryIntermediaries, TelemetryMode,
-    TelemetryRaw, TelemetryRegs,
+    CalibKinematics, CalibMotor, CalibMotorExt, CalibPot, CalibRegs, CalibSense, CalibSenseExt,
+    CalibStamp, CalibThermal, ConfigCommon, ConfigFaultCfg, ConfigFusion, ConfigLimits,
+    ConfigLoopCurrent, ConfigLoopPosition, ConfigLoopVelocity, ConfigPosPhys, ConfigPosSoft,
+    ConfigRegs, ConfigThermal, ControlLifecycle, ControlRegs, ControlTable, ControlTableCell, Mode,
+    StallResponse, TelemetryCommon, TelemetryEstimates, TelemetryMode, TelemetryRefs,
+    TelemetryRegs, TelemetryTick,
 };
-pub use sample::{ConversionVariables, RawSamples, Sample};
+pub use sensor_frame::{Frame, SensorFrame};
 pub use services::bus::{Dispatcher, Session};
 pub use shared::Shared;
 pub use traits::{
-    Capabilities, ControlIo, DecayMode, Dispatch, Dispatched, Motor, MotorCmd, Reply, Request,
-    RequestCtx, SendError, Sensors, Status,
+    Capabilities, ControlIo, Dispatch, Dispatched, Motor, MotorCmd, Reboot, Reply, Request,
+    RequestCtx, SendError, Sensors, Status, TelStream,
 };

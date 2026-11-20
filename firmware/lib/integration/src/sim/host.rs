@@ -4,19 +4,19 @@
 //!
 //! The provider shapes mirror `providers.rs` (shared `Rc` state the `Sim`
 //! also holds): the host ring is fed by the same wire deliveries the servo
-//! rings get (minus the host's own TX -- the no-echo contract), the
-//! deadline schedules `HostCompare` events, and the TX wire schedules the
-//! same `WireBreak`/`WireData` events a scripted `host_send` would.
+//! rings get (minus the host's own TX - the no-echo contract), every break
+//! it hears is marked [`HOST_MARK_LAG_US`] after the break ends (the
+//! adapter's break detector and its service), the deadline schedules
+//! `HostCompare` events, and the TX wire schedules the same
+//! `WireBreak`/`WireData` events a scripted `host_send` would.
 
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::vec::Vec;
 
 use osc_host::engine::{HostBus, Terminal};
-use osc_host::traits::{Deadline, EdgeCapture, Providers, RxRing, TxWire, UsartBaud};
+use osc_host::traits::{Deadline, Providers, RxRing, TxWire, UsartBaud};
 use osc_protocol::wire::BaudRate;
-use osc_servo_drivers::bus::RESCUE_LOW_US;
 
 use super::core::{Core, Event, TICKS_PER_US, Talker, break_ticks, byte_ticks};
 use super::providers::{BaudState, DeadlineState, RingState};
@@ -31,21 +31,76 @@ pub enum HostEvent {
         payload: Vec<u8>,
     },
     Done(Terminal),
-    /// An instrument wire op closed (raw send / burst / pulse).
+    /// An instrument wire op closed (raw send / burst / pulse). Never
+    /// produced without `bench`.
     WireDone {
         tick: u32,
     },
 }
 
-pub struct HostRing(pub Rc<RingState>);
+/// Break end to the mark's publication at budget: the adapter's break
+/// detector latches at the end of the low span and its vector, above the
+/// engine's class, reads the ring count. The silicon body measures 0.6 us
+/// at most; a mark is exact while it lands before the next byte (one
+/// byte-time, 3.3 us at 3M).
+pub const HOST_MARK_LAG_US: u64 = 3;
+
+/// The adapter's mark buffer depth (`RxRing::marks`).
+const MARKS_LEN: usize = 256;
+
+pub struct MarkState {
+    marks: UnsafeCell<[u32; MARKS_LEN]>,
+    marked: Cell<u32>,
+    /// A detector latch awaiting service: a second break inside it
+    /// coalesces into the same mark.
+    pending: Cell<bool>,
+}
+
+impl MarkState {
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self {
+            marks: UnsafeCell::new([0; MARKS_LEN]),
+            marked: Cell::new(0),
+            pending: Cell::new(false),
+        })
+    }
+
+    /// The detector latched; false if a service was already pending.
+    pub fn latch(&self) -> bool {
+        !self.pending.replace(true)
+    }
+
+    /// The service: mark the last ringed byte, as the chip's vector does
+    /// from the DMA count.
+    pub fn publish(&self, ring: &RingState) {
+        self.pending.set(false);
+        let n = self.marked.get();
+        // SAFETY: single-threaded harness; never mutated while a `marks()`
+        // slice is live (the Sim publishes only between engine calls).
+        unsafe { (*self.marks.get())[n as usize % MARKS_LEN] = ring.written().wrapping_sub(1) };
+        self.marked.set(n.wrapping_add(1));
+    }
+}
+
+pub struct HostRing(pub Rc<RingState>, pub Rc<MarkState>);
 
 impl RxRing for HostRing {
     fn bytes(&self) -> &[u8] {
         self.0.bytes()
     }
 
-    fn cursor(&self) -> u16 {
-        self.0.cursor()
+    fn written(&self) -> u32 {
+        self.0.written()
+    }
+
+    fn marks(&self) -> &[u32] {
+        // SAFETY: see `MarkState::publish`.
+        let arr: &[u32; MARKS_LEN] = unsafe { &*self.1.marks.get() };
+        &arr[..]
+    }
+
+    fn marked(&self) -> u32 {
+        self.1.marked.get()
     }
 }
 
@@ -131,11 +186,14 @@ impl TxWire for HostWire {
 
     fn send(&mut self, span: &[u8]) {
         // The break heads this frame -- one record, no bare flush.
-        self.bare_break.take();
+        let framed = self.bare_break.take().is_some();
         let baud = self.baud.current();
         let bt = byte_ticks(baud);
         let mut c = self.core.borrow_mut();
         let start = self.tx_cursor.get().max(c.now());
+        if !framed {
+            c.last_breakless_tx = Some(start + span.len() as u64 * bt);
+        }
         for (k, &b) in span.iter().enumerate() {
             c.schedule(
                 Event::WireData {
@@ -154,9 +212,11 @@ impl TxWire for HostWire {
     }
 
     fn hold_low(&mut self) {
-        let now = self.core.borrow().now();
-        // Width is unknowable here (instrument pulses are arbitrary); the
-        // sampler verdict waits for release.
+        let mut c = self.core.borrow_mut();
+        let now = c.now();
+        // Width is unknowable here (instrument pulses are arbitrary): the
+        // hold stays open, the samplers pumping, until release.
+        c.hold_low(now, u64::MAX);
         self.low_since.set(Some(now));
     }
 
@@ -169,17 +229,10 @@ impl TxWire for HostWire {
         }
         if let Some(start) = self.low_since.take() {
             c.claim(Talker::Host, start, now);
+            c.release_low(now);
+            // The pulse's one break wake is modeled at the rise, its 0x00 in
+            // the sim's wake order.
             let baud = self.baud.current();
-            // Sampler model, mirroring `hold_line_low_at`: the fleet
-            // declares only if the frozen-ring threshold tick fell inside
-            // the held span. The wire stays host-claimed to the rise, so
-            // declare-at-release observes like the mid-pulse declaration
-            // (FIFO tie: declare lands before the rise's break wake, as on
-            // silicon). Then the rising edge is where break detectors latch.
-            let declare = start + byte_ticks(baud) + RESCUE_LOW_US as u64 * TICKS_PER_US;
-            if declare < now {
-                c.schedule(Event::RescueDeclare, now);
-            }
             c.schedule(Event::StrayBreak { baud }, now);
         }
     }
@@ -209,21 +262,28 @@ impl UsartBaud for HostUsart {
     }
 }
 
-/// Edge capture has no sim model (hardware-stamped pin transitions are
-/// silicon-only by nature): drains answer empty, honestly.
-pub struct HostEdges;
+/// The instrument side of the sim host.
+#[cfg(feature = "bench")]
+pub mod bench {
+    use osc_host::traits::EdgeCapture;
 
-impl EdgeCapture for HostEdges {
-    fn drain_falls(&mut self, _buf: &mut [u16]) -> usize {
-        0
+    /// Edge capture has no sim model (hardware-stamped pin transitions are
+    /// silicon-only by nature): drains answer empty, honestly.
+    #[derive(Default)]
+    pub struct HostEdges;
+
+    impl EdgeCapture for HostEdges {
+        fn drain_falls(&mut self, _buf: &mut [u16]) -> usize {
+            0
+        }
+        fn drain_rises(&mut self, _buf: &mut [u16]) -> usize {
+            0
+        }
+        fn overflow(&self) -> bool {
+            false
+        }
+        fn reset(&mut self) {}
     }
-    fn drain_rises(&mut self, _buf: &mut [u16]) -> usize {
-        0
-    }
-    fn overflow(&self) -> bool {
-        false
-    }
-    fn reset(&mut self) {}
 }
 
 /// Provider bundle for the sim-hosted engine.
@@ -234,7 +294,8 @@ impl Providers for SimHostProviders {
     type Deadline = HostDeadline;
     type Tx = HostWire;
     type Baud = HostUsart;
-    type Edges = HostEdges;
+    #[cfg(feature = "bench")]
+    type Edges = bench::HostEdges;
 }
 
 /// The attached host: the production engine plus the shared handles the
@@ -242,6 +303,10 @@ impl Providers for SimHostProviders {
 pub struct SimHost {
     pub bus: HostBus<SimHostProviders>,
     pub ring: Rc<RingState>,
+    pub marks: Rc<MarkState>,
+    /// Break end to mark, ticks ([`HOST_MARK_LAG_US`] unless a scenario
+    /// overrides it).
+    pub mark_lag: u64,
     pub deadline: Rc<DeadlineState>,
     pub baud: Rc<BaudState>,
     pub events: Vec<HostEvent>,
@@ -250,10 +315,11 @@ pub struct SimHost {
 impl SimHost {
     pub fn build(core: &Rc<RefCell<Core>>, rate: BaudRate) -> Self {
         let ring = RingState::new();
+        let marks = MarkState::new();
         let deadline = DeadlineState::new();
         let baud = BaudState::new(rate);
         let bus = HostBus::new(
-            HostRing(ring.clone()),
+            HostRing(ring.clone(), marks.clone()),
             HostDeadline {
                 core: core.clone(),
                 state: deadline.clone(),
@@ -266,12 +332,13 @@ impl SimHost {
                 low_since: Cell::new(None),
             },
             HostUsart(baud.clone()),
-            HostEdges,
             rate,
         );
         Self {
             bus,
             ring,
+            marks,
+            mark_lag: HOST_MARK_LAG_US * TICKS_PER_US,
             deadline,
             baud,
             events: Vec::new(),

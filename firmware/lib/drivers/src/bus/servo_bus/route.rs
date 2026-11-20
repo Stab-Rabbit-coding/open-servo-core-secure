@@ -1,15 +1,16 @@
 //! The dispatch spine: resolver -> frame routing -> CRC verdict -> reply sequencing.
 
+use osc_protocol::frame::Header;
 use osc_protocol::wire::{ENUM_REPLY_SLOTS, ResultCode};
 use osc_servo_core::traits::{Dispatch, Dispatched, Request, RequestCtx};
 
 use super::super::chain::ChainOut;
-use super::super::decode::{Decoded, decode};
+use super::super::decode::{Decoded, Slot, decode, foreign};
 use super::super::frame_view;
-use super::super::framer::{FrameSpan, FramerOut};
+use super::super::framer::{FrameNeeds, FrameSpan, FramerOut};
 use super::reply::ReplyHandle;
 use super::{Pending, ServoBus};
-use crate::traits::bus::{Deadline, Providers, RxRing, tick_reached};
+use crate::traits::bus::{BreakStamps, Deadline, Providers, RxRing, tick_reached};
 
 impl<P: Providers> ServoBus<P> {
     /// Drive the resolver as far as ring DATA allows (data-first from the
@@ -18,12 +19,47 @@ impl<P: Providers> ServoBus<P> {
     /// wake -- past the bound the framer
     /// slot re-arms at `now` (pend-on-past re-entry) so the other mux slots
     /// are never starved by a deep backlog.
+    #[rustc_align(4)]
     pub(super) fn drive_framer<D: Dispatch>(&mut self, d: &mut D) {
         for _ in 0..super::FRAMES_PER_WAKE {
+            // Own TX holds the one CRC engine until its release, and a frame
+            // the ladder hands over may need a verdict: the ladder waits, and
+            // the release re-drives it (`on_tx_complete`). Checked per frame:
+            // the frame before may have just started a reply or lent the
+            // lane to a TEL burst.
+            if self.tx.streaming() {
+                self.framer_at = None;
+                return;
+            }
+            // Cursor before clock: a preemption between the reads then
+            // projects from a late `now`, never an early one (DES pin
+            // `preempted_projection_never_aims_early`).
+            let cursor = self.ring.cursor();
             let now = self.deadline.now();
+            let id = self.id;
+            let idle = !self.chain.active() && !self.tx.busy();
+            let waiting = self.chain.waiting();
+            // A frame that can change nothing until it is whole needs no
+            // milestone: another servo's plain op, or a status nobody waits
+            // on (sec 6). The next wake resolves it from the ring. A status
+            // a chain slot waits on needs only its end: the snoop consumes
+            // nothing ahead of it.
+            let needs = move |h: &Header| {
+                if h.inst.is_status() {
+                    if waiting {
+                        FrameNeeds::End
+                    } else {
+                        FrameNeeds::Nothing
+                    }
+                } else if idle && foreign(h, id) {
+                    FrameNeeds::Nothing
+                } else {
+                    FrameNeeds::Covered
+                }
+            };
             let out = self
                 .framer
-                .resolve(self.ring.bytes(), self.ring.cursor(), now, self.tpb);
+                .resolve(self.ring.bytes(), cursor, now, self.tpb, needs);
             match out {
                 FramerOut::None => {
                     self.framer_at = None;
@@ -46,6 +82,7 @@ impl<P: Providers> ServoBus<P> {
         self.framer_at = Some(self.deadline.now());
     }
 
+    #[rustc_align(4)]
     pub(super) fn route_chain(&mut self, mut out: ChainOut) {
         loop {
             match out {
@@ -101,18 +138,50 @@ impl<P: Providers> ServoBus<P> {
     /// reply pipeline check the CRC first, then dispatch. A frontier frame that
     /// lands in the verdict-first path just defers -- its frame end arrives here
     /// `complete`.
+    #[rustc_align(4)]
     fn route_frame<D: Dispatch>(&mut self, span: FrameSpan, complete: bool, d: &mut D) {
         let anchor = span.anchor;
         let footprint = span.footprint;
         let packet_end = span.packet_end;
-        // Status frames only advance the snoop chain (sec 6) -- framing-level
-        // truth, NO validation: the chain consumes nothing from the body, and
-        // skipping the CRC keeps the snapshot buffer free while our own reply
-        // streams from it. A frontier status defers to its frame end.
-        if self.ring_inst(anchor).is_status() {
-            if complete {
+        // A status's LEN moves the ladder, so a garbled one would swallow
+        // the frames behind it. One a chain slot waits on is checked against
+        // the size its GREAD set and then only times the slot (sec 6: the
+        // chain consumes nothing from the body). The framer hands a status
+        // over only whole.
+        let status = self.ring_inst(anchor).is_status();
+        if status && self.chain.waiting() {
+            if self.chain.admits(footprint) {
                 let out = self.chain.on_status_end(packet_end);
                 self.route_chain(out);
+            } else {
+                let len = self.ring.bytes().len();
+                self.framer.on_frame_misframed(anchor, len);
+            }
+            return;
+        }
+        let idle = !self.chain.active() && !self.tx.busy();
+        // Any other status, and another servo's plain op from an idle
+        // pipeline, touch nothing: no feed, no decode, only the bare CRC gate
+        // on the whole frame - the verdict is what keeps the ladder's stride
+        // trusted. A frontier frame at its covered checkpoint is never one:
+        // `needs` classified it from the same header and pipeline state, so
+        // the header read stays off the own-frame turnaround path.
+        if status
+            || complete && idle && foreign(Header::from_bytes(&self.ring_header(anchor)), self.id)
+        {
+            // The stream digest is fleet-common: every servo folds every held
+            // write on the shared wire, including one addressed to another
+            // servo, or a broadcast COMMIT's single tag cannot verify
+            // (`docs/security-architecture.md` sec 2.1). So a foreign frame
+            // that clears its CRC is folded here, and one that fails it
+            // restarts the cycle as on the spine. Status frames are never
+            // folded and never poison the digest.
+            if self.crc_gate(anchor, footprint) {
+                if !status {
+                    self.security_fold(anchor, footprint);
+                }
+            } else if !status {
+                self.security.rollback_stream();
             }
             return;
         }
@@ -122,7 +191,7 @@ impl<P: Providers> ServoBus<P> {
         // below. The guard also keeps the CRC engine free through a pending
         // window -- chain/tx activate only at a verdict, so no trigger reset
         // can clobber a fed span.
-        if !self.chain.active() && !self.tx.busy() && !self.verdict_first(anchor) {
+        if idle && !self.verdict_first(anchor) {
             // Feed first so the engine chews the covered span under the
             // dispatch body; the verdict then finds it settled.
             self.crc_feed(anchor, footprint);
@@ -140,7 +209,7 @@ impl<P: Providers> ServoBus<P> {
                     Some((staged, slot, out)) => (staged, slot, matches!(out, Dispatched::Pending)),
                     // Skip (a group op not listing us): a bare verdict moves the
                     // ladder (complete); the frame end does it for a frontier.
-                    None if complete => (false, 0, false),
+                    None if complete => (false, Slot::at(0), false),
                     None => return,
                 };
             let p = Pending {
@@ -160,17 +229,11 @@ impl<P: Providers> ServoBus<P> {
         }
         // Verdict-first (only meaningful complete -- a frontier defers): the CRC
         // is checked before any effect. COMMIT/MGMT (unstageable), and frames
-        // overlapping a live reply pipeline. A fail drops silently (sec 5.3 L1),
-        // the hunt resuming one byte in (sec 3.3).
+        // overlapping a live reply pipeline.
         if !complete {
             return;
         }
-        if !self.crc_ok(anchor, footprint) {
-            if !self.framer.probing() {
-                self.crc_fails = self.crc_fails.wrapping_add(1);
-            }
-            let len = self.ring.bytes().len();
-            self.framer.on_frame_rejected(anchor, len);
+        if !self.crc_gate(anchor, footprint) {
             self.security.rollback_stream();
             return;
         }
@@ -183,36 +246,58 @@ impl<P: Providers> ServoBus<P> {
         //
         // No fold happens on this path: COMMIT must not enter the digest its
         // own tag is computed over, and MGMT carries an inline tag instead
-        // (`Policy::folds_into_stream`).
+        // (`Policy::folds_into_stream`). `crc_gate` has already told the
+        // framer the frame was well-formed, so a refusal here neither counts
+        // as a CRC failure nor rewinds the ladder.
         if !self.auth_verify(anchor, footprint) {
-            self.framer.on_frame_verified();
             self.security.rollback_stream();
             return;
         }
-        self.framer.on_frame_verified();
-        self.drift_note_verified(anchor, footprint);
         // A fresh instruction supersedes any stale, not-yet-streaming reply --
         // post-verdict, so a garbled frame touched nothing.
         self.chain.reset();
         self.chain_at = None;
         if self.tx.staged() {
-            self.tx.abort();
+            self.abort_reply();
         }
-        // Dispatch inline -- the CRC already passed, so a staged table effect
-        // commits directly and any reply sequences from the packet end. A frame
-        // that decodes as another servo's touches nothing.
-        let Some((staged, slot, out)) =
+        // Dispatch inline - the CRC already passed, so a staged table effect
+        // commits and any reply then sequences from the packet end (the
+        // `verify` order). A frame that decodes as another servo's touches
+        // nothing.
+        if let Some((has_reply, slot, out)) =
             self.dispatch_decoded(anchor, footprint, |req, ctx, h| d.dispatch(req, ctx, h))
-        else {
-            return;
-        };
-        if matches!(out, Dispatched::Pending) {
-            let mut handle = self.reply_handle();
-            d.commit(&mut handle);
+        {
+            if matches!(out, Dispatched::Pending) {
+                let mut handle = self.reply_handle();
+                // SAFETY: the frame was dispatched from the ring this wake.
+                unsafe { d.commit(&mut handle) };
+            }
+            if has_reply && self.tx.staged() {
+                self.sequence_reply(slot, packet_end);
+            }
         }
-        if staged && self.tx.staged() {
-            self.sequence_reply(slot, packet_end);
+        // A CAL announce: every stamp latched so far is traffic's, and the
+        // train's first mark latches next.
+        if self.clock.pending_cal.is_some() {
+            self.stamps.clear();
         }
+    }
+
+    /// The verdict on a whole frame with no staged effects: a fail drops
+    /// silently (sec 5.3 L1), the hunt resuming one byte in (sec 3.3); a pass
+    /// trusts the ladder again.
+    #[rustc_align(4)]
+    fn crc_gate(&mut self, anchor: u16, footprint: u16) -> bool {
+        if !self.crc_ok(anchor, footprint) {
+            if !self.framer.probing() {
+                self.crc_fails = self.crc_fails.wrapping_add(1);
+            }
+            let len = self.ring.bytes().len();
+            self.framer.on_frame_rejected(anchor, len);
+            return false;
+        }
+        self.framer.on_frame_verified();
+        true
     }
 
     /// Verify a pending frame's CRC **and** its authenticity, then resolve the
@@ -227,8 +312,8 @@ impl<P: Providers> ServoBus<P> {
     /// checked first: it is free (the hardware engine has already finished)
     /// and it is the more probable failure, so a garbled frame never reaches
     /// the MAC at all.
-    #[cfg_attr(target_os = "none", unsafe(link_section = ".highcode"))]
-    #[cfg_attr(target_os = "none", inline(never))]
+        #[cfg_attr(target_arch = "riscv32", inline(never))]
+    #[rustc_align(4)]
     fn verify<D: Dispatch>(&mut self, p: Pending, d: &mut D) {
         if !self.crc_verify(p.anchor, p.footprint) {
             if p.table {
@@ -263,10 +348,14 @@ impl<P: Providers> ServoBus<P> {
             return;
         }
         self.framer.on_frame_verified();
-        self.drift_note_verified(p.anchor, p.footprint);
+        // Commit before the reply is sequenced (sec 4): the ack never
+        // leaves ahead of its effect, and no later kill of the staged reply
+        // can lose a verified write.
         if p.table {
             let mut handle = self.reply_handle();
-            d.commit(&mut handle);
+            // SAFETY: the frame's bytes stay in the ring through its verdict
+            // (protocol sec 4.1).
+            unsafe { d.commit(&mut handle) };
         }
         // Sequence from the ENGINE's state, not the recorded flag: any path
         // that reclaimed the staged reply between dispatch and here would
@@ -279,26 +368,30 @@ impl<P: Providers> ServoBus<P> {
     /// Sequence a staged reply onto the snoop chain. reply gap is a wire gap
     /// measured from the packet end (sec 7), not from this (later) verify wake --
     /// the estimate is the framer's, conservative by the drift adder.
-    fn sequence_reply(&mut self, slot: u8, packet_end: u32) {
+    #[rustc_align(4)]
+    fn sequence_reply(&mut self, slot: Slot, packet_end: u32) {
         // sec 9.2 slot delay: a collision-tolerant reply offsets its trigger by
         // (key ^ tick) & (SLOTS-1) byte-times. Twin matchers run
         // cycle-identical firmware and otherwise answer in unison -- and a
         // sub-bit-aligned superposition of near-equal frames reads back as
         // ONE clean frame instead of collision garble. The tick term re-draws
         // every exchange, so equal keys never stick.
+        let now = self.deadline.now();
         let gap = match self.tx.slot_key() {
             Some(key) => {
-                let draw = (key ^ self.deadline.now() as u8) & (ENUM_REPLY_SLOTS - 1);
+                let draw = (key ^ now as u8) & (ENUM_REPLY_SLOTS - 1);
                 self.reply_gap().wrapping_add(draw as u32 * self.tpb)
             }
             None => self.reply_gap(),
         };
         let out = self.chain.on_reply_staged(
-            slot,
+            slot.index,
             packet_end,
+            now,
             gap,
             self.reclaim(),
             self.frame_allowance(),
+            slot.peer_footprint,
         );
         self.route_chain(out);
     }
@@ -306,7 +399,7 @@ impl<P: Providers> ServoBus<P> {
     /// Drop a not-yet-streaming staged reply and any chain sequencing it began.
     fn drop_staged(&mut self) {
         if self.tx.staged() {
-            self.tx.abort();
+            self.abort_reply();
         }
         self.chain.reset();
         self.chain_at = None;
@@ -321,12 +414,14 @@ impl<P: Providers> ServoBus<P> {
         &mut self,
         anchor: u16,
         footprint: u16,
-        f: impl FnOnce(Request<'_>, RequestCtx, &mut ReplyHandle<'_, P::Tx, P::Crc>) -> T,
-    ) -> Option<(bool, u8, T)> {
+        f: impl FnOnce(&Request<'_>, RequestCtx, &mut ReplyHandle<'_, P::Tx, P::Crc>) -> T,
+    ) -> Option<(bool, Slot, T)> {
         let frame = frame_view(self.ring.bytes(), anchor, footprint);
-        let (req, ctx, slot) = match decode(frame, self.id) {
-            Decoded::Own(req, ctx, slot) => (req, ctx, slot),
-            _ => return None,
+        // Borrowed in place: moving the request out of `Decoded` is a
+        // byte-wise memcpy call (its payload starts at offset 1).
+        let decoded = decode(frame, self.id);
+        let Decoded::Own(req, ctx, slot) = &decoded else {
+            return None;
         };
         // sec 9.2: an ENUM reply's staged wire effect is collision-tolerant --
         // its job is to collide with peer matchers (the on_break kill site
@@ -343,10 +438,12 @@ impl<P: Providers> ServoBus<P> {
             pending_reboot: &mut self.pending_reboot,
             pending_cal: &mut self.clock.pending_cal,
             response_deadline_us: &mut self.response_deadline_us,
+            tel: &mut self.tel,
+            rate: self.rate,
             staged: false,
             tolerant,
         };
-        let out = f(req, ctx, &mut handle);
-        Some((handle.staged, slot, out))
+        let out = f(req, *ctx, &mut handle);
+        Some((handle.staged, *slot, out))
     }
 }

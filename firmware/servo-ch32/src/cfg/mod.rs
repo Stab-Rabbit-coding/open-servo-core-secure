@@ -1,17 +1,20 @@
 pub mod board_wiring;
 pub mod chip;
 
-#[cfg(not(feature = "half-duplex"))]
-pub use board_wiring::BusWiring;
 pub use board_wiring::{
-    AdcPins, BoardWiring, Calibration, CurrentSenseConfig, Divider, DrvEn, NtcCal,
+    AdcPins, BoardWiring, Calibration, CurrentSenseConfig, Divider, DrvEn, Ntc,
 };
 pub use chip::{AnalogChannel, DigitalPin};
 
-use osc_servo_core::ConfigDefaults;
+use osc_servo_core::estimator::bemf::{self, RECIP_ARR_SHIFT};
+use osc_servo_core::estimator::window::WINDOW_ARR_MIN;
+use osc_servo_core::kernel::DECIM_MED;
+use osc_servo_core::regions::config::{
+    BURST_MAX_MV, DEFAULT_RAIL_SOURCE_MOHM, DEFAULT_V_UNDERVOLT_MV, rail_fold_q8, vmotor_counts,
+};
+use osc_servo_core::{ConfigDefaults, CurrentDefaults, KernelTiming};
 
-use crate::control::Scales;
-use crate::providers::usart_baud;
+use crate::providers::{break_wake, usart_baud};
 
 #[derive(Copy, Clone)]
 pub struct BoardConfig {
@@ -28,21 +31,110 @@ pub struct BoardConfig {
 /// linker can drop __udivdi3 / __udivsi3 / __umodsi3 entirely.
 #[derive(Copy, Clone)]
 pub struct Precomputed {
-    pub scales: Scales,
     pub pwm_psc: u16,
     pub pwm_arr: u16,
     pub usart_brr: u32,
+    pub break_reload: u16,
+    pub kernel_timing: KernelTiming,
+    pub current_defaults: CurrentDefaults,
+    pub burst_v_max_counts: u16,
+    pub v_undervolt_counts: u16,
+    pub rail_fold_q8: u16,
+    pub vmotor_bias_nom_counts: u16,
+    pub vmotor_bias_top_ohm: u16,
+    pub vmotor_bias_bot_ohm: u16,
 }
 
 impl Precomputed {
     pub const fn compute(cfg: &BoardConfig) -> Self {
         let (pwm_psc, pwm_arr) = crate::hal::timer::pwm_dividers_from_hz(chip::MOTOR_PWM_FREQ_HZ);
-        let gain_factor = cfg.wiring.current_sense.gain.factor();
+        // Const-eval quotients per the KernelTiming field docs; the divides
+        // fold at compile time so no soft-div symbol ever links.
+        let med_hz = chip::MOTOR_PWM_FREQ_HZ / DECIM_MED as u32;
+        let (rail, term, bias) = (
+            &cfg.calibration.vbus_divider,
+            &cfg.calibration.vmotor_divider,
+            &cfg.calibration.vmotor_bias,
+        );
+        let vbus_scale_q15 = ((rail.top_ohm + rail.bot_ohm) as u64 * term.bot_ohm as u64 * 32768
+            / (rail.bot_ohm as u64 * (term.top_ohm + term.bot_ohm) as u64))
+            as u32;
         Self {
-            scales: Scales::new(&cfg.calibration, gain_factor),
             pwm_psc,
             pwm_arr,
             usart_brr: usart_baud::brr_for(cfg.defaults.baud),
+            break_reload: break_wake::reload_for(cfg.defaults.baud),
+            kernel_timing: KernelTiming {
+                pwm_arr,
+                recip_arr_q24: (1u32 << RECIP_ARR_SHIFT) / pwm_arr as u32,
+                tick_hz: chip::MOTOR_PWM_FREQ_HZ as u16,
+                dt_med_q32: ((1u64 << 32) / med_hz as u64) as u32,
+                vbus_scale_q15,
+                bias_brake_min_ticks: cfg.calibration.bias_brake_min_ticks,
+                bemf_min_ticks: cfg.calibration.bemf_window_min_ticks,
+                bridge_min_ticks: cfg.calibration.bridge_min_ticks,
+                i_settle_gain: cfg.calibration.i_settle_gain,
+                brush_dev_max: bemf::brush_dev_max(
+                    cfg.calibration.shunt_r_mohm,
+                    cfg.wiring.current_sense.gain_milli,
+                    cfg.calibration.vdd_mv,
+                ),
+            },
+            current_defaults: CurrentDefaults::from_sense(
+                cfg.calibration.shunt_r_mohm,
+                cfg.wiring.current_sense.gain_milli,
+                cfg.calibration.vdd_mv,
+            ),
+            burst_v_max_counts: vmotor_counts(
+                BURST_MAX_MV,
+                term.top_ohm,
+                term.bot_ohm,
+                cfg.calibration.vdd_mv,
+            ),
+            v_undervolt_counts: vmotor_counts(
+                DEFAULT_V_UNDERVOLT_MV,
+                term.top_ohm,
+                term.bot_ohm,
+                cfg.calibration.vdd_mv,
+            ),
+            rail_fold_q8: rail_fold_q8(
+                DEFAULT_RAIL_SOURCE_MOHM,
+                cfg.calibration.shunt_r_mohm,
+                cfg.wiring.current_sense.gain_milli,
+                cfg.calibration.vdd_mv,
+                term.top_ohm,
+                term.bot_ohm,
+            ),
+            vmotor_bias_nom_counts: vmotor_counts(
+                cfg.calibration.vdd_mv,
+                bias.top_ohm,
+                bias.bot_ohm,
+                cfg.calibration.vdd_mv,
+            ),
+            vmotor_bias_top_ohm: ohm16(bias.top_ohm),
+            vmotor_bias_bot_ohm: ohm16(bias.bot_ohm),
         }
+    }
+}
+
+impl Precomputed {
+    /// The board's brush term bound keeps the half's product one i32
+    /// multiply (`bemf::brush_dev_max_fits`), and the PWM period keeps the
+    /// window term's conductance per tick one u32 (`WINDOW_ARR_MIN`).
+    pub const fn assert_valid(&self) {
+        if !bemf::brush_dev_max_fits(self.kernel_timing.brush_dev_max) {
+            panic!("Precomputed: the sense chain's brush bound overflows the half's product");
+        }
+        if self.kernel_timing.pwm_arr < WINDOW_ARR_MIN {
+            panic!("Precomputed: the PWM period overflows the window term's conductance");
+        }
+    }
+}
+
+const fn ohm16(ohm: u32) -> u16 {
+    if ohm > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        ohm as u16
     }
 }

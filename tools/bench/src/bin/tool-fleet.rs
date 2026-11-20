@@ -7,15 +7,14 @@ use anyhow::{Result, anyhow};
 use bench::cli::{Connect, gate_fail_rate};
 use bench::edges::BStamp;
 use bench::osc::{build_instruction, gread_uniform_payload, gwrite_uniform_payload};
-use bench::run::Stats;
+use bench::run::{BURST_VALUES, Stats, burst_goal_base, goal_rails};
 use bench::wire::Wire;
 use clap::Parser;
 use osc_protocol::crc::osc_crc;
 use osc_protocol::frame::Header;
 use osc_protocol::wire::{Inst, Opcode, ResultCode};
+use osc_servo_core::regions::control::addr::lifecycle::GOAL_POSITION;
 
-/// goal_position: the rule-heavy hot-loop register (see tool-burst).
-const GOAL_POSITION_ADDR: u16 = 0x0184;
 const GOAL_LEN: u16 = 4;
 const BCAST: u8 = 0xFE;
 const BREAK: u8 = 0x00;
@@ -123,7 +122,7 @@ fn cycle_frames(args: &Args, value: i32) -> (Vec<Vec<u8>>, Vec<u8>) {
         BCAST,
         Opcode::Gread,
         0,
-        &gread_uniform_payload(GOAL_POSITION_ADDR, GOAL_LEN, &args.ids),
+        &gread_uniform_payload(GOAL_POSITION, GOAL_LEN, &args.ids),
     );
     if args.hot {
         let data = value.to_le_bytes();
@@ -132,7 +131,7 @@ fn cycle_frames(args: &Args, value: i32) -> (Vec<Vec<u8>>, Vec<u8>) {
             BCAST,
             Opcode::Gwrite,
             Inst::FLAG_HOLD,
-            &gwrite_uniform_payload(GOAL_POSITION_ADDR, &entries),
+            &gwrite_uniform_payload(GOAL_POSITION, &entries),
         );
         let commit = build_instruction(BCAST, Opcode::Commit, 0, &[]);
         (vec![gwrite, commit, gread.clone()], gread)
@@ -190,9 +189,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let mut client = args.conn.wire()?;
     let bit_ticks = client.bit_ticks();
+    let mut rails = i32::MIN..=i32::MAX;
+    for &id in &args.ids {
+        let r = goal_rails(&mut client, id)?;
+        rails = *rails.start().max(r.start())..=*rails.end().min(r.end());
+    }
+    let base = burst_goal_base(&rails, 0)?;
 
     // Warmup: prime the chip and flush stale stamps before measuring.
-    let _ = run_cycle(&mut client, &args, 0, bit_ticks);
+    let _ = run_cycle(&mut client, &args, base, bit_ticks);
 
     let n_gaps = args.ids.len().saturating_sub(1);
     let mut slot0 = Vec::new();
@@ -200,7 +205,7 @@ fn main() -> Result<()> {
     let mut totals = Vec::new();
     let mut fail = 0u32;
     for i in 0..args.count {
-        let value = (i % 1000) as i32 + 1;
+        let value = base + (i % BURST_VALUES as u32) as i32 + 1;
         match run_cycle(&mut client, &args, value, bit_ticks) {
             Ok((s0, g, total)) => {
                 slot0.push(s0);

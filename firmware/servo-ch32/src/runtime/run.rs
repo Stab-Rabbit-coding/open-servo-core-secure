@@ -1,24 +1,17 @@
 //! Top-level program entry. `run!` is the board binary's main: it validates
-//! the `BoardConfig` literal at compile time, calls into bringup, installs
-//! the kernel + IRQs, and enters the main loop.
+//! the `BoardConfig` literal at compile time, calls into bringup, confirms the
+//! boot, installs the kernel + IRQs, and enters the main loop.
 
-use osc_servo_core::{BootMode, RegionStorageRaw};
-use osc_servo_drivers::led::Pattern;
+use osc_servo_core::RegionStorageRaw;
 use osc_servo_drivers::traits::Monotonic as _;
-use portable_atomic::Ordering;
-
-use osc_servo_drivers::bus::RESCUE_LOW_US;
 
 use crate::cfg::{BoardConfig, Precomputed, chip};
-use crate::control::Ch32ControlIo;
-use crate::hal::{dma, flash, gpio, pfic, rcc};
+use crate::hal::{gpio, pfic, rcc};
 use crate::providers::monotonic::Monotonic;
+use crate::runtime::control_io::Ch32ControlIo;
 
-/// STAT LED activity hold: how long "talking" outlives the last wire IRQ,
-/// so gapped exchanges read as one lit episode. Dark at idle.
-const TALK_HOLD_US: u32 = 200_000;
-
-/// Const-asserts pin-uniqueness on the `BoardConfig` literal, then runs.
+/// Const-asserts pin-uniqueness on the `BoardConfig` literal and the bounds
+/// on its derived constants, then runs.
 #[macro_export]
 macro_rules! run {
     ($cfg:expr) => {{
@@ -26,6 +19,7 @@ macro_rules! run {
         const __OSC_CH32_PRE: $crate::cfg::Precomputed =
             $crate::cfg::Precomputed::compute(&__OSC_CH32_CFG);
         const _: () = __OSC_CH32_CFG.wiring.assert_valid();
+        const _: () = __OSC_CH32_PRE.assert_valid();
         // qingke-rt sets WFITOWFE=1; undo it so `wfi` wakes on pending IRQs.
         // INTSYSCR stays at qingke-rt's 0x3 (HPE + nesting): the "HPE
         // corrupts t0/t2" episode was a wlink write-mem artifact (see
@@ -37,8 +31,13 @@ macro_rules! run {
 
 #[doc(hidden)]
 pub fn __run(cfg: BoardConfig, pre: Precomputed) -> ! {
+    #[cfg(target_arch = "riscv32")]
+    let mut stack = crate::runtime::stack::paint();
     let io = Ch32ControlIo::new(cfg, pre);
-    crate::runtime::statics::install(io);
+    crate::runtime::statics::install(io, pre.kernel_timing);
+    // Bringup done, no IRQ live yet: the META page erase stalls nothing.
+    #[cfg(target_arch = "riscv32")]
+    crate::runtime::boot::confirm();
     crate::runtime::isr::install_irqs();
     // Last-published transport counters: the table gets DELTAS, so a host
     // zero-write (the rw clear contract, `TelemetryCommon`) sticks instead
@@ -47,48 +46,78 @@ pub fn __run(cfg: BoardConfig, pre: Precomputed) -> ! {
         crc_fail_count: 0,
         framing_drop_count: 0,
     };
-    let talk_hold_ticks = TALK_HOLD_US * Monotonic::TICKS_PER_US;
-    let mut last_talk = Monotonic.ticks().wrapping_sub(talk_hold_ticks);
-    let rescue_low_ticks = RESCUE_LOW_US * Monotonic::TICKS_PER_US;
-    let mut rescue_low_since: Option<u32> = None;
-    let mut rescue_ndtr: u16 = dma::remaining(dma::Channel::CH5);
+    let mut tel_published: u16 = 0;
+    let mut lamp_test = crate::runtime::stat::LampTest::new(Monotonic.ticks());
+    let mut flash = crate::runtime::stat::Flash::default();
     loop {
-        // Transport RX/TX/deadlines are ISR-driven (USART1 + SysTick, PFIC
-        // HIGH). Main loop owns LED housekeeping, the link-diagnostics
-        // publish, the deferred-reboot poll, and sleep.
+        // Transport RX/TX/deadlines are ISR-driven (TIM2 + USART1 + SysTick
+        // + SW, the bus level). Main loop owns LED housekeeping, the
+        // link-diagnostics publish, the deferred-reboot poll, and sleep. Its
+        // reach-ins into bus state mask the bus level only (`pfic::mask_bus`):
+        // the kernel never waits on the main loop.
         //
-        // STAT LED: dark when idle, lit while the bus talks -- any USART1
-        // wire event latches `BUS_ACTIVITY`, and the light holds past the
-        // last event so an exchange reads as one episode. The `wfi` wake
-        // cadence is the poll cadence: wire IRQs while talking, the 20 kHz
-        // kernel tick otherwise.
-        if crate::runtime::registry::BUS_ACTIVITY.swap(false, Ordering::Relaxed) {
-            last_talk = Monotonic.ticks();
-        }
-        let talking = Monotonic.ticks().wrapping_sub(last_talk) < talk_hold_ticks;
+        // STAT lamp (`runtime::stat`). The `wfi` wake cadence is the poll
+        // cadence: the 20 kHz kernel tick at the slowest.
+        // SAFETY: table storage is 'static; single-byte volatile loads, and
+        // a write landing from an ISR mid-pair costs one stale pass.
+        let (fault_code, data_flags) = unsafe {
+            let mode = &raw const (*crate::runtime::statics::SHARED.table.region_ptr())
+                .telemetry
+                .mode;
+            (
+                (&raw const (*mode).fault_code).read_volatile(),
+                (&raw const (*mode).data_flags).read_volatile(),
+            )
+        };
+        // A host flash request (`stat_flash_ticks`) is taken and zeroed
+        // here. The mask folds the take against a commit landing from the
+        // bus, which is the field's only other writer.
+        let flash_ticks = pfic::mask_bus(|| {
+            // SAFETY: table storage is 'static; the bus level is masked.
+            unsafe {
+                let field = &raw mut (*crate::runtime::statics::SHARED.table.region_ptr())
+                    .control
+                    .stat
+                    .stat_flash_ticks;
+                let ticks = field.read_volatile();
+                if ticks != 0 {
+                    field.write_volatile(0);
+                }
+                ticks
+            }
+        });
+        let now = Monotonic.ticks();
+        flash.request(now, flash_ticks);
         // SAFETY: stat_led installed in bringup; main-loop sole accessor.
         let led = unsafe { crate::runtime::Drivers::stat_led() };
-        led.set_pattern(if talking {
-            Pattern::SolidOn
-        } else {
-            Pattern::SolidOff
-        });
+        led.set_pattern(crate::runtime::stat::pattern(
+            flash.running(now),
+            lamp_test.running(now),
+            fault_code,
+            data_flags,
+        ));
         led.poll();
 
         // Publish transport health into the telemetry region (protocol sec 5.3 layer 1:
-        // dropped frames are counted, never answered). The critical section
-        // makes the `bus()` reach-in non-aliasing (HIGH owns it otherwise)
-        // and folds the read-modify-write against a concurrent host clear
-        // committing from HIGH.
-        critical_section::with(|_| {
-            // SAFETY: bus installed in bringup; ISRs masked by the CS.
+        // dropped frames are counted, never answered), and the TEL rows the
+        // kernel dropped. The mask makes the `bus()` reach-in non-aliasing
+        // (the bus level owns it otherwise) and folds the read-modify-write
+        // against a concurrent host clear committing from the bus; the
+        // kernel writes none of these fields.
+        pfic::mask_bus(|| {
+            // SAFETY: bus installed in bringup; the bus level is masked.
             let diag = unsafe { crate::runtime::Drivers::bus() }.diag();
+            let tel_drops = crate::runtime::statics::TEL_CHANNEL.drops();
             // SAFETY: table storage is 'static; field access is volatile and
-            // ISR-masked, mirroring the sample_tick idiom in `isr.rs`.
+            // bus-masked, mirroring the sample_tick idiom in `isr.rs`.
             unsafe {
-                let common = &raw mut (*crate::runtime::statics::SHARED.table.region_ptr())
-                    .telemetry
-                    .common;
+                let table = crate::runtime::statics::SHARED.table.region_ptr();
+                let common = &raw mut (*table).telemetry.common;
+                let tel = &raw mut (*table).telemetry_ext.health.tel_drop_count;
+                tel.write_volatile(
+                    tel.read_volatile()
+                        .wrapping_add(tel_drops.wrapping_sub(tel_published)),
+                );
                 let crc = &raw mut (*common).crc_fail_count;
                 crc.write_volatile(
                     crc.read_volatile()
@@ -103,7 +132,21 @@ pub fn __run(cfg: BoardConfig, pre: Precomputed) -> ! {
                 );
             }
             published = diag;
+            tel_published = tel_drops;
         });
+
+        #[cfg(target_arch = "riscv32")]
+        if let Some(free) = stack.step() {
+            // SAFETY: table storage is 'static; the main loop is the only
+            // writer of this read-only field.
+            unsafe {
+                (&raw mut (*crate::runtime::statics::SHARED.table.region_ptr())
+                    .telemetry_ext
+                    .health
+                    .stack_free_min)
+                    .write_volatile(free);
+            }
+        }
 
         // Clock-trim loop (protocol sec 9.3): the transport measures
         // host-instruction byte cadence ISR-side; the correction lands here,
@@ -112,8 +155,8 @@ pub fn __run(cfg: BoardConfig, pre: Precomputed) -> ! {
         // wire is safe (measured: the manual-knob experiment trimmed the
         // fleet mid-traffic with zero errors). The applied total mirrors
         // into telemetry, read-only, for fleet diagnosis.
-        let trim = critical_section::with(|_| {
-            // SAFETY: bus installed in bringup; ISRs masked by the CS.
+        let trim = pfic::mask_bus(|| {
+            // SAFETY: bus installed in bringup; the bus level is masked.
             unsafe { crate::runtime::Drivers::bus() }.poll_clock_trim()
         });
         if let Some(total) = trim {
@@ -129,48 +172,46 @@ pub fn __run(cfg: BoardConfig, pre: Precomputed) -> ! {
             }
         }
 
-        // Deferred reboot (protocol sec 9.5), honored after the ack has drained. The
-        // critical section is load-bearing: `bus()` is otherwise `&mut`-owned
-        // by the HIGH transport ISRs, so masking them is what makes this
-        // main-loop reach-in non-aliasing. Flash writes stay out of the ISR
-        // bodies -- the stall is lethal under a live control loop.
-        let reboot: Option<BootMode> =
-            critical_section::with(|_| unsafe { crate::runtime::Drivers::bus() }.take_reboot());
-        if let Some(mode) = reboot {
-            flash::set_boot_mode(matches!(mode, BootMode::Bootloader));
-            pfic::software_reset();
+        // Shunt-burst page copy: republishes one page of the frozen capture
+        // into the BURST window. Main-loop side on purpose -- the copy is
+        // ~120 words and has no business inside a 20 kHz ISR.
+        crate::runtime::burst::poll_page(&crate::runtime::statics::SHARED);
+
+        // Data job (core `data_state`): the stamp checkpoint a covered or
+        // stamp write posts and the verdict a LUT COMMIT posts, ~0.6 ms of
+        // software CRC that outlasts a bus body. The run is preemptible;
+        // the publish masks the bus so dispatch cannot land a write between
+        // its generation check and the table stores. The kernel only reads
+        // the published bytes, each in its own phase. The posting ISR's
+        // return is the wfi wake, so the job runs before the next frame can
+        // arrive.
+        if let Some(job) = crate::runtime::statics::SHARED.data_job_run() {
+            pfic::mask_bus(|| crate::runtime::statics::SHARED.data_job_publish(job));
         }
 
-        // Rescue sampler (protocol sec 9.1). The break detector latches only at a
-        // dominant span's END, so no transport wake can
-        // observe a rescue pulse in progress -- the slow loop measures it
-        // instead, which is where a 300 us-scale signal belongs. One sample
-        // per wfi wake; the 20 kHz ADC tick is the idle metronome, so the
-        // worst-case cadence is ~50 us against a >= 300 us window. The window
-        // requires every sample low AND the RX ring frozen: any completed
-        // character moves NDTR (a real dominant low delivers no start
-        // edges), so UART traffic at any baud -- including the pulse's own
-        // ringed 0x00, which re-anchors the window ~a byte-time in -- can
-        // never impersonate a pulse. Declaration runs under a critical
-        // section (the bus is otherwise HIGH-ISR-owned) while the pulse
-        // still holds the line, so the driver resyncs at a provably-still
-        // cursor; the window restart afterwards makes a continuing low
-        // redeclare idempotently rather than repeat-fire.
-        let ndtr = dma::remaining(dma::Channel::CH5);
-        if !gpio::is_low(chip::BUS_LINE_PIN) || ndtr != rescue_ndtr {
-            rescue_low_since = None;
-            rescue_ndtr = ndtr;
-        } else if let Some(t0) = rescue_low_since {
-            if Monotonic.ticks().wrapping_sub(t0) >= rescue_low_ticks {
-                rescue_low_since = None;
-                critical_section::with(|_| {
-                    // SAFETY: bus installed in bringup; ISRs masked by the CS.
-                    unsafe { crate::runtime::Drivers::bus() }.on_rescue_break()
-                });
-            }
-        } else {
-            rescue_low_since = Some(Monotonic.ticks());
+        // Deferred reboot (protocol sec 9.5), honored after the ack has drained. The
+        // mask is load-bearing: `bus()` is otherwise `&mut`-owned by the
+        // transport ISRs, so masking the bus level is what makes this
+        // main-loop reach-in non-aliasing. Flash writes stay out of the ISR
+        // bodies -- the stall is lethal under a live control loop.
+        #[cfg(target_arch = "riscv32")]
+        if let Some(reboot) =
+            pfic::mask_bus(|| unsafe { crate::runtime::Drivers::bus() }.take_reboot())
+        {
+            crate::runtime::boot::reboot(reboot);
         }
+
+        // Rescue sampler (protocol sec 9.1). The break detector wakes once
+        // per dominant span, a break-length in, so no transport wake can
+        // measure a rescue pulse; the slow loop measures it instead, one
+        // sample per wfi wake. The pin is read under the same bus mask that
+        // also reads the TX state and declares, so a TX start or release
+        // cannot land between them.
+        pfic::mask_bus(|| {
+            let low = gpio::is_low(chip::BUS_USART_MAPPING.tx_pin());
+            // SAFETY: bus installed in bringup; the bus level is masked.
+            unsafe { crate::runtime::Drivers::bus() }.sample_rescue(low)
+        });
 
         riscv::asm::wfi();
     }

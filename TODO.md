@@ -9,6 +9,9 @@ Legend: `[ ]` open · `[x]` closed · **(BLOCKER)** gates a downstream item.
 
 ## 7. Security element integration (ECC204)
 
+> **Under re-scope.** The parametric-board plan (§11, unit U3) re-selects the
+> MCU and secure element; items here close or re-point at that gate.
+
 Design of record: [`docs/security-architecture.md`](docs/security-architecture.md).
 Citations: [`REFERENCES.md`](REFERENCES.md).
 
@@ -504,6 +507,57 @@ connections and added no violations.
       8-layer for routing density at this size." The board is **4-layer**:
       `F.Cu`, `In1.Cu`, `In2.Cu`, `B.Cu`. Correct the README. Worth deciding at
       the same time whether the board *should* be 6- or 8-layer, given §10.4.
+
+---
+
+## 11. Parametric secure microservo board family
+
+Plan of record: [`docs/plans/2026-11-16-001-feat-parametric-secure-microservo-board-plan.md`](docs/plans/2026-11-16-001-feat-parametric-secure-microservo-board-plan.md)
+(owner issue #4). Each sprint ends in a QA gate: unit tests pass, standing checks
+pass, a negative control shows each new checker can fail, and a signed gate record
+is filed in `docs/qa/`. **Stop** at any failed gate; stop before U5 layout until U2
+measurements exist for every profile the board claims; stop before ordering boards
+(owner action).
+
+### 11.1 Open owner decisions
+
+- [ ] **(BLOCKER for U3)** Rule on the 2026-11-19 BOM comment: the `ECC204`
+      contradicts KTD3 (NDA-only command set), and the CAN-FD / RS-485
+      transceivers contradict R6 (single-wire bus). See plan KTD3a.
+- [ ] Confirm that a gutted servo body (motor, gears, pot, case) is outside the
+      sourcing rule, which then applies to the swap board only (plan, Assumptions).
+
+### 11.2 Sprints
+
+- [ ] **U1 Sprint 0** — add the sourcing and openness rule to `AGENTS.md` (cite the
+      Serenity rule as origin); audit every `osc-sg90-v006` part by maker domicile
+      and datasheet openness (`docs/sourcing-audit.md`); file the six servo documents
+      under `hardware/datasheets/` and in `REFERENCES.md` (LD5801 source page:
+      *requires verification*); write the gate-record template `docs/qa/README.md`.
+- [ ] **U2 Sprint 1** — teardown of one unit per model; `profiles/schema.json`,
+      five profiles, `tools/profile/validate.py` (test-first).
+- [ ] **U3 Sprint 2** — MCU and crypto selection (`docs/mcu-crypto-trade.md`);
+      revise `docs/security-architecture.md`; close or re-point every §7 item.
+- [ ] **U4 Sprint 3** — shared schematic, `hardware/tools/gen_board_geometry.py`.
+- [ ] **U5 Sprint 4** — `osc-micro-slim` layout and `check_cavity_fit.py`.
+- [ ] **U6 Sprint 5** — chip crate for the selected MCU; profile-driven defaults.
+- [ ] **U7 Sprint 6** — security port and provisioning; measured timing as `[Fn]`
+      facts. Also routes the `SEC_*` MGMT ops, which the core answers as
+      unsupported until then.
+- [ ] **U8 Sprint 7** — bring-up and per-profile bench validation.
+- [ ] **U9 Sprint 8** — `sg90` re-target through the same flow.
+- [ ] **U10 Sprint 9** — `docs/adding-a-servo-model.md` and a fifth profile.
+
+### 11.3 Carried from the upstream sync (PR #6)
+
+- [ ] `firmware/lib/osc-security/src/mac.rs:204` and the `drivers` test modules
+      (`bus/servo_bus/security.rs:159`, `se/ecc204.rs:310-311`) fail
+      `cargo clippy -D warnings` on the current nightly. Fix with the U7 port.
+- [ ] Re-prove the foreign-frame digest fold on the upstream fast path
+      (`route_frame`, `docs/security-architecture.md` §2.1) with a discrete-event
+      test: a foreign held WRITE before a broadcast COMMIT.
+- [ ] Build the riscv32 chip and board crates against the merged tree; this was
+      not possible in the merge session (target not installed).
 
 ---
 

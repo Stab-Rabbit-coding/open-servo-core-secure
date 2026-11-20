@@ -9,12 +9,26 @@ pub const CONFIG_COMMON_END: u16 = 0x020;
 
 /// u16 RO -- keys the per-model register map.
 pub const MODEL_NUMBER: u16 = 0x000;
-/// u8 RO.
+/// u16 RO - semver packed 5.5.6 (`version::pack_version`).
 pub const FIRMWARE_VERSION: u16 = 0x002;
-/// u8 RO.
-pub const HARDWARE_REVISION: u16 = 0x003;
-/// u32 RO -- reserved-slot extension signal; no bits defined yet.
+/// u32 RO - reserved-slot extension signal; bits below.
 pub const CAPABILITY_FLAGS: u16 = 0x004;
+/// u8 RO.
+pub const HARDWARE_REVISION: u16 = 0x008;
+/// u8 RO - sec 5.6: the longest TEL row, bytes; present under
+/// `CAP_TEL_ROWS`.
+pub const TEL_ROW_BYTES_MAX: u16 = 0x00A;
+/// u8 RO - sec 5.6: the chunks a TEL row copies at most; present under
+/// `CAP_TEL_ROWS`.
+pub const TEL_CHUNKS_MAX: u16 = 0x00B;
+
+/// `CAPABILITY_FLAGS` bit 0: `TEL_ROW_BYTES_MAX` and `TEL_CHUNKS_MAX` are
+/// published.
+pub const CAP_TEL_ROWS: u32 = 1 << 0;
+/// `CAPABILITY_FLAGS` bit 1: the experiment image (kernel sec 2.7): OpenLoop
+/// alone, no limiter and no stall permit, the overcurrent trip and the bus
+/// dead-man its two protections.
+pub const CAP_EXPERIMENT: u32 = 1 << 1;
 /// u8 RW -- unicast address, 0x01..=0xF9 (sec 3.1).
 pub const ID: u16 = 0x010;
 /// u8 RW -- sec 2 rate index (`BaudRate` discriminant).

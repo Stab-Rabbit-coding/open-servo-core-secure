@@ -1,6 +1,6 @@
 # Hierarchical Driver Pattern
 
-A design convention for organizing firmware that has more than two or three peripherals interacting with a protocol stack. This doc captures the convention in generic terms so it can be applied to any project — examples are illustrative rather than tied to a specific codebase. For a full worked example in this tree, see the bus driver under `firmware/lib/drivers/src/bus/` (the composite `ServoBus` composing the `Framer`/`Chain`/`TxEngine`/`ClockTracker` sub-drivers) with its providers in `firmware/servo-ch32/src/providers/`.
+A design convention for organizing firmware that has more than two or three peripherals interacting with a protocol stack. This doc captures the convention in generic terms so it can be applied to any project - examples are illustrative rather than tied to a specific codebase. For a full worked example in this tree, see the bus driver under `firmware/lib/drivers/src/bus/` (the composite `ServoBus` composing the `Framer`/`Chain`/`TxEngine`/`ClockDiscipline` sub-drivers) with its providers in `firmware/servo-ch32/src/providers/`.
 
 ---
 
@@ -161,7 +161,7 @@ A single-variant project uses flat files (`hal/types.rs`, `cfg/board_wiring.rs`,
 | board bins | `osc-dev-v006` | `osc-adapter-wchlinke` |
 | PC software | — | `osc-client` (`client/`) |
 
-(The host column is the naming scheme; its cells land with the host band.) Foundation crates — `osc-protocol`, `osc-units`, `osc-log`, `control-table(-derive)` — belong to no column. `osc-integration` is the one deliberate column-spanner: it closes both ends over a simulated wire.
+(The host column is the naming scheme; its cells land with the host band.) Foundation crates — `osc-protocol`, `osc-log`, `control-table(-derive)` — belong to no column. `osc-integration` is the one deliberate column-spanner: it closes both ends over a simulated wire.
 
 The grid laws:
 

@@ -1,0 +1,650 @@
+# osc capture pilot envelope. Positions in pot counts, speeds in counts/ms,
+# times in ms. rule, current_limit_counts, rail_mv: the drive rule the pilot
+# ran under, the servo's current limit and its rail at rest; a capture
+# refuses the envelope once they differ. limits: soft/phys read from the
+# servo, guard = soft inset, runway = guard_hi - guard_lo. grid: the ladder
+# climbed the grid block's duties from the bottom, both ways, each rung run
+# only while its predicted travel fit the runway and its braked stop fit
+# between the soft limit and the stop beyond it. Per rung and direction:
+# the window it ran, t_goal_ms (the first sample whose applied duty was the
+# goal), travel by then, v_ss (fit over the samples at the goal past the
+# settle), and the braked stop after it. windows_ms: the window a campaign
+# rung drives at each duty kept, its climb and a tail crossing 0.8 of the
+# runway, cut to what still fits it. v_ss: counts/ms = slope x duty_pct +
+# intercept over the rungs that moved. coast: the ladder climbed the coast
+# block's duties, each driven to its goal and 20 ms on (drive_ms), then
+# coast_ms, both ways, while its predicted travel x (1 + margin) fit the room
+# (the far edge of the start band to soft); top_pct is its top duty. Per rung
+# and direction: predicted travel (none on the first rung), entry speed, lead
+# (travel to the coast's first sample), coast, travel = lead + coast, and the
+# peak's distance inside soft. chains: every other chain the session drives,
+# run both ways, its excursion from the start and the peak's distance inside
+# soft; refused_chains did not fit. fast: the grid ladder again under fast
+# decay, for a recording that drives under it.
+supply = "2s"
+fw = 65
+git_sha = "66271cfccb9344df4857ac928c6016c80a59a239"
+measured = "2026-09-30"
+seek_pct = 11
+rule = "limit"
+current_limit_counts = 280
+rail_mv = 7935
+refused_chains = []
+
+[limits]
+soft = [432, 3626]
+phys = [232, 3849]
+guard = [532, 3526]
+center = 2029
+runway = 2994
+
+[v_ss]
+duties = [5, 10, 15, 20, 25, 30, 35, 40, 45]
+
+[v_ss.fwd]
+slope = 0.1932
+intercept = -0.392
+r2 = 0.9962
+
+[v_ss.rev]
+slope = 0.2182
+intercept = -0.822
+r2 = 0.9872
+
+[windows_ms]
+5 = 1500
+10 = 1500
+15 = 972
+20 = 690
+25 = 502
+30 = 427
+35 = 337
+40 = 327
+45 = 308
+
+[grid]
+top_pct = 45
+
+[[grid.rungs]]
+pct = 5
+window_ms = 1500
+
+[grid.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 0.4
+travel = 0
+v_ss = 0.501
+stop = 3
+
+[grid.rungs.rev]
+ran_ms = 150
+t_goal_ms = 0.3
+travel = 2
+v_ss = 0.35
+stop = 0
+
+[[grid.rungs]]
+pct = 10
+window_ms = 1500
+
+[grid.rungs.fwd]
+ran_ms = 142
+t_goal_ms = 0.5
+travel = 0
+v_ss = 1.481
+stop = 14
+
+[grid.rungs.rev]
+ran_ms = 111
+t_goal_ms = 0.1
+travel = 0
+v_ss = 1.266
+stop = 10
+
+[[grid.rungs]]
+pct = 15
+window_ms = 972
+
+[grid.rungs.fwd]
+ran_ms = 187
+t_goal_ms = 0.6
+travel = 0
+v_ss = 2.465
+stop = 31
+
+[grid.rungs.rev]
+ran_ms = 111
+t_goal_ms = 0.65
+travel = 2
+v_ss = 2.102
+stop = 50
+
+[[grid.rungs]]
+pct = 20
+window_ms = 690
+
+[grid.rungs.fwd]
+ran_ms = 218
+t_goal_ms = 6.3
+travel = 5
+v_ss = 3.492
+stop = 55
+
+[grid.rungs.rev]
+ran_ms = 111
+t_goal_ms = 4.15
+travel = 4
+v_ss = 3.479
+stop = 61
+
+[[grid.rungs]]
+pct = 25
+window_ms = 502
+
+[grid.rungs.fwd]
+ran_ms = 133
+t_goal_ms = 11.0
+travel = 18
+v_ss = 4.5
+stop = 69
+
+[grid.rungs.rev]
+ran_ms = 124
+t_goal_ms = 12.4
+travel = 4
+v_ss = 4.877
+stop = 88
+
+[[grid.rungs]]
+pct = 30
+window_ms = 427
+
+[grid.rungs.fwd]
+ran_ms = 134
+t_goal_ms = 20.3
+travel = 44
+v_ss = 5.492
+stop = 105
+
+[grid.rungs.rev]
+ran_ms = 261
+t_goal_ms = 18.4
+travel = 42
+v_ss = 5.749
+stop = 112
+
+[[grid.rungs]]
+pct = 35
+window_ms = 337
+
+[grid.rungs.fwd]
+ran_ms = 148
+t_goal_ms = 30.5
+travel = 85
+v_ss = 6.668
+stop = 112
+
+[grid.rungs.rev]
+ran_ms = 144
+t_goal_ms = 26.65
+travel = 70
+v_ss = 7.483
+stop = 103
+
+[[grid.rungs]]
+pct = 40
+window_ms = 327
+
+[grid.rungs.fwd]
+ran_ms = 164
+t_goal_ms = 40.1
+travel = 145
+v_ss = 7.349
+stop = 119
+
+[grid.rungs.rev]
+ran_ms = 169
+t_goal_ms = 40.1
+travel = 117
+v_ss = 7.919
+stop = 151
+
+[[grid.rungs]]
+pct = 45
+window_ms = 308
+
+[grid.rungs.fwd]
+ran_ms = 166
+t_goal_ms = 50.4
+travel = 195
+v_ss = 7.985
+stop = 157
+
+[grid.rungs.rev]
+ran_ms = 182
+t_goal_ms = 48.35
+travel = 160
+v_ss = 8.467
+stop = 178
+
+[grid.refused]
+pct = 50
+dir = "rev"
+why = "rev 50% would stop in about 202 counts, over the 200 between the soft limit and the stop: a rung its host abandoned would hit the stop"
+
+[coast]
+coast_ms = 400
+margin = 0.1
+top_pct = 40
+
+[coast.room]
+fwd = 3019
+rev = 3019
+
+[coast.refused]
+pct = 60
+why = "the grid ladder never kept 60%, so it has no climb to drive by"
+
+[[coast.ladder]]
+pct = 20
+drive_ms = 27
+
+[coast.ladder.fwd]
+entry = 2.666
+lead = 72
+coast = 93
+travel = 165
+peak_inside_soft = 2910
+
+[coast.ladder.rev]
+entry = 2.898
+lead = 54
+coast = 83
+travel = 137
+peak_inside_soft = 2911
+
+[[coast.ladder]]
+pct = 30
+drive_ms = 41
+
+[coast.ladder.fwd]
+predicted = 528
+entry = 4.669
+lead = 148
+coast = 230
+travel = 378
+peak_inside_soft = 2712
+
+[coast.ladder.rev]
+predicted = 430
+entry = 3.985
+lead = 122
+coast = 261
+travel = 383
+peak_inside_soft = 2707
+
+[[coast.ladder]]
+pct = 40
+drive_ms = 61
+
+[coast.ladder.fwd]
+predicted = 721
+entry = 7.241
+lead = 299
+coast = 451
+travel = 750
+peak_inside_soft = 2333
+
+[coast.ladder.rev]
+predicted = 629
+entry = 6.156
+lead = 263
+coast = 543
+travel = 806
+peak_inside_soft = 2253
+
+[[chains]]
+block = "step"
+chain = "30@20,coast:400"
+predicted = 539
+
+[chains.fwd]
+travel = 174
+peak_inside_soft = 2917
+
+[chains.rev]
+travel = 158
+peak_inside_soft = 2920
+
+[[chains]]
+block = "step"
+chain = "30@40,coast:400"
+predicted = 654
+
+[chains.fwd]
+travel = 362
+peak_inside_soft = 2708
+
+[chains.rev]
+travel = 380
+peak_inside_soft = 2705
+
+[[chains]]
+block = "step"
+chain = "30@60,coast:400"
+predicted = 768
+
+[chains.fwd]
+travel = 544
+peak_inside_soft = 2542
+
+[chains.rev]
+travel = 569
+peak_inside_soft = 2491
+
+[[chains]]
+block = "step"
+chain = "30@80,coast:400"
+predicted = 883
+
+[chains.fwd]
+travel = 677
+peak_inside_soft = 2384
+
+[chains.rev]
+travel = 723
+peak_inside_soft = 2357
+
+[[chains]]
+block = "step"
+chain = "30@120,coast:400"
+predicted = 1112
+
+[chains.fwd]
+travel = 910
+peak_inside_soft = 2178
+
+[chains.rev]
+travel = 939
+peak_inside_soft = 2108
+
+[[chains]]
+block = "reversal"
+chain = "20@60,then:-20@60,then:20@60,brake:200"
+predicted = 818
+
+[chains.fwd]
+travel = 237
+peak_inside_soft = 2817
+
+[chains.rev]
+travel = 208
+peak_inside_soft = 2872
+
+[[chains]]
+block = "ends"
+chain = "15@1277"
+predicted = 3272
+
+[chains.fwd]
+travel = 3074
+peak_inside_soft = -18
+
+[chains.rev]
+travel = 3073
+peak_inside_soft = 50
+
+[[chains]]
+block = "ends"
+chain = "20@897"
+predicted = 3287
+
+[chains.fwd]
+travel = 3096
+peak_inside_soft = 61
+
+[chains.rev]
+travel = 3088
+peak_inside_soft = 41
+
+[fast]
+top_pct = 35
+
+[[fast.rungs]]
+pct = 5
+window_ms = 1500
+
+[fast.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 0.5
+travel = 0
+v_ss = -0.001
+stop = 0
+
+[fast.rungs.rev]
+ran_ms = 150
+t_goal_ms = 0.15
+travel = 10
+v_ss = -0.001
+stop = 9
+
+[[fast.rungs]]
+pct = 10
+window_ms = 1500
+
+[fast.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 0.2
+travel = 0
+v_ss = 0.0
+stop = 1
+
+[fast.rungs.rev]
+ran_ms = 150
+t_goal_ms = 0.15
+travel = 14
+v_ss = 0.001
+stop = 4
+
+[[fast.rungs]]
+pct = 15
+window_ms = 1500
+
+[fast.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 0.35
+travel = 0
+v_ss = 0.0
+stop = 0
+
+[fast.rungs.rev]
+ran_ms = 150
+t_goal_ms = 0.25
+travel = 11
+v_ss = -0.001
+stop = 5
+
+[[fast.rungs]]
+pct = 20
+window_ms = 1500
+
+[fast.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 1.1
+travel = 0
+v_ss = 0.0
+stop = 0
+
+[fast.rungs.rev]
+ran_ms = 150
+t_goal_ms = 1.05
+travel = 7
+v_ss = 0.0
+stop = 0
+
+[[fast.rungs]]
+pct = 25
+window_ms = 1500
+
+[fast.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 1.95
+travel = 1
+v_ss = 0.0
+stop = 0
+
+[fast.rungs.rev]
+ran_ms = 150
+t_goal_ms = 1.6
+travel = 7
+v_ss = -0.001
+stop = 3
+
+[[fast.rungs]]
+pct = 30
+window_ms = 1500
+
+[fast.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 2.4
+travel = 0
+v_ss = 0.0
+stop = 1
+
+[fast.rungs.rev]
+ran_ms = 150
+t_goal_ms = 2.2
+travel = 6
+v_ss = 0.43
+stop = 11
+
+[[fast.rungs]]
+pct = 35
+window_ms = 1500
+
+[fast.rungs.fwd]
+ran_ms = 150
+t_goal_ms = 3.0
+travel = 0
+v_ss = 1.329
+stop = 11
+
+[fast.rungs.rev]
+ran_ms = 111
+t_goal_ms = 3.05
+travel = 0
+v_ss = 0.768
+stop = 22
+
+[[fast.rungs]]
+pct = 40
+window_ms = 1251
+
+[fast.rungs.fwd]
+ran_ms = 158
+t_goal_ms = 3.5
+travel = 0
+v_ss = 1.921
+stop = 31
+
+[fast.rungs.rev]
+ran_ms = 111
+t_goal_ms = 3.7
+travel = 1
+v_ss = 1.412
+stop = 27
+
+[[fast.rungs]]
+pct = 45
+window_ms = 862
+
+[fast.rungs.fwd]
+ran_ms = 189
+t_goal_ms = 4.3
+travel = 0
+v_ss = 2.79
+stop = 108
+
+[fast.rungs.rev]
+ran_ms = 128
+t_goal_ms = 4.4
+travel = 3
+v_ss = 2.105
+stop = 52
+
+[[fast.rungs]]
+pct = 50
+window_ms = 643
+
+[fast.rungs.fwd]
+ran_ms = 225
+t_goal_ms = 4.85
+travel = 0
+v_ss = 3.753
+stop = 69
+
+[fast.rungs.rev]
+ran_ms = 122
+t_goal_ms = 4.7
+travel = 0
+v_ss = 2.754
+stop = 80
+
+[[fast.rungs]]
+pct = 55
+window_ms = 502
+
+[fast.rungs.fwd]
+ran_ms = 258
+t_goal_ms = 5.4
+travel = 2
+v_ss = 4.817
+stop = 107
+
+[fast.rungs.rev]
+ran_ms = 124
+t_goal_ms = 5.5
+travel = 7
+v_ss = 3.641
+stop = 103
+
+[[fast.rungs]]
+pct = 60
+window_ms = 477
+
+[fast.rungs.fwd]
+ran_ms = 164
+t_goal_ms = 6.45
+travel = 4
+v_ss = 5.081
+stop = 114
+
+[fast.rungs.rev]
+ran_ms = 123
+t_goal_ms = 6.25
+travel = 8
+v_ss = 4.675
+stop = 123
+
+[[fast.rungs]]
+pct = 65
+window_ms = 356
+
+[fast.rungs.fwd]
+ran_ms = 145
+t_goal_ms = 20.05
+travel = 36
+v_ss = 6.24
+stop = 115
+
+[fast.rungs.rev]
+ran_ms = 128
+t_goal_ms = 15.55
+travel = 11
+v_ss = 6.996
+stop = 165
+
+[fast.refused]
+pct = 70
+dir = "rev"
+why = "rev 70% would stop in about 293 counts, over the 200 between the soft limit and the stop: a rung its host abandoned would hit the stop"

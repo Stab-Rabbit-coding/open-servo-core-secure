@@ -6,10 +6,16 @@
 use osc_integration::sim::{RamStore, Sim, Source, WireFrame, assert_valid, instruction, status};
 use osc_protocol::table::STATUS_FLAG_CONFIG_DIRTY;
 use osc_protocol::wire::{Id, MgmtOp, Opcode, ResultCode};
-use osc_servo_core::persist::{Image, Slot};
+use osc_servo_core::adc::ADC_WIDE_SLOTS;
+use osc_servo_core::persist::{CALIB_LEN, CalibImage, Image, Slot};
+use osc_servo_core::regions::calib::addr::adc::ADC_WIDE_MID_Q4;
+use osc_servo_core::regions::calib::addr::motor::R_Q12;
+use osc_servo_core::regions::calib::addr::sense::TICK_HZ;
+use osc_servo_core::regions::calib::addr::thermal::TH_RISE_Q016;
 use osc_servo_core::regions::config::addr::common::RESPONSE_DEADLINE_US;
 use osc_servo_core::regions::control::addr::lifecycle::TORQUE_ENABLE;
 use osc_servo_core::regions::telemetry::addr::common::STATUS_FLAGS;
+use osc_servo_core::regions::{CALIB_BASE_ADDR, ControlTable};
 use rstest::rstest;
 use rstest_reuse::apply;
 
@@ -59,6 +65,16 @@ fn read_byte(sim: &mut Sim, id: u8, addr: u16) -> u8 {
     let (inst, payload) = status(sole_reply(&frames));
     assert_eq!(inst.result(), Some(ResultCode::Ok));
     payload[0]
+}
+
+/// READ a u16 back.
+fn read_u16(sim: &mut Sim, id: u8, addr: u16) -> u16 {
+    let a = addr.to_le_bytes();
+    sim.host_send(&instruction(id, Opcode::Read, 0, &[a[0], a[1], 2, 0]));
+    let frames = sim.run();
+    let (inst, payload) = status(sole_reply(&frames));
+    assert_eq!(inst.result(), Some(ResultCode::Ok));
+    u16::from_le_bytes([payload[0], payload[1]])
 }
 
 #[apply(matrix)]
@@ -137,6 +153,122 @@ fn factory_wipes_the_store_and_stages_reboot(baud_idx: u8) {
     assert_eq!(store.wipes(), 1);
     assert!(store.slot(Slot::A).is_none() && store.slot(Slot::B).is_none());
     assert!(sim.take_reboot(s).is_some(), "factory stages the reboot");
+}
+
+/// Calib persistence (identification's write-back path): a fitted value
+/// written over the wire SAVEs into the calib image, survives a reboot
+/// (fresh `Sim`, same store), and FACTORY wipes it.
+#[apply(matrix)]
+fn saved_calib_survives_reboot_until_factory(baud_idx: u8) {
+    let store = RamStore::leak();
+    {
+        let mut sim = sim(baud_idx);
+        sim.add_servo_with_store(ID5, store);
+        write_ok(&mut sim, ID5, R_Q12, &14000u16.to_le_bytes());
+        let frames = mgmt(&mut sim, ID5, MgmtOp::Save);
+        assert_eq!(status(sole_reply(&frames)).0.result(), Some(ResultCode::Ok));
+        let img = store.calib_slot(Slot::A).expect("first save lands in A");
+        let parsed = CalibImage::parse(&img).expect("stored calib image parses");
+        let at = (R_Q12 - CALIB_BASE_ADDR) as usize;
+        assert_eq!(parsed.calib[at..at + 2], 14000u16.to_le_bytes());
+    }
+    {
+        let mut sim = sim(baud_idx);
+        sim.add_servo_with_store(ID5, store);
+        assert_eq!(read_u16(&mut sim, ID5, R_Q12), 14000, "fit restored");
+        let frames = mgmt(&mut sim, ID5, MgmtOp::Factory);
+        assert_eq!(status(sole_reply(&frames)).0.result(), Some(ResultCode::Ok));
+        assert!(store.calib_slot(Slot::A).is_none() && store.calib_slot(Slot::B).is_none());
+    }
+    {
+        let mut sim = sim(baud_idx);
+        sim.add_servo_with_store(ID5, store);
+        assert_eq!(read_u16(&mut sim, ID5, R_Q12), 0, "factory zeroed the fit");
+    }
+}
+
+/// The boot-order contract: the calib overlay copies the whole region, so a
+/// stale image carrying sense bytes the wire could never write must still
+/// lose to the board seed (re-seeded after the overlay) -- while the image's
+/// data fields land.
+#[apply(matrix)]
+fn board_sense_wins_over_a_stale_calib_image(baud_idx: u8) {
+    let store = RamStore::leak();
+    let mut calib = [0u8; CALIB_LEN];
+    calib[(R_Q12 - CALIB_BASE_ADDR) as usize..][..2].copy_from_slice(&14000u16.to_le_bytes());
+    calib[(TICK_HZ - CALIB_BASE_ADDR) as usize..][..2].copy_from_slice(&12345u16.to_le_bytes());
+    store.inject_calib(Slot::A, 1, &calib);
+
+    let mut sim = sim(baud_idx);
+    sim.add_servo_with_store(ID5, store);
+    assert_eq!(read_u16(&mut sim, ID5, R_Q12), 14000, "data overlaid");
+    assert_eq!(read_u16(&mut sim, ID5, TICK_HZ), 20000, "board seed wins");
+}
+
+/// SAVE seals every CONFIG and CALIB byte no field covers as zero: bytes
+/// an image of another layout left in reserved bytes (the leak that booted
+/// a winding estimate with its constants set) read as stored until the
+/// SAVE, are zero in both sealed images and read zero after it, while
+/// every field byte seals as it stood and loads back.
+#[apply(matrix)]
+fn save_seals_reserved_bytes_as_zero_and_keeps_the_fields(baud_idx: u8) {
+    const JUNK: u8 = 0xA5;
+    /// The CALIB reserved tail's first byte, behind the ADC wide-code map.
+    const RESERVED: u16 = ADC_WIDE_MID_Q4 + ADC_WIDE_SLOTS as u16;
+    const SEALED: usize = (CALIB_BASE_ADDR + CALIB_LEN as u16) as usize;
+    let mut covered = [false; SEALED];
+    for f in ControlTable::FIELDS.iter() {
+        let lo = (f.addr as usize).min(SEALED);
+        let hi = ((f.addr + f.width) as usize).min(SEALED);
+        covered[lo..hi].fill(true);
+    }
+    let mut calib = [0u8; CALIB_LEN];
+    for (a, b) in calib.iter_mut().enumerate() {
+        if !covered[CALIB_BASE_ADDR as usize + a] {
+            *b = JUNK;
+        }
+    }
+    calib[(R_Q12 - CALIB_BASE_ADDR) as usize..][..2].copy_from_slice(&4016u16.to_le_bytes());
+    calib[(TH_RISE_Q016 - CALIB_BASE_ADDR) as usize..][..2].copy_from_slice(&2097u16.to_le_bytes());
+    let store = RamStore::leak();
+    store.inject_calib(Slot::A, 1, &calib);
+    let live = |sim: &Sim| {
+        // SAFETY: the table is repr(C) bytes and the sim is single-threaded.
+        sim.servo_table(0, |t| unsafe {
+            core::slice::from_raw_parts(t as *const ControlTable as *const u8, SEALED).to_vec()
+        })
+    };
+    {
+        let mut sim = sim(baud_idx);
+        sim.add_servo_with_store(ID5, store);
+        sim.servo_table_mut(0, |t| {
+            t.config.common._rsvd_identity = JUNK;
+            t.config.common._rsvd_tail = [JUNK; 12];
+        });
+        let reserved = RESERVED;
+        assert_eq!(read_byte(&mut sim, ID5, reserved), JUNK, "read as stored");
+        let before = live(&sim);
+        let frames = mgmt(&mut sim, ID5, MgmtOp::Save);
+        assert_eq!(status(sole_reply(&frames)).0.result(), Some(ResultCode::Ok));
+        assert_eq!(read_byte(&mut sim, ID5, reserved), 0);
+        let config = store.slot(Slot::A).expect("first config save lands in A");
+        let config = Image::parse(&config).expect("config image parses");
+        let img = store
+            .calib_slot(Slot::B)
+            .expect("the save after A lands in B");
+        let parsed = CalibImage::parse(&img).expect("calib image parses");
+        let sealed: Vec<u8> = config.config.iter().chain(parsed.calib).copied().collect();
+        for a in 0..SEALED {
+            let want = if covered[a] { before[a] } else { 0 };
+            assert_eq!(sealed[a], want, "addr {a:#05x}");
+        }
+        assert_eq!(live(&sim), sealed, "the live table matches the seal");
+    }
+    let mut sim = sim(baud_idx);
+    sim.add_servo_with_store(ID5, store);
+    assert_eq!(read_u16(&mut sim, ID5, R_Q12), 4016);
+    assert_eq!(read_u16(&mut sim, ID5, TH_RISE_Q016), 2097);
+    assert_eq!(read_byte(&mut sim, ID5, RESERVED), 0);
 }
 
 /// The sec 9.2 + 9.4 field story: ASSIGN takes a new id immediately, SAVE

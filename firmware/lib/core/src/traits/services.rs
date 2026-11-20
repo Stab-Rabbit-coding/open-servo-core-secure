@@ -1,7 +1,9 @@
 use osc_protocol::FrameBytes;
-use osc_protocol::wire::{MgmtOp, ResultCode, UID_LEN};
+pub use osc_protocol::frame::Reboot;
+use osc_protocol::wire::{MgmtOp, ResultCode};
 
-use crate::{BaudRate, BootMode};
+use crate::BaudRate;
+use crate::tel::Chunks;
 
 /// Reply-side runtime failure. Overflow is a sizing bug (reply exceeds the
 /// bus's staging buffer); Busy means a previous reply is still draining.
@@ -44,12 +46,12 @@ pub enum Request<'a> {
     /// prefix; silent otherwise.
     Enumerate {
         prefix_len: u8,
-        prefix: [u8; UID_LEN],
+        prefix: FrameBytes<'a>,
     },
     /// MGMT ASSIGN (sec 9.2): the servo whose UID matches takes `new_id`
     /// immediately and acks from it.
     Assign {
-        uid: [u8; UID_LEN],
+        uid: FrameBytes<'a>,
         new_id: u8,
     },
     /// MGMT CAL (sec 9.3, broadcast-only): `gaps + 1` bare breaks spaced
@@ -69,6 +71,7 @@ pub enum Request<'a> {
 }
 
 /// Bus-derived context core may not derive itself.
+#[derive(Copy, Clone)]
 pub struct RequestCtx {
     /// The wire contract permits a status for this request (false for
     /// NOREPLY-flagged instructions and non-acking broadcasts).
@@ -100,8 +103,15 @@ pub trait Reply {
     fn stage_baud(&mut self, baud: BaudRate);
     /// Immediate: the bus caches this for chain-reclaim timing (sec 6).
     fn set_response_deadline(&mut self, us: u16);
+    /// TEL burst arm, fired once per commit that wrote `tel_count`: stream
+    /// `count` rows of `chunks` as `Stream` status frames once the line is
+    /// host-silent. `count` 0 disarms (the dispatcher passes 0 for chunks
+    /// that are no row, `Chunks::valid`), and so does a line not at
+    /// `tel::BAUD`. The bus zeroes `tel_count` once the arm ends: refused,
+    /// its lend dropped, or its LAST frame out (protocol sec 5.6).
+    fn tel_arm(&mut self, chunks: Chunks, count: u16);
     /// Deferred reboot, honored after any in-flight TX drains.
-    fn stage_reboot(&mut self, mode: BootMode);
+    fn stage_reboot(&mut self, reboot: Reboot);
     /// MGMT CAL accepted (sec 9.3): the bus measures the announced break train
     /// against its own clock and trims the oscillator from it.
     fn begin_clock_cal(&mut self, gap_us: u16, gaps: u8);
@@ -122,22 +132,29 @@ pub enum Dispatched {
 ///
 /// Dispatch-before-verdict is the spine: `dispatch` runs before the frame's
 /// CRC verdict and STAGES effects -- the reply through `R` (the wire effect,
-/// sent or dropped by the bus) and writes into the staging buffer (the table
-/// effect, gated by [`Self::commit`]/[`Self::revert`]). COMMIT and MGMT
+/// sent or dropped by the bus) and checked writes (the table effect, gated by
+/// [`Self::commit`]/[`Self::revert`]). COMMIT and MGMT
 /// cannot stage their effects; the bus routes them verdict-first (CRC checked
 /// before dispatch), and `dispatch` applies them directly on that contract.
 pub trait Dispatch {
     fn dispatch<R: Reply>(
         &mut self,
-        req: Request<'_>,
+        req: &Request<'_>,
         ctx: RequestCtx,
         reply: &mut R,
     ) -> Dispatched;
 
     /// Verdict pass: promote the staged table effect -- a plain write applies
     /// into the live table and fires its hooks; a held write keeps its
-    /// entries for a later COMMIT.
-    fn commit<R: Reply>(&mut self, reply: &mut R);
+    /// entries for a later COMMIT. The bus commits before it sequences the
+    /// staged reply, so the ack never leaves ahead of the effect.
+    ///
+    /// # Safety
+    /// The bytes of the request whose `dispatch` returned
+    /// [`Dispatched::Pending`] must still be readable and unchanged: a plain
+    /// write stores straight from them. A frame's bytes stay in the RX ring
+    /// until the host sends about another 254 bytes (protocol sec 4.1).
+    unsafe fn commit<R: Reply>(&mut self, reply: &mut R);
 
     /// Verdict fail (or frame died): discard the staged table effect.
     fn revert(&mut self);

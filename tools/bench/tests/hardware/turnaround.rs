@@ -2,58 +2,55 @@ use bench::SUPPORTED_BAUDS;
 use bench::osc::{build_ping, build_read, build_write};
 use bench::run::Stats;
 use osc_servo_core::regions::control::addr::lifecycle::GOAL_POSITION;
-use osc_servo_core::regions::telemetry::addr::converted::PRESENT_POSITION;
+use osc_servo_core::regions::telemetry::addr::tick::POS;
 use serial_test::serial;
 
 use crate::support::{Bench, bench};
 
-/// Per-baud ceiling for the mean ping turnaround (us). Ring-cadence timing,
-/// the fixed-us reply gap, and the in-place chain trigger put the floor at
-/// ~36/41 us (500k/1M) and ~49 us (2M/3M, pipeline-bound -- the
-/// covered-overlap window shrinks below the dispatch body; RAM placement
-/// probed and rejected, see the transport pillar). Measured means on the
-/// current fleet build through the adapter instrument:
-/// 35.5/40.9/49.5/48.7 ascending baud.
-/// Each ceiling sits ~6 us above the measured floor: tight enough to
-/// catch a regression from the current baseline, loose enough for the
-/// +/-5 us flash-layout swing.
+/// Budgets for the mean turnaround (us) with the kernel above the bus: a
+/// reply waits out any kernel body in flight, so the means sit about one
+/// kernel body above the dispatch floor and move with where the 50 us ticks
+/// land (run-to-run spread ~2.5 us). Each ceiling sits ~8 us above the
+/// measured mean: the +/-5 us flash-layout swing plus that phase spread.
+/// The bound that matters to a host is RESPONSE_DEADLINE (1000 us); these
+/// catch a regression from the current baseline.
+///
+/// Ping, measured means 62.2/71.0/78.1/77.0 ascending baud.
 fn ping_budget_us(baud: u32) -> f64 {
     match baud {
-        1_000_000 => 47.0,
-        2_000_000 => 55.0,
-        3_000_000 => 55.0,
-        500_000 => 42.0,
-        _ => 55.0,
+        500_000 => 70.0,
+        1_000_000 => 79.0,
+        2_000_000 => 86.0,
+        3_000_000 => 85.0,
+        _ => 90.0,
     }
 }
 
-/// READ ceiling: the reply break waits only on staging the copy-once
-/// snapshot kickoff, not the payload's wire time, so a 16 B read tracks the
-/// ping floor plus the read-dispatch body (measured means 40.6/41.1/49.1/51.6
-/// ascending baud on the current build). Same ~6 us headroom policy.
+/// READ: the reply break waits only on staging the snapshot's first arm, not
+/// the payload's wire time, so a 16 B read tracks the ping floor plus the
+/// read-dispatch body. Measured means 60.4/73.6/77.1/77.1 ascending baud.
 fn read_budget_us(baud: u32) -> f64 {
     match baud {
-        1_000_000 => 47.0,
-        2_000_000 => 55.0,
-        3_000_000 => 58.0,
-        500_000 => 47.0,
-        _ => 60.0,
+        500_000 => 68.0,
+        1_000_000 => 82.0,
+        2_000_000 => 85.0,
+        3_000_000 => 85.0,
+        _ => 90.0,
     }
 }
 
-/// WRITE ceiling: goal_position is the rule-heavy hot-loop register -- its
-/// soft-limit rules dominate the dispatch body (write-size is not the cost),
-/// and the production hot loop pays none of this -- GWRITE is NOREPLY.
-/// Measured means on the enum-slot fleet build: 82.0/88.3/97.5/98.9
-/// ascending baud, within the +/-5 us flash-layout swing. Same ~6 us
-/// headroom policy.
+/// WRITE: goal_position is the rule-heavy hot-loop register; its soft-limit
+/// rules dominate the dispatch body (write size is not the cost), and the
+/// production hot loop pays none of this (GWRITE is NOREPLY). The commit runs
+/// before the ack is sequenced, so its CPU is on the turnaround. Measured
+/// means 151.0/162.6/166.5/166.7 ascending baud.
 fn write_budget_us(baud: u32) -> f64 {
     match baud {
-        1_000_000 => 95.0,
-        2_000_000 => 104.0,
-        3_000_000 => 105.0,
-        500_000 => 88.0,
-        _ => 110.0,
+        500_000 => 159.0,
+        1_000_000 => 171.0,
+        2_000_000 => 175.0,
+        3_000_000 => 175.0,
+        _ => 180.0,
     }
 }
 
@@ -90,31 +87,25 @@ fn ping_turnaround_within_budget() {
     gate(&mut b, &build_ping(id), "ping", ping_budget_us);
 }
 
-/// The copy-once read path at telemetry scale (16 B from the converted
-/// block).
+/// The copy-once read path at telemetry scale (16 B from the raw block).
 #[serial]
 #[test]
 fn read_turnaround_within_budget() {
     let mut b = bench();
     let id = b.id();
-    gate(
-        &mut b,
-        &build_read(id, PRESENT_POSITION, 16),
-        "read",
-        read_budget_us,
-    );
+    gate(&mut b, &build_read(id, POS, 16), "read", read_budget_us);
 }
 
-/// The mutating path: validated goal_position write (board-default value,
-/// so the table state is untouched).
+/// The mutating path: a goal_position write the rule accepts.
 #[serial]
 #[test]
 fn write_turnaround_within_budget() {
     let mut b = bench();
     let id = b.id();
+    let goal = b.goal_mid();
     gate(
         &mut b,
-        &build_write(id, GOAL_POSITION, &0i32.to_le_bytes()),
+        &build_write(id, GOAL_POSITION, &goal.to_le_bytes()),
         "write",
         write_budget_us,
     );

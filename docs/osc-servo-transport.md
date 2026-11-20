@@ -3,9 +3,9 @@
 The servo-side transport of the osc-native protocol: how a sub-$0.20 MCU
 with no input capture and no crystal turns break-framed wire traffic into
 dispatched instructions and on-grid replies. Companion pillars:
-`osc-native-protocol.md` (the wire; §3.4 is the two-signal fault
+`osc-native-protocol.md` (the wire; sec 3.4 is the two-signal fault
 contract), `driver-pattern.md` (the layering). `[Fn]` cites the measured
-foundation in `osc-native-protocol.md` §11.
+foundation in `osc-native-protocol.md` sec 11.
 
 Code is authoritative; when this doc and the code disagree, fix the doc.
 
@@ -14,14 +14,14 @@ Code is authoritative; when this doc and the code disagree, fix the doc.
 All byte movement is hardware. The CPU never receives or transmits a
 byte: DMA writes every received byte into a circular ring, DMA streams
 every reply out of buffers and the control table, and a DMA-fed SPI
-engine computes every CRC. Software is pure state machines — `Framer`,
-`Chain`, `TxEngine`, and the clock tracker — composed by `ServoBus`,
-driven by exactly two interrupt vectors at one priority, whose only jobs
-are to compute two kinds of numbers — *where* frames sit in the ring, and
-*when* something is due — and to react to two kinds of events: "a break
-happened" (the USART's length-qualified LIN break detector) and "it is
-time now" (one tick comparator, multiplexed over every deadline the
-transport has).
+engine computes every CRC. Software is pure state machines - `Framer`,
+`Chain`, `TxEngine`, and the clock discipline - composed by `ServoBus`,
+driven by interrupt vectors at one priority, whose only jobs are to
+compute two kinds of numbers - *where* frames sit in the ring, and *when*
+something is due - and to react to two kinds of events: "a break
+happened" (a timer on the bus pin, length-qualified at 9.5 bit-times)
+and "it is time now" (one tick comparator, multiplexed over every
+deadline the transport has).
 
 ## 2. Hardware ledger
 
@@ -30,81 +30,107 @@ Every hardware resource the transport touches, and its duty cycle:
 | resource        | role                                             | budget/event |
 |-----------------|--------------------------------------------------|--------------|
 | USART1          | half-duplex wire; HDSEL, no self-echo (F9)       | —            |
-| USART1 vector   | PFIC HIGH. (a) LBD = break wake (length-qualified ≥10-bit low; flag-selective write-0 clear at entry, never a DATAR read; FE/NE/ORE have no interrupt enable — they latch silently, §7); (b) TC = TX arm drained | break body ~1 µs; TC body ~2–4 µs/arm |
+| TIM2 vector     | PFIC LOW (0x80). The break wake: TI1 on PC0 (remap 4), counter gated to run only while the line is low and zeroed by DMA1 CH7 at every rising edge, so its overflow at 9.5 bit-times is a break (sec 7) | one entry per break; ~16.5 us with the framer's break body (ping, bench probe) |
+| USART1 vector   | PFIC LOW (0x80). TC = TX arm drained, the one enabled source (never a DATAR read; FE/NE/ORE have no interrupt enable - they latch silently, sec 7) | TC body ~2-4 us/arm |
 | SysTick CNT/CMP | the transport clock (48 MHz, 32-bit) + the ONE comparator | — |
-| SysTick vector  | PFIC HIGH. Deadline mux: framer A/B, covered, chain trigger — and dispatch, inline (every class except verdict-first runs at the covered checkpoint or the fast path, §6) | arithmetic slots ~1–5 µs; dispatch bodies ~10–70 µs |
-| DMA1 CH5        | USART1 RX → 512 B ring, circular, silent (no IRQ); **VERYHIGH, alone atop the ladder** (§7) | zero CPU |
-| DMA1 CH4        | TX arms → USART1 DR (header, snapshot payload, CRC tail); HIGH | zero CPU; TC surfaces as USART TC |
-| DMA1 CH3        | CRC feeds → SPI1 DR, 16-bit halfwords (RX span straight from the ring); MEDIUM, below CH6 | zero CPU, ~0.36 µs/B engine time |
+| SysTick vector  | PFIC LOW (0xC0), after a pending wake or TC. Deadline mux: framer A/B, covered, chain trigger - and dispatch, inline (every class except verdict-first runs at the covered checkpoint or the fast path, sec 6) | arithmetic slots ~1-5 us; dispatch bodies ~10-70 us |
+| DMA1 CH5        | USART1 RX -> 512 B ring, circular, silent (no IRQ); **VERYHIGH, atop the ladder** (sec 7) | zero CPU |
+| DMA1 CH7        | TIM2_CH2 (IC2, rising edge) -> a RAM zero into TIM2 CNT, circular, one halfword per rising edge; VERYHIGH, below CH5 (sec 7) | zero CPU |
+| DMA1 CH2 + TIM3 | TIM2_UP (the detector's overflow) -> TIM3's free-running HCLK count into an 8-entry stamp ring, circular; HIGH, below CH1 (sec 8) | zero CPU; read only during a CAL train |
+| DMA1 CH4        | TX arms -> USART1 DR (header, snapshot payload, CRC tail; a TEL frame's whole image); HIGH | zero CPU; TC surfaces as USART TC, polled by the kernel for TEL frames |
+| DMA1 CH3        | CRC feeds -> SPI1 DR, 16-bit halfwords (RX span straight from the ring); MEDIUM, below CH6 | zero CPU, ~0.36 us/B engine time |
 | SPI1            | CRC-16/ARC coprocessor (16-bit LSB-first, bitrev16 at the register), accumulates across feeds | runs ~8× wire speed (F6) |
-| DMA1 CH6        | snapshot copy → the 256 B snapshot buffer (reply payloads only — RX CRC feeds the ring directly); HIGH, above CH3 | ~0.125 µs/B, zero CPU |
-| DMA1 CH1        | ADC sample set → buffer; DMA HIGH (wins HIGH ties by channel number); TC vector = motor kernel tick at PFIC LOW | ~10 µs body |
-| PC0 CNF         | drive discipline: open-drain listening / push-pull TX window | flipped at trigger/release |
-| main loop       | deferred reboot poll + rescue line sampler (protocol §9.1: line pin + CH5 NDTR once per wfi wake — the break detector latches only at a span's END, so the slow loop is the only observer of a pulse in progress) | cold path; sampler ~0.3 µs/wake |
+| DMA1 CH6        | snapshot copy -> the 256 B snapshot buffer (reply payloads only - RX CRC feeds the ring directly), or while a TEL burst streams the row copies, table chunks -> the frame image, halfwords, armed by the kernel; HIGH, above CH3 | ~0.125 us/B, zero CPU |
+| DMA1 CH1        | ADC sample set -> the control table's tick block; DMA HIGH (wins HIGH ties by channel number); no interrupt from the scans, the kernel polls TC; its vector serves the shunt burst's HT and TC | zero CPU |
+| ADC             | the injected group's end (JEOC) vector = motor kernel tick, alone at PFIC HIGH outside a shunt burst | 14-40 us body (rest to moving) |
+| PC0 CNF         | AF open-drain for good: the servo only pulls low, the host pull-up (and the board keeper) holds mark (protocol sec 2) | set once at init |
+| main loop       | deferred reboot poll + rescue line sampler (protocol sec 9.1: line pin + CH5 NDTR + own-TX state under one bus mask per wfi wake, the window restarting while the servo transmits - the break detector fires once per span, a break-length in, so the slow loop is the only observer of a pulse's length) | cold path; sampler ~0.3 us/wake |
 
-Buffered boards (the default config; the `half-duplex` feature selects
-the direct wire) swap the wire rows: USART1 runs plain full duplex (no
-HDSEL, RX on PC1 through the 74LVC2G241's mute-gated receive buffer), and
-the PC0-CNF flip becomes the TX_EN (PC2) level — high claims the wire and
-mutes RX, low releases. Every discipline in this doc (the no-DATAR rule,
-F9 no-echo) holds identically; only the claim/release lines in `TxWire`
-differ.
+PFIC preemption is two-level (IPRIOR bit 7; bit 6 orders pending vectors
+within a level). The motor kernel (ADC = 29) is alone at HIGH outside a
+shunt burst, which hands HIGH to DMA1_CH1 (22) for its window: its
+entry waits only for a running critical section, whatever the wire
+carries. TIM2 + USART1 + SysTick + SW share LOW, the
+bus level, and therefore serialize against each other; a pending wake or
+TC runs before a pending deadline or stage. The main loop reaches into
+bus state only under `pfic::mask_bus` (PFIC_ITHRESDR at the LOW level),
+which holds the bus off and leaves the kernel live. Free and reserved: TIM1 (motor PWM),
+I2C1_EV (30), I2C1_ER (31). The break detector holds DMA1 CH7, I2C1_RX's
+request channel. The CAL stamps hold DMA1 CH2 (TIM2_UP) and TIM3.
 
-PFIC preemption is two-level (IPRIOR bit 7). USART1 + SysTick share HIGH
-and therefore serialize against each other; LOW holds only the motor
-kernel (DMA1_CH1 = 22), which HIGH preempts and which runs in the wire
-gaps between frames. Free and reserved: TIM2 (reserved: future encoders),
-TIM1 (motor PWM), SW (14), I2C1_EV (30), I2C1_ER (31).
+The kernel side of this split is
+[kernel sec 3](osc-servo-kernel.md#3-the-kernel-above-the-bus).
 
-**Kernel ticks under load — measured and accepted.** Everything-at-HIGH
-means transport work preempts the kernel, and a kernel tick that pends
-while a ≥50 µs HIGH chunk runs coalesces with the next one (the PFIC pend
-bit is one bit). Silicon, against a 20.11 kHz idle tick baseline: tick
-loss ≈ 1.2–1.4× the transport-HIGH duty — 14% under a sustained 9-frame
-zero-gap flood (~11% duty), 23% under a 21-frame flood (~17% duty).
-Latency stays bounded (the longest HIGH chunk is ~60–80 µs ≈ 1–2 ticks);
-ticks are never starved outright. Accepted because the duty profile that
-loses ticks is rare in practice: config sessions run torque-off (kernel
-idle by definition), and the production hot loop is a few small GWRITEs +
-COMMIT + GREAD per cycle — short bursts, wire-gapped, single-digit duty.
-A use case that sustains heavy bus duty under live control is the signal
-to revisit (hardware-counted ticks, or an isolation lane).
+**The bus absorbs the load, the kernel none.** With the kernel on top,
+bus traffic costs the kernel no tick; the bus becomes a background
+server, so each us of bus work costs 1 / (1 - U) us of latency, U being
+the kernel's share of the CPU (36% at rest, 67% while moving). A bus
+body that runs while the kernel ticks simply finishes later, and a
+reply may pause between its arms for about one kernel body (protocol
+sec 4.2). RESPONSE_DEADLINE (1 ms default, protocol sec 7) bounds the
+result. The hazards of being preemptible are closed in the bus code:
+each TX arm clears TC before its DMA starts, the projections read the
+ring cursor before the clock (sec 5.1), and a committed CONFIG write
+lands before the generation the kernel snapshots it under. DES:
+`kernel_on_top_loses_no_tick_under_polling`,
+`reply_bound_covers_turnaround_under_kernel_preemption`.
 
-## 3. One exchange, tick by tick (ping at 1M; byte-time = 10 µs)
+**Frames for other servos.** In a fleet most traffic on the wire is
+somebody else's, and every servo pays for all of it, so a foreign frame
+gets the least work that keeps the ladder honest. Its header is read at
+deadline A like any frame's; from there a plain op addressed to another
+id (from an idle reply pipeline) and a status no chain slot waits on
+schedule no milestone (sec 5.2). The CRC verdict, with no feed ahead of
+it and no decode, runs at the next wake, usually the next frame's
+break - for the status too: its LEN moves the ladder, and a garbled one
+would swallow the frames behind it (sec 5.3), so it costs what the op
+costs (~13 us of verdict, from the static count). A chain slot keeps the
+frame end of the status it waits on, and only the end. Per host request plus
+the reply it draws, a bystander pays two break wakes and three deadline
+wakes (two headers, and the starve horizon that resolves the reply on a
+quiet bus), where every frame used to pay header, covered and end. DES:
+`bystander_entries_per_foreign_exchange_are_pinned`,
+`chain_entries_per_gread_are_pinned`.
+
+## 3. One exchange, tick by tick (ping at 1M; byte-time = 10 us)
 
 ```
-t=0    break's wire end. DMA has already ringed the 0x00. LBD ISR (~2 µs) —
-       a pure wake: the framer resolves from ring data and projects deadline
-       A = now + 3 byte-times at wire pace + ½ byte for the break tail
-       [F5]. No timestamp is recorded.
+t=0    break detector overflow, 9.5 bit-times into the break; the 0x00
+       rings at its stop-bit sample. TIM2 ISR - a pure wake: the
+       framer resolves from ring data and projects deadline A = now + 3
+       byte-times at wire pace + ½ byte for the break tail [F5]. A wake
+       that beat its 0x00 waits one byte-time for it first (sec 5.1). No
+       timestamp is recorded.
 t=10/20/30  ID, LEN, INST land in the ring by DMA. CPU idle.
-t=35   deadline A (SysTick): header parse + validate → footprint 6, frame
+t=35   deadline A (SysTick): header parse + validate -> footprint 6, frame
        end computable. A ping's CRC-covered span IS its header, so the
        covered checkpoint fires from this same wake:
          · packet_end FROZEN by ring cadence: now + missing(2)·byte-times
            (+ the 1.6% drift pad) — `now` and the cursor advance together,
            so ISR lag cancels and the estimate is late by under a
            byte-time, never early.
-         · CRC feed of the covered span starts (CH3 arm, ~1 µs of CPU)
-         · DISPATCH (inline, at HIGH): decode + dispatch run NOW, the
+         · CRC feed of the covered span starts (CH3 arm, ~1 us of CPU)
+         · DISPATCH (inline, at the bus level): decode + dispatch run NOW, the
            reply is built and staged into the TX engine — all before the
            frame has ended. The verdict at deadline B will SEND or
            DON'T-SEND it; the work is already done either way.
        Deadline B armed at the frozen packet_end, exactly.
 t=40/50  the two wire-CRC bytes land. SPI engine finishes the covered span
-       long before (4 B ≈ 1.5 µs). CPU idle again.
+       long before (4 B ≈ 1.5 us). CPU idle again.
 t≈55   deadline B (SysTick): the verdict — poll CRC result (ready) == wire
-       CRC → SEND: chain sequences the staged reply, trigger due at
-       packet_end + reply gap (12 µs, fixed at every baud). Body is a few µs —
-       the work already happened.
-t≈67   trigger (SysTick): INST finalized, PC0 → push-pull, break sent, first
+       CRC -> a staged write COMMITs, then SEND: chain sequences the
+       staged reply, trigger due at packet_end + reply gap (12 us, fixed
+       at every baud). The ack never leaves ahead of its effect, and no
+       later kill of the staged reply can lose a verified write. Body is a
+       few us plus the commit - the work already happened.
+t≈67   trigger (SysTick): INST finalized, break sent, first
        DMA arm armed. Status break falls. TX CRC is computed by the same SPI
        engine IN PARALLEL with transmission and patched into the final arm.
-t=…    per-arm TC ISRs stream the remaining arms; final TC releases the wire
-       and applies any deferred id/baud config.
+t=…    per-arm TC ISRs stream the remaining arms; final TC turns TX DMA
+       off (the pin never changes) and applies any deferred id/baud config.
 ```
 
-Measured: 30.4 µs from instruction end to status break fall (§10). The
+Measured: 30.4 us from instruction end to status break fall (sec 10). The
 estimate chain above — reply-gap grid plus sub-byte estimate lateness —
 accounts for roughly half; the remainder is trigger-body, break commit,
 and ISR-entry overheads.
@@ -117,17 +143,23 @@ and ISR-entry overheads.
    verdict then gates those effects, never the work. This is not an
    optimization layered on a "safe" path — it IS the default, for every
    class. The alternative (a non-dispatching path that schedules a CRC
-   check and blocks on the result before doing any work) spends ~5–7 µs
-   of HIGH per frame spinning on a finished engine, and in a zero-gap
+   check and blocks on the result before doing any work) spends ~5–7 us
+   of bus CPU per frame spinning on a finished engine, and in a zero-gap
    burst those spins stack onto the burst-cycle critical path and widen
    break-delivery lag — so no such path exists. The verdict gates two
    effect kinds: the **wire effect** (a staged reply — SEND on pass,
-   DON'T-SEND on fail) and the **table effect** (staged writes — COMMIT
-   on pass, REVERT on fail). Ping/read stage only a wire effect; a
+   DON'T-SEND on fail) and the **table effect** (a checked write - COMMIT
+   stores it from the ring on pass, REVERT drops it on fail; a HOLD write
+   is staged until a COMMIT frame). Ping/read stage only a wire effect; a
    NOREPLY write only a table effect; a reply-bearing write both, under
-   one verdict.
+   one verdict, table effect first: the commit lands before the reply is
+   sequenced, so the status break never leaves ahead of the effect it
+   acknowledges, and a staged reply killed later (a following break, a
+   supersede, a rescue) never takes a verified write with it. The cost is
+   the commit's post-commit bookkeeping (tens of us on the chip) on the
+   write's turnaround.
 2. **Work hides under wire time.** The dispatch window (covered
-   checkpoint → frame end) runs decode + dispatch + reply build while the
+   checkpoint -> frame end) runs decode + dispatch + reply build while the
    last two CRC bytes are still in flight. Deadline B — the only step on
    the reply's critical path — is reduced to "poll a finished CRC and arm
    the trigger". The reply rides the reply-gap grid, not the dispatch
@@ -135,7 +167,7 @@ and ISR-entry overheads.
 3. **The verdict is almost always PASS.** Dispatch bets the frame passes
    CRC. On a clean bus that is ~100% of frames; the loser (a corrupted
    frame) pays a revert + don't-send, which is off the happy path by
-   definition — and the frame-position ladder is untouched by it (§5), so
+   definition - and the frame-position ladder is untouched by it (sec 5), so
    the hunt just starts one hop later, on corrupt frames only, inside the
    host's retry contract.
 4. **Hardware CRC in both directions, in parallel.** RX: fed at the
@@ -143,20 +175,20 @@ and ISR-entry overheads.
    polled at the verdict. TX: fed per arm, patched into the trailing arm
    before DMA reaches it. The CPU never computes or waits a full CRC.
 5. **Zero hops, everywhere.** Every stageable class (ping/read/gread,
-   write/gwrite) dispatches inline at HIGH — each stage hands off by
-   falling through within one ISR invocation or the next event's entry,
-   no cross-priority round-trip. The kernel-side cost is the measured,
-   accepted tick coalescing in §2.
+   write/gwrite) dispatches inline at the bus level - each stage hands
+   off by falling through within one ISR invocation or the next event's
+   entry, no cross-priority round-trip. The kernel above preempts it and
+   loses nothing; the bus pays in latency (sec 2).
 6. **Copy-once TX.** Reply payloads are DMA-snapshotted once
-   (~0.125 µs/B, fire-and-forget) and streamed from the snapshot by both
+   (~0.125 us/B, fire-and-forget) and streamed from the snapshot by both
    the wire and the CRC — snapshot-consistent reads for the price of one
-   copy hidden under reply gap (protocol §4.2).
+   copy hidden under reply gap (protocol sec 4.2).
 7. **One comparator, muxed.** Every deadline (framer A/B/covered, chain
    trigger, rescue) folds onto SysTick CMP with pend-on-past semantics;
    the drain loop consumes every slot due at the same wake.
 8. **The single-context CRC engine needs no arbitration protocol.** TX
    generation and RX validation share one engine safely because both run
-   at HIGH — ownership is serialized by the PFIC, for free.
+   at the bus level - ownership is serialized by the PFIC, for free.
 
 ## 5. Position and time from the stream
 
@@ -167,7 +199,7 @@ projections, never wake arrival.**
 The rationale is staleness, not latency. A handler that samples the ring
 cursor at ISR entry and classifies the event by `ring[cursor−1]` reads
 the wrong byte whenever service lags the wire by a byte-time — and at 3M
-(3.33 µs/byte) any dispatch body guarantees that lag, while two pended
+(3.33 us/byte) any dispatch body guarantees that lag, while two pended
 breaks coalesce into one PFIC entry. The failure is silent: the cursor
 has moved past the break byte, the test reads frame data, the framer
 ignores the "garble", and a fully intact frame in the ring is never
@@ -182,7 +214,7 @@ The break wake carries neither position nor time. It is a pure wake, and
 its handler does only the bounded wire work: staged-reply kill (from
 which broadcast-ENUM replies are exempt — colliding is their contract,
 and they ride a UID-keyed slot delay so twin matchers don't collide in
-undetectable unison, protocol §9.2) and chain suspend. Every aim and
+undetectable unison, protocol sec 9.2) and chain suspend. Every aim and
 estimate is instead projected from live ring state at each resolve:
 
 ```
@@ -190,8 +222,8 @@ aim / estimate = now + missing·tpb (+ span·tpb ≫ 6 drift pad)
 ```
 
 `now` and the cursor advance together, so ISR delivery lag — the thing a
-wake timestamp inherits wholesale (a 60 µs-late wake makes the reply
-60 µs late) — cancels out of the projection. The error is bounded by one
+wake timestamp inherits wholesale (a 60 us-late wake makes the reply
+60 us late) - cancels out of the projection. The error is bounded by one
 byte-time plus one wake latency and is always on the LATE side: a byte
 counted as missing can only finish sooner than assumed, so a reply grid
 measured from the estimate never fires into its own frame's tail (the
@@ -203,6 +235,22 @@ byte-time out, so no recheck/park budget machinery exists; the
 authority. One epsilon survives, on header aims only: the break rings at
 its wake point ~4 bit-times before the line rises [F5], so the first data
 byte sits that far outside the byte cadence.
+
+The wake can beat its own byte. The detector fires 9.5 bit-times into
+the break, ahead of the stop-bit sample that rings the `0x00`, so a wake
+whose break byte has not rung gets its ring-dependent service - the
+resolver, the staged-reply kill - one byte-time later, at a third
+deadline slot. The break's position comes from the ladder, never from
+the wake: the
+resolver walks the ladder onto the break's own byte through every frame
+whole in the ring, however many data bytes a late service finds ringed
+behind it (under 1M bursts the frame-end body spans the next detector
+fire, so every wake lands a byte-time or more late, with data bytes
+newest). A CAL ruler mark needs neither: it is its detector's hardware
+stamp (sec 8). DES: `tests/break_wake.rs` runs its pins with the wake ahead of
+its byte, behind it, and alternating between the two;
+`lagged_break_wakes_resolve_every_frame` serves every wake 2.5 byte-times
+late.
 
 ### 5.2 The ring is the queue
 
@@ -220,12 +268,20 @@ and never reloaded. From then on:
   scheduling; the 512 B ring (≥ 15 hot-loop frames) is the queue, and it
   cannot "drop" an entry the way a snapshot queue can.
 - **Scheduled path (newest frame only).** The frame still arriving rides
-  the deadline pipeline: A (header) → covered checkpoint (dispatch, §6) →
+  the deadline pipeline: A (header) -> covered checkpoint (dispatch, sec 6) ->
   B (verdict), every deadline a ring-cadence projection.
+- **No milestone.** A frame that can change nothing until it is whole -
+  another servo's plain op while the reply pipeline is idle, or a status
+  no chain slot is waiting on - schedules nothing after A. The next
+  wake resolves it from the ring like any backlog frame (it still gets
+  its CRC verdict, which keeps the stride trusted), and only
+  the starve horizon is armed for it, so a truncated one still dies by
+  starve. DES: `truncated_foreign_frame_starves_then_recovers`,
+  `snooped_slot_answers_a_reply_gap_after_its_predecessor`.
 
 ### 5.3 Garble dies by data only
 
-Per the fault contract (protocol §3.4), no frame is dropped, killed, or
+Per the fault contract (protocol sec 3.4), no frame is dropped, killed, or
 rejected on wake evidence — wake-time observations (service-time cursors,
 latched re-fires) lie under exactly the conditions a busy fleet produces:
 coalesced or lagged break service at high ISR occupancy, and latched-flag
@@ -234,38 +290,88 @@ flag). A death decision derived from them plants itself inside live
 frames. Data is the only death authority: a phantom candidate born from
 garble is killed by its footprint-fill CRC verdict or by the starve
 horizon — never by fault position. The cost is bounded, documented
-recovery latency (the host pacing rule, protocol §3.4) instead of
+recovery latency (the host pacing rule, protocol sec 3.4) instead of
 fault-speed phantom kills; a phantom's CRC rejection flips the hunt on,
 and the hunt converges from ring data.
 
 Corruption recovery is bounded: a corrupted LEN mis-strides the ladder;
 the next resolution finds no `0x00` at the expected anchor (or the frame
-fails CRC) → drop + count, and the ladder re-verifies at every following
-boundary. Anchors are parity-free (protocol §3.2), so recovery needs no
+fails CRC) -> drop + count, and the ladder re-verifies at every following
+boundary. Anchors are parity-free (protocol sec 3.2), so recovery needs no
 ring reload, only the next break's arrival. Loss is bounded to ≤ 2 frames
 per corruption event; the host's timeout+retry contract closes the loop.
+
+Statuses are no exception, though nothing acts on their bodies. A status
+LEN garbled long would otherwise swallow up to 258 B of the frames behind
+it, so every status is checked before the ladder steps past it. One a
+chain slot waits on is checked for free: a uniform GREAD sizes every
+predecessor's reply, so a LEN that is neither that span's nor an empty
+error status's is a framing drop before it counts (a short one would time
+the slot into its predecessor's tail; the slot answers at its reclaim
+instead, flagged). Any other status gets the CRC verdict at the next
+wake, like a foreign op. DES: `garbled_status_len_costs_only_the_status`,
+`waiting_slot_drops_a_status_len_its_gread_rules_out`.
 
 ## 6. Instruction classes
 
 The class split is *stageability* — whether an instruction's effects can
 be staged behind the CRC verdict:
 
-- **Stageable — PING/READ/GREAD/WRITE/GWRITE.** Dispatch inline at HIGH
-  at the covered checkpoint (frontier) or the resolve wake (backlog); the
+- **Stageable - PING/READ/GREAD/WRITE/GWRITE.** Dispatch inline at the
+  bus level at the covered checkpoint (frontier) or the resolve wake (backlog); the
   CRC feed chews underneath. The verdict at the frame end gates the
-  staged effects: SEND/DON'T-SEND of a reply, COMMIT/REVERT of a table
-  write.
+  staged effects: COMMIT/REVERT of a table write, then SEND/DON'T-SEND
+  of a reply (sec 4: the commit lands before the reply is sequenced).
 - **Verdict-first — COMMIT/MGMT.** Their effects cannot be staged (COMMIT
   applies the whole buffer; MGMT reboots), so the CRC is checked FIRST
-  and dispatch runs only on a pass. Rare, short frames — the ~2 µs
+  and dispatch runs only on a pass. Rare, short frames - the ~2 us
   blocking CRC poll is affordable where staging isn't possible.
+- **Unsolicited - TEL bursts (protocol sec 5.6).** The one place the
+  servo transmits without an instruction on the wire. A committed
+  nonzero `tel_count` arms it; the host is silent by contract until the
+  LAST-flagged frame, so the TX lane, the CRC engine and DMA1 CH6 (the
+  reply snapshot's channel, idle while no reply is staged) are the
+  burst's and the bus lends them to the kernel tick (PFIC HIGH): at the
+  arming ack's release, or at the arm when no ack follows. The kernel
+  lands each control tick's row straight to its final wire offset in one
+  of two frame images (header, head, rows, CRC slot): the longer chunk
+  by one CH6 memory-to-memory copy, armed first, then the shorter (at
+  most 6 B, under the DMA arm's cost) by CPU halfword stores while the
+  copy runs, at a fixed point right
+  after the tick block is published, ahead of the next scans the ADC
+  DMA lands in the block, so every row is one tick's; CH6 above the CRC
+  feed's CH3 lands the copy ahead of any feed that reads it, and one arm
+  a tick leaves no copy in flight at the next. The bus derives the
+  row's copies at the arm, so the kernel's first tick only takes them. A frame starts once its lead row has landed - the start rule
+  leaves the DMA three ticks behind the rows and the patch - with a CRC
+  reset, the written bytes' feed and the law break; the next tick arms
+  CH4 for the whole image with no TCIE, the DMA reading rows as the wire
+  reaches them. The bank's feed and the CRC patch follow on later ticks,
+  one lane step a tick, none on a tick that lands a head or a bank
+  or runs a SLOW stage;
+  the kernel polls TC and starts the next frame in the tick the last one
+  ends. No bus body runs between frames. Lost ticks mid-frame ship stale
+  bytes against the fresh CRC: the frame fails it, never silently, and
+  nothing wedges (the arm is finite). After LAST the bus takes the lane
+  back in its next body, its ladder resumed at the ring cursor the
+  kernel read while LAST streamed (the receiver is deaf under own TX),
+  so host traffic during the burst is skipped, never served late, and
+  zeroes `tel_count`: the register reads nonzero only while a burst is
+  armed or streams, the shunt burst's arm condition (an arm that never
+  lends, refused or its ack cut short, zeroes it at once).
+  Cross-context traffic is a lent flag, an arm mailbox and the LAST
+  notice, single-writer volatile discipline, no atomics. A row that
+  finds both images unfinished drops and is counted - the fast tick
+  never blocks.
 
 Backpressure is structural: at most one pending-verdict frame exists at a
 time (the pending frame IS the frontier), so the single staging slot and
-the single CRC accumulator are never contended. The kernel-isolation
-question is settled by measurement instead of structure: dispatch bodies
-preempt the kernel and coalesce ticks in proportion to bus duty (§2),
-which the intended duty profiles make negligible.
+the single CRC accumulator are never contended. Own TX holds the same
+accumulator from trigger to release, so the ladder resolves nothing while
+a reply streams; the release resumes it from the ring, and a frame that
+landed meanwhile (a peer talking over the reply) gets its verdict then.
+DES: `status_verdict_waits_for_own_tx_release`. The kernel is isolated
+by structure: it sits above every dispatch body (sec 2).
 
 ## 7. The DMA priority ladder and receive-side discipline
 
@@ -278,23 +384,30 @@ byte-still-undrained entries observed across soaks at 1M and 3M); the
 window opens ONLY under DMA1-arbiter contention, where a competitor
 delays the CH5 drain — 22% of frames at a moderate competing burst, 94%
 at a heavy one. The arbiter preempts **per-beat** (RX stays clean even
-against a 256-transfer competitor once it outranks it), so RX alone at
-the top bounds its drain wait to a single in-flight transfer — a couple
-of cycles, far under interrupt entry latency — regardless of the
+against a 256-transfer competitor once it outranks it), so RX at the top
+bounds its drain wait to a single in-flight transfer - a couple of
+cycles, far under interrupt entry latency - regardless of the
 competitor's burst length.
 
 So the guarantee is the priority ladder, not a software mitigation:
 
-- **VERYHIGH:** CH5 RX — alone at the top.
-- **HIGH:** CH1 ADC, CH4 TX, CH6 snapshot (ADC wins the HIGH ties by
-  channel number, keeping its interleave ahead of the copy).
-- **MEDIUM:** CH3 CRC feed — below CH6 so a reply copy is written before
+- **VERYHIGH:** CH5 RX and CH7 detector zero. The zero is one halfword
+  per rising bus edge and must land before the next low has counted the
+  detector's last quarter bit-time on top of a 9-bit data low, about one
+  bit-time (16 HCLK at 3M); RX wins the tie on channel number, so each
+  waits at most one beat of the other. At HIGH it would lose every beat
+  of a snapshot copy.
+- **HIGH:** CH1 ADC, CH2 CAL stamp, CH4 TX, CH6 snapshot (ADC wins the
+  HIGH ties by channel number, keeping its interleave ahead of the copy;
+  the stamp's one halfword per break waits at most one beat of a copy).
+- **MEDIUM:** CH3 CRC feed - below CH6 so a reply copy is written before
   the feed reads it.
 
-With RX on top the break byte is always ringed before `on_break` reads
-ring state, so the framer needs no promise machinery from the wake.
-Silicon: 25k/25k zero-gap hot loops at 2M and 3M with zero
-no-reply/stale.
+With RX on top no ringed byte is ever missing from a cursor read. The
+ladder cannot put the break's own `0x00` ahead of its wake, though - the
+detector fires before that byte exists - and that case is the one-byte
+re-inspection's (sec 5.1). Silicon: 25k/25k zero-gap hot loops at 2M and 3M
+with zero no-reply/stale.
 
 **The no-DATAR rule.** The ladder protects only the byte already in RDR.
 A CPU DATAR read while a byte is mid-reception additionally kills the
@@ -305,83 +418,102 @@ at 1M under one alignment. So nothing on the receive side ever touches
 DATAR. Silicon: 12k/12k plain floods at 1M and 0.5M with no RX-path DATAR
 read, versus 44/12k with one present.
 
-**LBD is the only receive interrupt.** Its clear at entry is a
-flag-selective STATR write — all bits 1 except LBD's 0, a constant write,
-never a read-modify-write (an RMW races concurrently-setting rc_w0 bits
-and arms the SR half of the error-clear pair). The per-character error
+**The break detector is the only receive interrupt.** HDSEL disables
+the USART's LIN break detector on this silicon (protocol F16), so the
+detector is TIM2 on the bus pin, and the hardware does all of the
+qualifying. Remap 4 puts TI1 on PC0. Slave gated mode on TI1FP1 with
+CC1P inverting it runs the counter only while the line is low. IC2,
+mapped onto the same TI1, captures each rising edge, and its DMA request
+(DMA1 CH7, circular) copies a RAM zero into the counter. The overflow
+at 9.5 bit-times of continuous low (ARR 912/456/228/152 at
+0.5M/1M/2M/3M, rewritten with every BRR write) raises the update, the
+one enabled interrupt: an idle line and frame data never reach it.
+
+A low that is still held when the service runs (often the break's own
+tail, a rescue pulse, a stuck line) would
+overflow again every 9.5 bit-times, so the service parks the counter
+at ARR + 1: it must wrap through 0xFFFF, 65536 ticks of low, before it
+can overflow again, and the rising edge's zero un-parks it with no CPU.
+CC2IF, set by every rising edge and cleared only by the park, tells a
+parked low's re-fire from a fresh break, so a low of any length is one
+wake; nothing reads CH2CVR, whose read would clear it. A rising edge
+between the pin read and the park, whose zero the park overwrote, shows
+as the pin high on a re-read and is replayed by a software capture
+(CC2G), which sets CC2IF and requests the zero as the edge did. The
+servo's own break is sent with the update masked: the receiver hears
+nothing of its own TX (F9), but the pin does. The per-character error
 flags (FE/NE/ORE) are never serviced: EIE stays 0 from boot, so a latched
 error flag pends nothing, storms nothing, and needs no retire protocol.
 The flags self-clear incidentally when ordinary traffic pairs a STATR
 read with the drain's DATAR access, but nothing observes or depends on
 it; at most they may be polled from a cold path as line-noise telemetry
-(protocol §3.4).
+(protocol sec 3.4).
 
-The rationale for waking on LBD rather than the error flags is
-first-principles: the error flags are latched, positionless, and
+The rationale for waking on a length-qualified break detector rather
+than the error flags is first-principles: the error flags are latched, positionless, and
 coalescing, so a wake built on them shall be throttled against garble
 storms (wrong-baud traffic heard as continuous framing errors), and any
 mute needs a restore path that itself cannot be starved — a structural
-liability. A wake that never needs muting deletes the problem: LBD is
-length-qualified (only a genuine ≥10-bit dominant span sets it), so real
-errors never interrupt at all, and their consequences surface exactly
-where data-driven handling already looks (§5.3). Silicon: law breaks
-2000/2000 intact with the write-0 clear running mid-traffic; zero vector
-entries across framing-error injection and high-baud garble; reception
-perfect with FE latched throughout, entries == breaks for the whole run.
+liability. A wake that never needs muting deletes the problem: the
+detector is length-qualified (only a dominant span past 9.5 bit-times
+fires it), so real errors never interrupt at all, and their consequences
+surface exactly where data-driven handling already looks (sec 5.3).
+Silicon: law breaks 100/100 at every rate, one entry each; zero entries
+on an idle line; zero false breaks from frame data or faster-baud garble
+(protocol F17).
 
 ## 8. Clock discipline
 
-Chain snoop is servo→servo (protocol §9.3): slot k>0 times its reply off
+Chain snoop is servo->servo (protocol sec 9.3): slot k>0 times its reply off
 the predecessor's snooped status frame, so the clock budget is
-pairwise-HSI — two uncalibrated RC oscillators against each other.
+pairwise-HSI - two uncalibrated RC oscillators against each other.
 Factory spread (7k+ ppm measured across five chips) garbles snooped
 status tails at 3M; trimming is what makes high-baud chains work. The
 host owns the only crystal on the bus, so it is the syntonization root:
-the servo measures the host's cadence and slews HSITRIM toward it.
+the servo measures the host's crystal and slews HSITRIM toward it.
 
-Two estimators feed the trim loop, both built on break-wake stamps at
-frame boundaries — hardware-anchored and same-ISR-flavor, so entry
-latency cancels in every pair. (Mid-frame progress stamps do not have
-this property: they are whole-byte-quantized with software-chosen phase,
-and they need frames far longer than real hot-loop traffic provides.)
-These stamps are the one sanctioned exception to §5's no-wake-time rule —
-the trim machinery's entire subject is the break-service stamp itself,
-and it is gated, paired, and baseline-anchored accordingly (protocol
-§3.4, §9.3).
+The one measurement is **MGMT CAL**: a broadcast instruction announcing N
+breaks spaced exactly T us; the servo times each break by hardware, gates
+each gap at |d - T| <= T/16, and trims off the sum. The detector's
+overflow (TIM2_UP) requests DMA1 CH2, which copies TIM3's free-running
+HCLK count into an 8-entry ring, so every stamp sits the same 9.25
+bit-times into its break and the offset cancels in the difference. The
+wake only collects: during a live train each break service takes the
+stamps in wire order, however late or coalesced it runs, and a gap is the
+16-bit difference of two. The servo's own breaks never latch (the mute
+drops the request with the interrupt), and a CAL announce drops what
+traffic left, so the train's first mark opens the ruler. Nothing is
+paired with ring positions: a train is bare breaks, so stamps are marks.
+A wake lagging past the ring's 8 marks loses those gaps to the gate, and
+a train with fewer than half its gaps valid decides nothing. Break time
+is never the wake's (sec 5, protocol sec 3.4). Break decode is threshold-free across the full HSITRIM throw, so
+CAL also rescues a railed servo.
 
-- **Absolute, rarely — MGMT CAL.** A broadcast instruction announcing N
-  breaks spaced exactly T µs; the servo stamps `deadline.now()` at each
-  break-wake entry, gates each gap at |Δ−T| ≤ T/16, and trims off the
-  sum. ~±260 ppm from 8 × 400 µs gaps. Fired at boot (≥2 trains — the
-  first identifies the chip's step effect, protocol §9.3 boot guidance)
-  and at host-known events, not on a timer. Break decode is
-  threshold-free across the full HSITRIM throw, so CAL also rescues a
-  railed servo.
-- **Differential, continuously — chain pairs.** Break-wake stamps of
-  adjacent host instructions (GWRITE→COMMIT seams):
-  `err = measured − footprint·tpb = seam + drift·span`. The host's
-  queuing seam is unknown but stationary; a baseline captured right after
-  each trim application subtracts it, so windows read pure drift. Any
-  constant — seam, detector latch offset, ISR flavor residue — dies in
-  the subtraction; only changes survive, and the sanity band catches
-  non-thermal jumps.
+Frame traffic never trims. The host sends CAL when it detects a servo
+(at least two trains - the first identifies the chip's step effect,
+protocol sec 9.3 boot guidance), then periodically to follow thermal
+drift; a rate change needs none.
 
-Both feed the `TrimLoop`: `steps = round(err / step_effect)`, clamped ±4;
-round-to-nearest IS the deadband. The step effect is self-measured (chip
-steps are nonuniform, 1.4–3.2k ppm; sanity-banded 0.8–4k); the total is
-applied via HSITRIM between frames and mirrored read-only at
-`telemetry.clock.trim_steps`. Wire format, qualification rules, and the
-tracker's baseline mechanics are normative in protocol §9.3. DES:
-`tests/trim.rs` — trains converge/reject/watchdog, the tracker follows
-mid-run drift injection, constant seam+skew cancel exactly, solicited
-shapes never pair.
+The measurement feeds the `TrimLoop`: `steps = round(err / step_effect)`,
+clamped +/-4; round-to-nearest IS the deadband. The step effect is
+self-measured, CAL to CAL over the steps applied between (chip steps are
+nonuniform, 1.4-3.2k ppm; sanity-banded 0.8-4k). The total is applied via
+HSITRIM between frames and mirrored read-only at
+`telemetry.clock.trim_steps`. Wire format and rules are normative in
+protocol sec 9.3. DES:
+`tests/trim.rs` - trains converge/reject/watchdog, every mark served
+U(0, 60) us late reads within 0.1 step (`cal_ruler_ignores_wake_lag`),
+traffic stamps never reach the ruler
+(`cal_ruler_opens_on_the_first_mark_after_traffic`), traffic never trims
+between CALs (`traffic_never_trims_between_cals`), and a CAL re-converges
+after a thermal shift (`cal_reconverges_after_a_thermal_shift`).
 
 ## 9. Losslessness
 
 The zero-gap argument, from first principles:
 
 1. **Capture.** Every byte is DMA'd regardless of CPU state; breaks pend
-   and may coalesce, but §5 derives frame positions from the stream, so a
+   and may coalesce, but sec 5 derives frame positions from the stream, so a
    coalesced or delayed wake costs nothing — the fast path recovers every
    completed frame from data.
 2. **Backlog.** Bounded by the ring (512 B ≈ 15 minimal hot-loop frames).
@@ -390,36 +522,43 @@ The zero-gap argument, from first principles:
    (`zero_gap_flood` in `hot_loop.rs`: 100 zero-gap minimal writes +
    READ, ring laps ~2×, dispatch-cost sweep inside the contract, zero
    loss at 1M and 3M), not by a runtime guard.
-3. **Ordering.** At most one pending-verdict frame at a time (§6), so the
+3. **Ordering.** At most one pending-verdict frame at a time (sec 6), so the
    in-order ring walk preserves frame order. A backlog write commits
    before the frame behind it dispatches — DES-pinned by
    `backlog_write_then_read_processes_in_order`.
 4. **The host's side of the contract.** RESPONSE_DEADLINE shall cover the
-   full reply path — decode + dispatch + verify, elastically late under a
-   backlog — not just the happy-path grid: with ~70 µs dispatch bodies a
-   60 µs default is dishonest, and a chain slot reclaims into a
-   live-but-slow predecessor (DES-pinned in `hot_loop.rs`). Deployments
-   tune the register to their measured worst case.
+   full reply path - decode + dispatch + verify, stretched by the kernel
+   above the bus and elastically late under a backlog - not just the
+   happy-path grid. The 1 ms default covers the published capacity
+   (`reply_bound_covers_turnaround_under_kernel_preemption`); a chain
+   slot counts its reclaim from its own readiness, so a backlog every
+   servo shares does not make it reclaim into a live-but-slow predecessor
+   (`reclaim_window_counts_from_the_slots_own_readiness`), and a
+   predecessor's break suspends the reclaim for the largest frame plus
+   RESPONSE_DEADLINE, which covers the pauses inside a reply
+   (`chain_slot_survives_a_predecessor_stalled_inside_its_frame`).
 
 ## 10. Measured turnarounds
 
-Turnaround = instruction wire-end → status break fall. Read = 16 B READ,
+Turnaround = instruction wire-end -> status break fall. Read = 16 B READ,
 write = goal_position 4 B WRITE. Flash-layout swings between builds are
-±5 µs.
+±5 us. The table predates the kernel-above-bus layout (sec 2), under
+which turnaround is the bus's CPU cost stretched by 1 / (1 - U): with
+the motor at rest, ping p50 about 70 us at 1M and 77 us at 3M.
 
 | baud  | ping    | read 16 B | write 4 B |
 |-------|---------|-----------|-----------|
-| 0.5M  | 32.2 µs | —         | —         |
-| 1M    | 30.4 µs | 38.6 µs   | 87.7 µs   |
-| 2M    | 38.8 µs | —         | —         |
-| 3M    | 41.3 µs | —         | —         |
+| 0.5M  | 32.2 us | - | - |
+| 1M    | 30.4 us | 38.6 us   | 87.7 us   |
+| 2M    | 38.8 us | - | - |
+| 3M    | 41.3 us | - | - |
 
 Under burst load the elasticity is small: hot-loop mean turnaround at 1M
-is 35.4 µs, plain-flood 31.3 µs.
+is 35.4 us, plain-flood 31.3 us.
 
 The shape: the reply's tail after the instruction's wire end is
-`max(serialized CPU pipeline, reply-gap grid)`. The grid is flat (12 µs
-at every baud, protocol §7) and the estimate it hangs off is
+`max(serialized CPU pipeline, reply-gap grid)`. The grid is flat (12 us
+at every baud, protocol sec 7) and the estimate it hangs off is
 delivery-noise-free, so 0.5M/1M pings sit together — grid-bound. 2M/3M
 are pipeline-bound: the covered window shrinks below the dispatch body —
 at 3M a short frame is fully ringed before the first deadline wake even
@@ -428,14 +567,15 @@ fires — so the pipeline serializes after the frame end.
 ## 11. Glossary
 
 - **break** — line held low ≥ a byte-time; the out-of-band frame
-  delimiter. Rings as one 0x00 byte, sets LBD — the transport's only
-  receive wake (FE latches too, unserviced). Break framing is the strong
+  delimiter. Rings as one 0x00 byte and fires the break detector - the
+  transport's only receive wake (FE latches too, unserviced). Break framing is the strong
   form of sync: DXL 2.0's `FF FF FD` hunting + byte stuffing is the
   workaround for not having an out-of-band delimiter at all.
 - **garble** — line damage that is not a break: a corrupted byte (slot
   occupied, CRC will fail) or a phantom byte (noise-invented byte between
-  frames). Raises no wake at all (sub-10-bit lows are invisible to the
-  detector, errors never interrupt); dies by data (§5.3).
+  frames). Raises no wake at all (lows under 9.5 bit-times are
+  invisible to the detector, errors never interrupt); dies by data
+  (sec 5.3).
 - **anchor / footprint** — a frame's start index in the ring / its total
   ring length including the break byte.
 - **covered span** — everything the CRC protects: the frame minus its two
@@ -444,23 +584,24 @@ fires — so the pipeline serializes after the frame end.
   (2 byte-times before frame end); the dispatch point.
 - **dispatch (the spine)** — decode + dispatch + reply build performed
   before the CRC verdict — the default for every class, not an
-  optimization (§4). Effects STAGE; they do not apply until the verdict.
+  optimization (sec 4). Effects STAGE; they do not apply until the verdict.
 - **verdict** — the CRC result at the frame end, gating the staged
   effects: the **wire effect** (a staged reply — SEND on pass, DON'T-SEND
   on fail) and the **table effect** (staged writes — COMMIT on pass,
   REVERT on fail). Ping/read stage only wire; a NOREPLY write only table;
-  a reply-bearing write both, under one verdict.
-- **instruction class** — stageability (§6): *stageable*
-  (ping/read/gread/write/gwrite — dispatch inline at HIGH, effects gated
+  a reply-bearing write both, under one verdict, committed then
+  sequenced (sec 4).
+- **instruction class** - stageability (sec 6): *stageable*
+  (ping/read/gread/write/gwrite - dispatch inline at the bus level, effects gated
   by the verdict), *verdict-first* (commit/mgmt, CRC checked before
   dispatch).
 - **deadline A / B** — header-readable check / frame-end check, both
   ring-cadence projections (`now + missing byte-times`) re-derived at
-  every wake (§5).
+  every wake (sec 5).
 - **reply gap** — the mandated wire gap between a frame and its reply
-  (12 µs, fixed at every baud — host TC→release is time-domain, protocol
-  §7); the reply grid.
-- **fast path / scheduled path** — §5.2's split: complete-in-ring frames
+  (12 us, fixed at every baud - host TC->release is time-domain, protocol
+  sec 7); the reply grid.
+- **fast path / scheduled path** - sec 5.2's split: complete-in-ring frames
   resolved from data with no clock / the newest frame timed by deadlines.
 - **starve horizon** — 64 byte-times of ring silence on a pending frame;
-  the fallback death authority for garble-born candidates (§5.3).
+  the fallback death authority for garble-born candidates (sec 5.3).

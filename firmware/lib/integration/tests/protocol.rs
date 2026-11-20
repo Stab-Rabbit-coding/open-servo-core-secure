@@ -7,11 +7,11 @@ use osc_integration::sim::{
     HandlerCost, Sim, Source, WireFrame, assert_valid, instruction, status,
 };
 use osc_protocol::wire::{Id, Inst, MgmtOp, Opcode, ResultCode};
-use osc_servo_core::BaudRate;
+use osc_servo_core::regions::PROFILE_BASE_ADDR;
 use osc_servo_core::regions::config::addr::common::{BAUD_RATE_IDX, ID};
 use osc_servo_core::regions::control::addr::lifecycle::TORQUE_ENABLE;
 use osc_servo_core::regions::profile::span_word;
-use osc_servo_core::regions::{CALIB_BASE_ADDR, PROFILE_BASE_ADDR};
+use osc_servo_core::{BaudRate, Reboot};
 use rstest::rstest;
 use rstest_reuse::apply;
 
@@ -54,7 +54,8 @@ fn ping_reports_model_and_fw(baud_idx: u8) {
         )
     });
     let m = model.to_le_bytes();
-    assert_eq!(payload, &[m[0], m[1], fw]);
+    let f = fw.to_le_bytes();
+    assert_eq!(payload, &[m[0], m[1], f[0], f[1]]);
 }
 
 #[apply(matrix)]
@@ -62,21 +63,21 @@ fn read_returns_table_bytes(baud_idx: u8) {
     let mut sim = sim(baud_idx);
     let s = sim.add_servo(ID5);
 
-    // READ config identity span [0, 4): model(2) + fw(1) + hardware_revision(1).
+    // READ config identity span [0, 4): model(2) + fw(2).
     sim.host_send(&instruction(ID5, Opcode::Read, 0, &[0, 0, 4, 0]));
     let frames = sim.run();
 
     let (inst, payload) = status(sole_reply(&frames));
     assert_eq!(inst.result(), Some(ResultCode::Ok));
-    let (model, fw, hw) = sim.servo_table(s, |t| {
+    let (model, fw) = sim.servo_table(s, |t| {
         (
             t.config.common.model_number,
             t.config.common.firmware_version,
-            t.config.common.hardware_revision,
         )
     });
     let m = model.to_le_bytes();
-    assert_eq!(payload, &[m[0], m[1], fw, hw]);
+    let f = fw.to_le_bytes();
+    assert_eq!(payload, &[m[0], m[1], f[0], f[1]]);
 }
 
 #[apply(matrix)]
@@ -94,9 +95,9 @@ fn read_front_loaded_reply_matches_and_leaves_table(baud_idx: u8) {
     let (inst, payload) = status(sole_reply(&frames));
     assert_eq!(inst.result(), Some(ResultCode::Ok));
     let m = before.to_le_bytes();
-    // Identity span [0,4): model(2) + the sim's seeded fw(1) + hardware_revision(1),
-    // both 1 from `seed_identity`.
-    assert_eq!(payload, &[m[0], m[1], 0x01, 0x01]);
+    // Identity span [0,4): model(2) + the fw(2) `seed_identity` stamps.
+    let f = osc_servo_core::FIRMWARE_VERSION.to_le_bytes();
+    assert_eq!(payload, &[m[0], m[1], f[0], f[1]]);
     assert_eq!(sim.servo_diag(s).crc_fail_count, 0);
     assert_eq!(
         sim.servo_table(s, |t| t.config.common.model_number),
@@ -210,18 +211,19 @@ fn hold_then_commit_applies_atomically(baud_idx: u8) {
 
 #[apply(matrix)]
 fn large_write_stages_and_applies(baud_idx: u8) {
-    // LEN is the only size limit (sec 5.1): a >128 B write stages like any other
-    // (the buffer fits the largest legal write) and commits at its verdict.
-    // Target the calib pot-LUT span (writable, no field rules).
+    // LEN is the only size limit (sec 5.1): the largest legal write - the
+    // whole 64 B PROFILE region, the map's widest rule-free writable span -
+    // stages like any other and commits at its verdict.
     let mut sim = sim(baud_idx);
     let s = sim.add_servo(ID5);
 
-    let mut data = vec![0u8; 130];
-    data[0..2].copy_from_slice(&0x1234u16.to_le_bytes()); // raw_min
-    data[2..4].copy_from_slice(&0x5678u16.to_le_bytes()); // raw_max
-    data[4] = 0xAB; // first LUT byte
+    let mut data = vec![0u8; 64];
+    data[0..2].copy_from_slice(&0x1234u16.to_le_bytes()); // slot 0 word 0
+    data[2..4].copy_from_slice(&0x5678u16.to_le_bytes());
+    data[4] = 0xAB;
+    data[63] = 0x7C; // last byte of the last slot word
 
-    let a = CALIB_BASE_ADDR.to_le_bytes();
+    let a = PROFILE_BASE_ADDR.to_le_bytes();
     let mut payload = vec![a[0], a[1]];
     payload.extend_from_slice(&data);
     sim.host_send(&instruction(ID5, Opcode::Write, 0, &payload));
@@ -230,16 +232,11 @@ fn large_write_stages_and_applies(baud_idx: u8) {
     let (inst, _) = status(sole_reply(&frames));
     assert_eq!(inst.result(), Some(ResultCode::Ok));
     assert_eq!(sim.servo_diag(s).crc_fail_count, 0);
-    let (raw_min, raw_max, lut0) = sim.servo_table(s, |t| {
-        (
-            t.calib.pot_lut.raw_min,
-            t.calib.pot_lut.raw_max,
-            t.calib.pot_lut.lut[0],
-        )
-    });
-    assert_eq!(raw_min, 0x1234);
-    assert_eq!(raw_max, 0x5678);
-    assert_eq!((lut0 as u32) & 0xFF, 0xAB, "the >128 B payload landed");
+    let words = sim.servo_table(s, |t| t.profile.slots.words);
+    assert_eq!(words[0], 0x1234);
+    assert_eq!(words[1], 0x5678);
+    assert_eq!(words[2] & 0xFF, 0xAB);
+    assert_eq!(words[31] >> 8, 0x7C, "the full 64 B payload landed");
 }
 
 #[apply(matrix)]
@@ -247,13 +244,28 @@ fn mgmt_reboot_acks_then_surfaces(baud_idx: u8) {
     let mut sim = sim(baud_idx);
     let s = sim.add_servo(ID5);
 
-    sim.host_send(&instruction(ID5, Opcode::Mgmt, 0, &[MgmtOp::Reboot as u8]));
+    let payload = [MgmtOp::Reboot as u8, Reboot::MODE_BOOTLOADER, baud_idx];
+    sim.host_send(&instruction(ID5, Opcode::Mgmt, 0, &payload));
     let frames = sim.run();
 
     let (inst, payload) = status(sole_reply(&frames));
     assert_eq!(inst.result(), Some(ResultCode::Ok));
     assert!(payload.is_empty());
-    assert!(sim.take_reboot(s).is_some());
+    let baud = BaudRate::from_idx(baud_idx).unwrap();
+    assert_eq!(sim.take_reboot(s), Some(Reboot::Bootloader(baud)));
+}
+
+#[apply(matrix)]
+fn mgmt_reboot_without_its_mode_nacks_range_and_stays_up(baud_idx: u8) {
+    let mut sim = sim(baud_idx);
+    let s = sim.add_servo(ID5);
+
+    sim.host_send(&instruction(ID5, Opcode::Mgmt, 0, &[MgmtOp::Reboot as u8]));
+    let frames = sim.run();
+
+    let (inst, _) = status(sole_reply(&frames));
+    assert_eq!(inst.result(), Some(ResultCode::Range));
+    assert_eq!(sim.take_reboot(s), None);
 }
 
 #[apply(matrix)]
@@ -523,8 +535,8 @@ fn profile_read_gathers_configured_spans(baud_idx: u8) {
     let s = sim.add_servo(ID5);
 
     // Configure slot 0 over the wire (sec 5.2: ordinary WRITEs, no new
-    // instruction): model+fw (3 B at 0x000, odd length -- no parity
-    // constraint) then the comms id byte.
+    // instruction): model + the fw low byte (3 B at 0x000, odd length -- no
+    // parity constraint) then the comms id byte.
     let words = [span_word(0, 3), span_word(ID, 1)];
     let mut payload = PROFILE_BASE_ADDR.to_le_bytes().to_vec();
     for w in words {
@@ -547,7 +559,8 @@ fn profile_read_gathers_configured_spans(baud_idx: u8) {
         )
     });
     let m = model.to_le_bytes();
-    assert_eq!(payload, &[m[0], m[1], fw, ID5]);
+    let f = fw.to_le_bytes();
+    assert_eq!(payload, &[m[0], m[1], f[0], ID5]);
 }
 
 #[apply(matrix)]

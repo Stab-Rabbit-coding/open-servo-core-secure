@@ -5,6 +5,7 @@
 //! servo self-gates and answers `access`).
 
 use osc_protocol::build;
+use osc_protocol::frame::Reboot;
 use osc_protocol::table;
 use osc_protocol::wire::{BaudRate, Id, Inst, MgmtOp, Opcode, ResultCode, UID_LEN};
 
@@ -211,6 +212,9 @@ pub async fn bus_present<P: Pipe>(c: &mut Client<P>) -> Result<bool, Error> {
     ))
 }
 
+// FIXME: the first unicast after this sweep sometimes gets no reply
+// (`osc ping` at 3M: about 1 run in 20, with or without OPEN_SESSION); root
+// cause open.
 /// Find the bus rate by ENUM probe: the 1M protocol default first, then the
 /// remaining rates ascending. Leaves the host at the found rate (at the last
 /// probed rate when nothing answered).
@@ -263,8 +267,27 @@ pub async fn save<P: Pipe>(c: &mut Client<P>, id: Id) -> Result<(), Error> {
     mgmt_op(c, id, MgmtOp::Save).await
 }
 
+/// MGMT REBOOT back into the app (protocol sec 9.5).
 pub async fn reboot<P: Pipe>(c: &mut Client<P>, id: Id) -> Result<(), Error> {
-    mgmt_op(c, id, MgmtOp::Reboot).await
+    reboot_into(c, id, Reboot::App).await
+}
+
+/// MGMT REBOOT into the bootloader, which then runs at `baud` (protocol
+/// sec 9.6).
+pub async fn reboot_bootloader<P: Pipe>(
+    c: &mut Client<P>,
+    id: Id,
+    baud: BaudRate,
+) -> Result<(), Error> {
+    reboot_into(c, id, Reboot::Bootloader(baud)).await
+}
+
+async fn reboot_into<P: Pipe>(c: &mut Client<P>, id: Id, reboot: Reboot) -> Result<(), Error> {
+    let mut p = [0u8; 3];
+    let n = build::mgmt_reboot(&mut p, reboot).expect("reboot payload fits");
+    let inst = Inst::instruction(Opcode::Mgmt, 0);
+    let reply = c.exchange(id, inst, &p[..n]).await?;
+    expect_ok_from(&reply, id)
 }
 
 pub async fn factory<P: Pipe>(c: &mut Client<P>, id: Id) -> Result<(), Error> {

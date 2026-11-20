@@ -11,8 +11,9 @@ use osc_protocol::wire::{MgmtOp, ResultCode};
 use crate::regions::CONTROL_BASE_ADDR;
 use crate::regions::config::BaudRate;
 use crate::services::bus::Dispatcher;
-use crate::traits::{Dispatch, Dispatched, Reply, Request, RequestCtx, SendError, Status};
-use crate::{BootMode, RegionStorage, Shared, StagedWrites};
+use crate::tel::{Chunk, Chunks};
+use crate::traits::{Dispatch, Dispatched, Reboot, Reply, Request, RequestCtx, SendError, Status};
+use crate::{RegionStorage, Shared, StagedWrites};
 
 /// One recorded `send_status` call.
 struct Sent {
@@ -31,7 +32,8 @@ struct FakeReply {
     set_id: Option<(u8, usize)>,
     staged_baud: Option<BaudRate>,
     response_deadline: Option<u16>,
-    reboot: Option<BootMode>,
+    tel_arm: Option<(Chunks, u16)>,
+    reboot: Option<Reboot>,
     clock_cal: Option<(u16, u8)>,
 }
 
@@ -44,6 +46,7 @@ impl FakeReply {
             set_id: None,
             staged_baud: None,
             response_deadline: None,
+            tel_arm: None,
             reboot: None,
             clock_cal: None,
         }
@@ -110,8 +113,12 @@ impl Reply for FakeReply {
         self.response_deadline = Some(us);
     }
 
-    fn stage_reboot(&mut self, mode: BootMode) {
-        self.reboot = Some(mode);
+    fn tel_arm(&mut self, chunks: Chunks, count: u16) {
+        self.tel_arm = Some((chunks, count));
+    }
+
+    fn stage_reboot(&mut self, reboot: Reboot) {
+        self.reboot = Some(reboot);
     }
 
     fn begin_clock_cal(&mut self, gap_us: u16, gaps: u8) {
@@ -127,10 +134,11 @@ fn go(shared: &Shared, staged: &mut StagedWrites, req: Request<'_>, may_reply: b
     let mut pending = None;
     let mut d = Dispatcher::new(shared, staged, &mut pending);
     if matches!(
-        d.dispatch(req, RequestCtx { may_reply }, &mut reply),
+        d.dispatch(&req, RequestCtx { may_reply }, &mut reply),
         Dispatched::Pending
     ) {
-        d.commit(&mut reply);
+        // SAFETY: the request bytes outlive the verdict.
+        unsafe { d.commit(&mut reply) };
     }
     reply
 }
@@ -148,13 +156,13 @@ fn ping_replies_model_and_firmware() {
     let shared = Shared::new();
     shared.table.with_mut(|t| {
         t.config.common.model_number = 0x1234;
-        t.config.common.firmware_version = 0x56;
+        t.config.common.firmware_version = 0x7856;
     });
     let mut staged = StagedWrites::new();
     let reply = go(&shared, &mut staged, Request::Ping, true);
     assert_eq!(reply.count(), 1);
     assert_eq!(reply.last().result, ResultCode::Ok);
-    assert_eq!(&reply.last().data[..], &[0x34, 0x12, 0x56]);
+    assert_eq!(&reply.last().data[..], &[0x34, 0x12, 0x56, 0x78]);
 }
 
 #[test]
@@ -336,8 +344,8 @@ fn profile_read_over_ceiling_rejects_limit() {
     let shared = Shared::new();
     // 5 x 63 B = 315 B > MAX_PAYLOAD.
     shared.table.with_mut(|t| {
-        for w in 0..5 {
-            t.profile.slots.words[w] = span_word(0, 63);
+        for w in &mut t.profile.slots.words[..5] {
+            *w = span_word(0, 63);
         }
     });
     let mut staged = StagedWrites::new();
@@ -396,6 +404,45 @@ fn write_validation_reject_maps_to_validation() {
         true,
     );
     assert_eq!(reply.last().result, ResultCode::Validation);
+}
+
+/// The brush resistance is refused over the stored winding's: the rule
+/// reads `r_q12` as it stands, so a write that carries both lands the
+/// winding first.
+#[test]
+fn a_brush_resistance_over_the_winding_is_refused() {
+    use crate::regions::calib::addr::motor::{R_BRUSH_Q12, R_Q12};
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let mut go = |addr, data: &[u8]| go(&shared, &mut staged, write(addr, data, false), true);
+    assert_eq!(
+        go(R_BRUSH_Q12, &1u16.to_le_bytes()).last().result,
+        ResultCode::Validation,
+        "no winding stored"
+    );
+    assert_eq!(go(R_BRUSH_Q12, &[0, 0]).last().result, ResultCode::Ok);
+    assert_eq!(
+        go(R_Q12, &3725u16.to_le_bytes()).last().result,
+        ResultCode::Ok
+    );
+    for (x, want) in [
+        (1093u16, ResultCode::Ok),
+        (3725, ResultCode::Ok),
+        (3726, ResultCode::Validation),
+        (u16::MAX, ResultCode::Validation),
+    ] {
+        assert_eq!(go(R_BRUSH_Q12, &x.to_le_bytes()).last().result, want, "{x}");
+    }
+    assert_eq!(shared.table.with(|t| t.calib.motor.r_brush_q12), 3725);
+    // r_q12 through ke_vpc_q, then the pair, in one write
+    let at = (R_BRUSH_Q12 - R_Q12) as usize;
+    let mut set = [0u8; 64];
+    set[..2].copy_from_slice(&5000u16.to_le_bytes());
+    set[at..at + 4].copy_from_slice(&[0x88, 0x13, 0xec, 0x09]);
+    let set = &set[..at + 4];
+    assert_eq!(go(R_Q12, set).last().result, ResultCode::Ok);
+    let m = shared.table.with(|t| t.calib.motor);
+    assert_eq!((m.r_q12, m.r_brush_q12, m.brush_cps), (5000, 5000, 2540));
 }
 
 /// osc separates write from persistence (sec 9.4): config writes are never
@@ -541,39 +588,51 @@ fn commit_silent_when_may_reply_false() {
 
 // --- Mgmt -----------------------------------------------------------------
 
+fn reboot_req(args: &[u8]) -> Request<'_> {
+    Request::Mgmt {
+        op: MgmtOp::Reboot,
+        args: FrameBytes::from(args),
+    }
+}
+
 #[test]
-fn mgmt_reboot_acks_and_stages_boot_mode() {
+fn mgmt_reboot_acks_and_stages_the_app() {
     let shared = Shared::new();
     let mut staged = StagedWrites::new();
-    let reply = go(
-        &shared,
-        &mut staged,
-        Request::Mgmt {
-            op: MgmtOp::Reboot,
-            args: FrameBytes::from(&[][..]),
-        },
-        true,
-    );
+    let reply = go(&shared, &mut staged, reboot_req(&[Reboot::MODE_APP]), true);
     assert_eq!(reply.last().result, ResultCode::Ok);
     assert!(reply.last().data.is_empty());
-    assert_eq!(reply.reboot, Some(BootMode::App));
+    assert_eq!(reply.reboot, Some(Reboot::App));
 }
 
 #[test]
 fn mgmt_reboot_stages_without_ack_when_silent() {
     let shared = Shared::new();
     let mut staged = StagedWrites::new();
-    let reply = go(
-        &shared,
-        &mut staged,
-        Request::Mgmt {
-            op: MgmtOp::Reboot,
-            args: FrameBytes::from(&[][..]),
-        },
-        false,
-    );
+    let reply = go(&shared, &mut staged, reboot_req(&[Reboot::MODE_APP]), false);
     assert_eq!(reply.count(), 0);
-    assert_eq!(reply.reboot, Some(BootMode::App));
+    assert_eq!(reply.reboot, Some(Reboot::App));
+}
+
+#[test]
+fn mgmt_reboot_into_the_bootloader_stages_the_named_rate() {
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let args = [Reboot::MODE_BOOTLOADER, BaudRate::B1000000.as_idx()];
+    let reply = go(&shared, &mut staged, reboot_req(&args), true);
+    assert_eq!(reply.last().result, ResultCode::Ok);
+    assert_eq!(reply.reboot, Some(Reboot::Bootloader(BaudRate::B1000000)));
+}
+
+#[test]
+fn mgmt_reboot_without_its_args_nacks_range_and_stays_up() {
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    for args in [&[][..], &[1], &[1, 4], &[2, 0], &[0, 0]] {
+        let reply = go(&shared, &mut staged, reboot_req(args), true);
+        assert_eq!(reply.last().result, ResultCode::Range, "args {args:?}");
+        assert_eq!(reply.reboot, None, "args {args:?}");
+    }
 }
 
 #[test]
@@ -600,7 +659,8 @@ fn mgmt_wrapped_enum_assign_reply_instruction() {
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::persist::{CONFIG_LEN, ConfigStore, PROFILE_LEN, StoreError};
+use crate::persist::{CALIB_LEN, CONFIG_LEN, ConfigStore, PROFILE_LEN, StoreError};
+use crate::pos_lut::INTERVALS;
 
 /// Atomics-only recording store (these tests are no_std): counts calls,
 /// fingerprints the saved bytes by CRC, arms failure via `fail`.
@@ -627,11 +687,19 @@ impl ConfigStore for FakeStore {
         &self,
         config: &[u8; CONFIG_LEN],
         profile: &[u8; PROFILE_LEN],
+        calib: &[u8; CALIB_LEN],
+        lut: &[i16; INTERVALS],
     ) -> Result<(), StoreError> {
         if self.fail.load(Ordering::Relaxed) {
             return Err(StoreError);
         }
-        let crc = osc_protocol::crc::osc_crc_continue(osc_protocol::crc::osc_crc(config), profile);
+        let mut crc = osc_protocol::crc::osc_crc_continue(
+            osc_protocol::crc::osc_crc_continue(osc_protocol::crc::osc_crc(config), profile),
+            calib,
+        );
+        for c in lut {
+            crc = osc_protocol::crc::osc_crc_continue(crc, &c.to_le_bytes());
+        }
         self.saved_crc.store(crc as u32, Ordering::Relaxed);
         self.saves.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -662,13 +730,24 @@ fn dirty(shared: &Shared) -> u8 {
 /// CRC fingerprint of the live persisted regions, mirroring FakeStore::save.
 fn table_crc(shared: &Shared) -> u32 {
     use crate::regions::{
-        CONFIG_BASE_ADDR, CONFIG_REGION_SIZE, PROFILE_BASE_ADDR, PROFILE_REGION_SIZE,
+        CALIB_BASE_ADDR, CALIB_REGION_SIZE, CONFIG_BASE_ADDR, CONFIG_REGION_SIZE,
+        PROFILE_BASE_ADDR, PROFILE_REGION_SIZE,
     };
     use control_table::RegisterFile;
     let config = RegisterFile::read(&shared.table, CONFIG_BASE_ADDR, CONFIG_REGION_SIZE).unwrap();
     let profile =
         RegisterFile::read(&shared.table, PROFILE_BASE_ADDR, PROFILE_REGION_SIZE).unwrap();
-    osc_protocol::crc::osc_crc_continue(osc_protocol::crc::osc_crc(config), profile) as u32
+    let calib = RegisterFile::read(&shared.table, CALIB_BASE_ADDR, CALIB_REGION_SIZE).unwrap();
+    let mut crc = osc_protocol::crc::osc_crc_continue(
+        osc_protocol::crc::osc_crc_continue(osc_protocol::crc::osc_crc(config), profile),
+        calib,
+    );
+    shared.with_pos_lut(|k| {
+        for c in &k[..INTERVALS] {
+            crc = osc_protocol::crc::osc_crc_continue(crc, &c.to_le_bytes());
+        }
+    });
+    crc as u32
 }
 
 fn write_at(shared: &Shared, staged: &mut StagedWrites, addr: u16, data: &[u8]) {
@@ -771,7 +850,7 @@ fn factory_wipes_acks_and_stages_reboot() {
     let reply = go(&shared, &mut staged, mgmt_req(MgmtOp::Factory), true);
     assert_eq!(reply.last().result, ResultCode::Ok);
     assert_eq!(STORE.wipes.load(Ordering::Relaxed), 1);
-    assert_eq!(reply.reboot, Some(BootMode::App));
+    assert_eq!(reply.reboot, Some(Reboot::App));
 }
 
 #[test]
@@ -879,12 +958,13 @@ fn enumerate_matching_prefix_replies_full_uid() {
     let shared = shared_with_uid();
     let mut staged = StagedWrites::new();
     for bits in [0u8, 1, 8, 127, 128] {
+        let prefix = prefix_of(bits);
         let reply = go(
             &shared,
             &mut staged,
             Request::Enumerate {
                 prefix_len: bits,
-                prefix: prefix_of(bits),
+                prefix: FrameBytes::from(&prefix[..]),
             },
             true,
         );
@@ -904,7 +984,7 @@ fn enumerate_mismatch_is_silent() {
         &mut staged,
         Request::Enumerate {
             prefix_len: 1,
-            prefix,
+            prefix: FrameBytes::from(&prefix[..]),
         },
         true,
     );
@@ -919,7 +999,7 @@ fn assign_matching_uid_sets_id_before_ack() {
         &shared,
         &mut staged,
         Request::Assign {
-            uid: UID,
+            uid: FrameBytes::from(&UID[..]),
             new_id: 42,
         },
         true,
@@ -933,6 +1013,7 @@ fn assign_matching_uid_sets_id_before_ack() {
     // also marks modified-since-save (sec 9.4).
     assert_eq!(shared.table.with(|t| t.config.common.id), 42);
     assert_eq!(dirty(&shared), 1);
+    assert_eq!(shared.config_seq(), 0, "the kernel reads no id");
 }
 
 #[test]
@@ -945,7 +1026,10 @@ fn assign_foreign_uid_is_silent_and_inert() {
     let reply = go(
         &shared,
         &mut staged,
-        Request::Assign { uid, new_id: 42 },
+        Request::Assign {
+            uid: FrameBytes::from(&uid[..]),
+            new_id: 42,
+        },
         true,
     );
     assert_eq!(reply.count(), 0);
@@ -962,7 +1046,7 @@ fn assign_invalid_id_nacks_validation() {
             &shared,
             &mut staged,
             Request::Assign {
-                uid: UID,
+                uid: FrameBytes::from(&UID[..]),
                 new_id: bad,
             },
             true,
@@ -980,7 +1064,7 @@ fn assign_noreply_still_applies() {
         &shared,
         &mut staged,
         Request::Assign {
-            uid: UID,
+            uid: FrameBytes::from(&UID[..]),
             new_id: 9,
         },
         false,
@@ -1059,7 +1143,7 @@ fn write_stages_then_commit_applies() {
     let mut reply = FakeReply::new();
 
     let out = disp(&shared, &mut staged, &mut pending).dispatch(
-        write(CONTROL_BASE_ADDR, &[1], false),
+        &write(CONTROL_BASE_ADDR, &[1], false),
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1068,7 +1152,9 @@ fn write_stages_then_commit_applies() {
     // Staged only -- the live table is untouched until the verdict commits.
     assert!(!shared.table.with(|t| t.control.lifecycle.torque_enable));
 
-    disp(&shared, &mut staged, &mut pending).commit(&mut reply);
+    // SAFETY: the request bytes outlive the verdict.
+
+    unsafe { disp(&shared, &mut staged, &mut pending).commit(&mut reply) };
     assert!(shared.table.with(|t| t.control.lifecycle.torque_enable));
     assert!(pending.is_none());
     assert!(
@@ -1085,7 +1171,7 @@ fn write_reverts_on_fail_verdict() {
     let mut reply = FakeReply::new();
 
     let out = disp(&shared, &mut staged, &mut pending).dispatch(
-        write(CONTROL_BASE_ADDR, &[1], false),
+        &write(CONTROL_BASE_ADDR, &[1], false),
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1107,7 +1193,7 @@ fn write_validation_reject_nacks_nothing_staged() {
 
     // 2 is outside a bool field's allowed {0, 1}: validation reject.
     let out = disp(&shared, &mut staged, &mut pending).dispatch(
-        write(CONTROL_BASE_ADDR, &[2], false),
+        &write(CONTROL_BASE_ADDR, &[2], false),
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1118,7 +1204,7 @@ fn write_validation_reject_nacks_nothing_staged() {
 }
 
 #[test]
-fn write_staging_full_nacks_busy_nothing_staged() {
+fn held_write_staging_full_nacks_busy_nothing_staged() {
     use control_table::STAGE_DATA_CAP;
     let shared = Shared::new();
     let mut staged = StagedWrites::new();
@@ -1130,7 +1216,7 @@ fn write_staging_full_nacks_busy_nothing_staged() {
     let mut pending = None;
     let mut reply = FakeReply::new();
     let out = disp(&shared, &mut staged, &mut pending).dispatch(
-        write(CONTROL_BASE_ADDR, &[1], false),
+        &write(CONTROL_BASE_ADDR, &[1], true),
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1142,6 +1228,33 @@ fn write_staging_full_nacks_busy_nothing_staged() {
     assert_eq!(staged.iter_all().count(), 1);
 }
 
+/// A plain write commits from its request bytes, so held entries filling the
+/// staging buffer do not refuse it, and it leaves them staged.
+#[test]
+fn plain_write_needs_no_staging_room() {
+    use control_table::STAGE_DATA_CAP;
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    staged
+        .push(CONTROL_BASE_ADDR, &[0u8; STAGE_DATA_CAP])
+        .unwrap();
+
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let gv = 7i32.to_le_bytes();
+    let out = disp(&shared, &mut staged, &mut pending).dispatch(
+        &write(GOAL_VELOCITY, &gv, false),
+        RequestCtx { may_reply: true },
+        &mut reply,
+    );
+    assert!(matches!(out, Dispatched::Pending));
+    assert_eq!(reply.last().result, ResultCode::Ok);
+    // SAFETY: the request bytes outlive the verdict.
+    unsafe { disp(&shared, &mut staged, &mut pending).commit(&mut reply) };
+    assert_eq!(shared.table.with(|t| t.control.lifecycle.goal_velocity), 7);
+    assert_eq!(staged.iter_all().count(), 1);
+}
+
 #[test]
 fn dangling_pending_write_auto_reverts_on_next_dispatch() {
     let shared = Shared::new();
@@ -1149,25 +1262,28 @@ fn dangling_pending_write_auto_reverts_on_next_dispatch() {
     let mut pending = None;
     let mut reply = FakeReply::new();
 
-    // Stage a write but never commit/revert (frame died with no verdict).
-    disp(&shared, &mut staged, &mut pending).dispatch(
-        write(CONTROL_BASE_ADDR, &[1], false),
-        RequestCtx { may_reply: true },
-        &mut reply,
-    );
-    assert!(pending.is_some());
-    assert!(!staged.is_empty());
+    // A plain and a held write, each never committed nor reverted (frame died
+    // with no verdict): the plain one stages nothing, the held one stages.
+    for hold in [false, true] {
+        disp(&shared, &mut staged, &mut pending).dispatch(
+            &write(CONTROL_BASE_ADDR, &[1], hold),
+            RequestCtx { may_reply: true },
+            &mut reply,
+        );
+        assert!(pending.is_some());
+        assert_eq!(staged.is_empty(), !hold);
 
-    // A following dispatch drops the dangling write before running.
-    let mut reply2 = FakeReply::new();
-    disp(&shared, &mut staged, &mut pending).dispatch(
-        Request::Ping,
-        RequestCtx { may_reply: true },
-        &mut reply2,
-    );
-    assert!(pending.is_none());
-    assert!(staged.is_empty());
-    assert!(!shared.table.with(|t| t.control.lifecycle.torque_enable));
+        // A following dispatch drops the dangling write before running.
+        let mut reply2 = FakeReply::new();
+        disp(&shared, &mut staged, &mut pending).dispatch(
+            &Request::Ping,
+            RequestCtx { may_reply: true },
+            &mut reply2,
+        );
+        assert!(pending.is_none());
+        assert!(staged.is_empty());
+        assert!(!shared.table.with(|t| t.control.lifecycle.torque_enable));
+    }
 }
 
 #[test]
@@ -1180,15 +1296,16 @@ fn real_commit_after_dangling_write_applies_only_held_entries() {
     // A HOLD write stages torque_enable=1 and gets its PASS verdict (the held
     // entry persists across frames, awaiting COMMIT).
     disp(&shared, &mut staged, &mut pending).dispatch(
-        write(CONTROL_BASE_ADDR, &[1], true),
+        &write(CONTROL_BASE_ADDR, &[1], true),
         RequestCtx { may_reply: true },
         &mut reply,
     );
-    disp(&shared, &mut staged, &mut pending).commit(&mut reply);
+    // SAFETY: the request bytes outlive the verdict.
+    unsafe { disp(&shared, &mut staged, &mut pending).commit(&mut reply) };
     // A write on top stages goal_velocity, then dies (dangling -- no verdict).
     let gv = 5i32.to_le_bytes();
     disp(&shared, &mut staged, &mut pending).dispatch(
-        write(GOAL_VELOCITY, &gv, false),
+        &write(GOAL_VELOCITY, &gv, false),
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1197,7 +1314,7 @@ fn real_commit_after_dangling_write_applies_only_held_entries() {
     // Real COMMIT auto-reverts the dangling write, then applies only the held
     // torque_enable -- the phantom goal_velocity is gone.
     disp(&shared, &mut staged, &mut pending).dispatch(
-        Request::Commit,
+        &Request::Commit,
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1213,7 +1330,7 @@ fn held_write_keeps_entries_through_its_verdict() {
     let mut reply = FakeReply::new();
 
     let out = disp(&shared, &mut staged, &mut pending).dispatch(
-        write(CONTROL_BASE_ADDR, &[1], true),
+        &write(CONTROL_BASE_ADDR, &[1], true),
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1221,7 +1338,8 @@ fn held_write_keeps_entries_through_its_verdict() {
     assert_eq!(reply.last().result, ResultCode::Ok);
 
     // CRC passed: a held write keeps its entry staged (it applies on COMMIT).
-    disp(&shared, &mut staged, &mut pending).commit(&mut reply);
+    // SAFETY: the request bytes outlive the verdict.
+    unsafe { disp(&shared, &mut staged, &mut pending).commit(&mut reply) };
     assert!(pending.is_none());
     assert!(
         !staged.is_empty(),
@@ -1231,7 +1349,7 @@ fn held_write_keeps_entries_through_its_verdict() {
 
     // A real COMMIT lands it.
     disp(&shared, &mut staged, &mut pending).dispatch(
-        Request::Commit,
+        &Request::Commit,
         RequestCtx { may_reply: true },
         &mut reply,
     );
@@ -1247,14 +1365,16 @@ fn hooks_fire_on_write_commit() {
     let mut reply = FakeReply::new();
 
     disp(&shared, &mut staged, &mut pending).dispatch(
-        write(ID, &[42], false),
+        &write(ID, &[42], false),
         RequestCtx { may_reply: true },
         &mut reply,
     );
     // Hooks are deferred to the verdict -- nothing staged through the reply yet.
     assert_eq!(reply.staged_id, None);
 
-    disp(&shared, &mut staged, &mut pending).commit(&mut reply);
+    // SAFETY: the request bytes outlive the verdict.
+
+    unsafe { disp(&shared, &mut staged, &mut pending).commit(&mut reply) };
     assert_eq!(reply.staged_id, Some(42));
 }
 
@@ -1268,18 +1388,322 @@ fn hooks_fire_on_real_commit() {
     let mut reply = FakeReply::new();
 
     disp(&shared, &mut staged, &mut pending).dispatch(
-        write(ID, &[42], true),
+        &write(ID, &[42], true),
         RequestCtx { may_reply: true },
         &mut reply,
     );
     assert_eq!(reply.staged_id, None, "HOLD stages, no hook yet");
-    disp(&shared, &mut staged, &mut pending).commit(&mut reply);
+    // SAFETY: the request bytes outlive the verdict.
+    unsafe { disp(&shared, &mut staged, &mut pending).commit(&mut reply) };
     assert_eq!(reply.staged_id, None, "held verdict defers to COMMIT");
 
     disp(&shared, &mut staged, &mut pending).dispatch(
-        Request::Commit,
+        &Request::Commit,
         RequestCtx { may_reply: true },
         &mut reply,
     );
     assert_eq!(reply.staged_id, Some(42), "COMMIT fires the deferred hook");
+}
+
+/// Dispatch through a fresh dispatcher over shared session state, delivering
+/// a PASS verdict into the caller's recording reply.
+fn pass(
+    shared: &Shared,
+    staged: &mut StagedWrites,
+    pending: &mut Option<crate::services::bus::PendingWrite>,
+    reply: &mut FakeReply,
+    req: Request<'_>,
+) {
+    let mut d = disp(shared, staged, pending);
+    if matches!(
+        d.dispatch(&req, RequestCtx { may_reply: true }, reply),
+        Dispatched::Pending
+    ) {
+        // SAFETY: the request bytes outlive the verdict.
+        unsafe { d.commit(reply) };
+    }
+}
+
+/// The CONTROL chunks a test row copies: the ident four, and the rail
+/// estimate behind them.
+fn ident_rail() -> Chunks {
+    use crate::regions::telemetry::addr::{estimates, tick};
+    Chunks::two(
+        Chunk::new(tick::I_TICK_COUNTS, 8),
+        Chunk::new(estimates::VBUS_COUNTS, 2),
+    )
+}
+
+fn write_chunks(b: &[u8; 8], hold: bool) -> Request<'_> {
+    write(crate::regions::control::addr::tel::CHUNK0_ADDR, b, hold)
+}
+
+#[test]
+fn tel_count_write_arms_with_the_live_chunks() {
+    use crate::regions::control::addr::tel::TEL_COUNT;
+    let (rail, none) = (ident_rail().to_le_bytes(), Chunks::NONE.to_le_bytes());
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let mut go = |reply: &mut FakeReply, req| pass(&shared, &mut staged, &mut pending, reply, req);
+
+    go(&mut reply, write_chunks(&rail, false));
+    assert_eq!(reply.tel_arm, None, "a chunk write alone never signals");
+
+    let count = 320u16.to_le_bytes();
+    go(&mut reply, write(TEL_COUNT, &count, false));
+    assert_eq!(reply.tel_arm, Some((ident_rail(), 320)));
+
+    // count 0 is the disarm
+    go(&mut reply, write(TEL_COUNT, &[0, 0], false));
+    assert_eq!(reply.tel_arm, Some((ident_rail(), 0)));
+
+    // no row cannot arm: the signal degrades to a disarm
+    go(&mut reply, write_chunks(&none, false));
+    go(&mut reply, write(TEL_COUNT, &[5, 0], false));
+    assert_eq!(reply.tel_arm, Some((Chunks::NONE, 0)));
+}
+
+/// One WRITE carries the chunks and the count: the arm sees the chunks it
+/// wrote.
+#[test]
+fn one_write_sets_the_row_and_arms() {
+    use crate::regions::control::addr::tel::CHUNK0_ADDR;
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let mut arm = [0u8; 10];
+    arm[..8].copy_from_slice(&ident_rail().to_le_bytes());
+    arm[8..].copy_from_slice(&64u16.to_le_bytes());
+    pass(
+        &shared,
+        &mut staged,
+        &mut pending,
+        &mut reply,
+        write(CHUNK0_ADDR, &arm, false),
+    );
+    assert_eq!(reply.tel_arm, Some((ident_rail(), 64)));
+}
+
+/// The chunks carry no rules: any value lands, and a count over chunks
+/// that are no row (odd, outside the table, over a row) arms as a disarm.
+#[test]
+fn chunk_writes_land_and_an_arm_over_no_row_disarms() {
+    use crate::regions::control::addr::tel::{CHUNK0_ADDR, CHUNK0_LEN, TEL_COUNT};
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let row = ident_rail().to_le_bytes();
+    for (addr, v) in [
+        (CHUNK0_ADDR, 0x225u16),
+        (CHUNK0_ADDR, 0x3FC),
+        (CHUNK0_LEN, 3),
+        (CHUNK0_LEN, 14),
+    ] {
+        let v = v.to_le_bytes();
+        let mut go = |req| pass(&shared, &mut staged, &mut pending, &mut reply, req);
+        go(write_chunks(&row, false));
+        go(write(addr, &v, false));
+        go(write(TEL_COUNT, &[5, 0], false));
+        let t = shared.table.with(|t| t.control.tel);
+        let got = if addr == CHUNK0_ADDR {
+            t.chunk0_addr
+        } else {
+            t.chunk0_len
+        };
+        assert_eq!(got.to_le_bytes(), v, "{addr:#x}");
+        assert_eq!(reply.tel_arm.map(|(_, n)| n), Some(0), "{addr:#x}");
+    }
+}
+
+#[test]
+fn held_chunks_and_count_arm_together_at_commit() {
+    use crate::regions::control::addr::tel::TEL_COUNT;
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+
+    pass(
+        &shared,
+        &mut staged,
+        &mut pending,
+        &mut reply,
+        write_chunks(&ident_rail().to_le_bytes(), true),
+    );
+    pass(
+        &shared,
+        &mut staged,
+        &mut pending,
+        &mut reply,
+        write(TEL_COUNT, &[16, 0], true),
+    );
+    assert_eq!(reply.tel_arm, None, "held entries stay silent");
+
+    disp(&shared, &mut staged, &mut pending).dispatch(
+        &Request::Commit,
+        RequestCtx { may_reply: true },
+        &mut reply,
+    );
+    assert_eq!(
+        reply.tel_arm,
+        Some((ident_rail(), 16)),
+        "arm sees the chunks from the same COMMIT"
+    );
+}
+
+/// A shunt arm committed beside a TEL arm, or ahead of it and not yet
+/// judged by the kernel (burst IDLE, `arm` at 1): the kernel's next tick
+/// can land before the TEL lend, so the TEL arm parks as a disarm.
+#[test]
+fn a_tel_arm_beside_an_unjudged_shunt_arm_parks() {
+    use crate::regions::control::addr::burst::ARM;
+    use crate::regions::control::addr::tel::TEL_COUNT;
+    let rail = ident_rail().to_le_bytes();
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let mut go = |reply: &mut FakeReply, req| pass(&shared, &mut staged, &mut pending, reply, req);
+    go(&mut reply, write_chunks(&rail, false));
+    go(&mut reply, write(TEL_COUNT, &[16, 0], true));
+    go(&mut reply, write(ARM, &[1], true));
+    assert_eq!(reply.tel_arm, None, "held entries stay silent");
+    drop(go);
+    disp(&shared, &mut staged, &mut pending).dispatch(
+        &Request::Commit,
+        RequestCtx { may_reply: true },
+        &mut reply,
+    );
+    assert_eq!(reply.tel_arm, Some((Chunks::NONE, 0)), "same COMMIT");
+
+    // back to back: the shunt arm committed, the kernel not yet ticked
+    let mut go = |reply: &mut FakeReply, req| pass(&shared, &mut staged, &mut pending, reply, req);
+    go(&mut reply, write(TEL_COUNT, &[16, 0], false));
+    assert_eq!(reply.tel_arm, Some((Chunks::NONE, 0)), "back to back");
+
+    // judged and released, the TEL arm goes
+    go(&mut reply, write(ARM, &[0], false));
+    go(&mut reply, write(TEL_COUNT, &[16, 0], false));
+    assert_eq!(reply.tel_arm, Some((ident_rail(), 16)));
+}
+
+#[test]
+fn permit_write_bumps_the_generation_only_when_set() {
+    use crate::regions::control::addr::lifecycle::{GOAL_DUTY, STALL_PERMIT, TORQUE_ENABLE};
+    let shared = Shared::new();
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let mut go = |req| pass(&shared, &mut staged, &mut pending, &mut reply, req);
+
+    go(write(STALL_PERMIT, &[1], false));
+    assert_eq!(shared.permit_gen(), 0, "a request under torque off");
+
+    go(write(TORQUE_ENABLE, &[1], false));
+    assert_eq!(shared.permit_gen(), 0, "torque on alone grants nothing");
+    go(write(STALL_PERMIT, &[1], false));
+    assert_eq!(shared.permit_gen(), 1);
+    go(write(STALL_PERMIT, &[1], false));
+    assert_eq!(shared.permit_gen(), 2, "every rewrite of true renews");
+    go(write(STALL_PERMIT, &[0], false));
+    assert_eq!(shared.permit_gen(), 2, "false is no grant");
+    go(write(GOAL_DUTY, &[0, 0], false));
+    assert_eq!(shared.permit_gen(), 2, "a span that misses the byte");
+
+    // one span over torque and permit judges the committed pair
+    go(write(TORQUE_ENABLE, &[1, 1], false));
+    assert_eq!(shared.permit_gen(), 3);
+    go(write(TORQUE_ENABLE, &[0, 1], false));
+    assert_eq!(shared.permit_gen(), 3, "torque off in the same span");
+
+    // a held permit grants at its COMMIT, not at the staging
+    go(write(TORQUE_ENABLE, &[1], false));
+    go(write(STALL_PERMIT, &[1], true));
+    assert_eq!(shared.permit_gen(), 3, "staged, not committed");
+    go(Request::Commit);
+    assert_eq!(shared.permit_gen(), 4);
+}
+
+/// One committed plain write, as the bus lands it after a clean CRC.
+#[cfg(not(feature = "experiment"))]
+pub(crate) fn write_committed(shared: &Shared, addr: u16, data: &[u8]) {
+    let mut staged = StagedWrites::new();
+    let reply = go(shared, &mut staged, write(addr, data, false), true);
+    assert_eq!(reply.last().result, ResultCode::Ok);
+}
+
+/// Every frame that commits a kernel input moves the configuration count
+/// by one odd/even pair, however many spans its COMMIT carries; nothing
+/// else moves it.
+#[test]
+fn config_commits_step_the_count_one_pair_per_frame() {
+    use crate::regions::calib::addr::motor::R_Q12;
+    use crate::regions::calib::addr::stamp::PLANT_STAMP;
+    use crate::regions::calib::addr::thermal::NTC_K2_Q24;
+    use crate::regions::config::addr::loop_current::DUTY_MAX_Q15;
+    use crate::regions::config::addr::pos_soft::POS_MIN_SOFT_COUNTS;
+    use crate::regions::control::addr::lifecycle::GOAL_DUTY;
+    let shared = Shared::new();
+    shared.table.with_mut(|t| {
+        t.config.pos_phys.pos_max_phys_counts = 4095;
+        t.config.pos_soft.pos_max_soft_counts = 4095;
+    });
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let mut go = |req| pass(&shared, &mut staged, &mut pending, &mut reply, req);
+
+    go(write(GOAL_DUTY, &[0, 1], false));
+    assert_eq!(shared.config_seq(), 0, "CONTROL is not configuration");
+    go(write(DUTY_MAX_Q15, &[0, 1], false));
+    assert_eq!(shared.config_seq(), 2);
+    go(write(R_Q12, &[0, 1], false));
+    assert_eq!(shared.config_seq(), 4, "CALIB is");
+    go(write(PLANT_STAMP, &[0, 1], false));
+    assert_eq!(shared.config_seq(), 4, "the stamp sits past the span");
+
+    // held writes move it at their COMMIT, once for the frame
+    go(write(DUTY_MAX_Q15, &[0, 2], true));
+    go(write(NTC_K2_Q24, &[0, 2], true));
+    go(write(GOAL_DUTY, &[0, 2], true));
+    assert_eq!(shared.config_seq(), 4, "staged, not committed");
+    go(Request::Commit);
+    assert_eq!(shared.config_seq(), 6);
+    go(write(NTC_K2_Q24, &[0, 1], false));
+    assert_eq!(shared.config_seq(), 8, "the last kernel input");
+    go(write(POS_MIN_SOFT_COUNTS, &[1, 0, 0, 0], false));
+    assert_eq!(shared.config_seq(), 10, "the first");
+}
+
+#[test]
+fn a_common_block_write_leaves_the_kernel_configuration_alone() {
+    use crate::regions::config::addr::common::{BAUD_RATE_IDX, ID, RESPONSE_DEADLINE_US};
+    use crate::regions::config::addr::pos_phys::POS_MAX_PHYS_COUNTS;
+    let shared = shared_with_uid();
+    let mut staged = StagedWrites::new();
+    let mut pending = None;
+    let mut reply = FakeReply::new();
+    let mut go = |req| pass(&shared, &mut staged, &mut pending, &mut reply, req);
+
+    go(write(ID, &[7], false));
+    go(write(BAUD_RATE_IDX, &[1], false));
+    go(write(RESPONSE_DEADLINE_US, &[100, 0], false));
+    go(write(POS_MAX_PHYS_COUNTS, &[100, 0, 0, 0], false));
+    go(Request::Assign {
+        uid: FrameBytes::from(&UID[..]),
+        new_id: 42,
+    });
+    shared.table.with(|t| {
+        let c = &t.config;
+        assert_eq!(
+            (c.common.baud_rate_idx, c.common.response_deadline_us),
+            (1, 100)
+        );
+        assert_eq!((c.common.id, c.pos_phys.pos_max_phys_counts), (42, 100));
+    });
+    assert_eq!(shared.config_seq(), 0);
 }

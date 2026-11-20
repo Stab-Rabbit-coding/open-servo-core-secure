@@ -3,12 +3,16 @@
 //! exchange from the edge capture, and report the TURNAROUND distribution
 //! (see [`crate::osc`] for the metric).
 
+use std::ops::RangeInclusive;
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
+use osc_client::record::WIRE_BURST_STREAM_MAX;
 use osc_protocol::wire::{Inst, Opcode, ResultCode};
+use osc_servo_core::regions::config::addr::pos_phys::{POS_MAX_PHYS_COUNTS, POS_MIN_PHYS_COUNTS};
 
+use crate::cli::SETTLE_MS;
 use crate::edges::BStamp;
 use crate::osc::{
     Exchange, ExchangeError, build_instruction, build_read, gread_uniform_payload,
@@ -18,6 +22,33 @@ use crate::wire::Wire;
 
 /// Broadcast id: group frames and COMMIT address every servo and draw no reply.
 const BROADCAST: u8 = 0xFE;
+
+/// Burst cycles carry values `1..=BURST_VALUES` (see [`burst_measure_observed`]).
+pub const BURST_VALUES: i32 = 1000;
+
+/// The rails `id`'s goal rule holds GOAL_POSITION inside; a calibration
+/// narrows them from the board default.
+pub fn goal_rails(w: &mut Wire, id: u8) -> Result<RangeInclusive<i32>> {
+    let mut read = |addr: u16| -> Result<i32> {
+        let ex = xfer(w, &build_read(id, addr, 4), SETTLE_MS)?;
+        match (ex.status.result, ex.status.payload.get(..4)) {
+            (Some(ResultCode::Ok), Some(&[a, b, c, d])) => Ok(i32::from_le_bytes([a, b, c, d])),
+            _ => bail!("id {id}: read of {addr:#06x}: {:?}", ex.status),
+        }
+    };
+    Ok(read(POS_MIN_PHYS_COUNTS)?..=read(POS_MAX_PHYS_COUNTS)?)
+}
+
+/// Offset that keeps the burst value schedule (sentinel 0, then
+/// `1..=BURST_VALUES`) inside the goal rails, with `dip` counts of room
+/// below each value for a flood counting up to it.
+pub fn burst_goal_base(rails: &RangeInclusive<i32>, dip: i32) -> Result<i32> {
+    let base = rails.start() + dip;
+    if base + BURST_VALUES > *rails.end() {
+        bail!("goal rails {rails:?} too narrow for the burst schedule");
+    }
+    Ok(base)
+}
 
 pub struct Report {
     pub ok: Vec<f64>,
@@ -165,6 +196,13 @@ pub fn hot_loop_cycle(id: u8, addr: u16, value: i32) -> BurstCycle {
     }
 }
 
+/// How many copies of a `frame_len`-byte frame one wire burst carries: the
+/// adapter link takes [`WIRE_BURST_STREAM_MAX`] bytes of `len(1) frame`
+/// entries, and an over-long record desyncs the pipe.
+pub fn frames_per_burst(frame_len: usize) -> usize {
+    (WIRE_BURST_STREAM_MAX / (frame_len + 1)).max(1)
+}
+
 /// A plain NOREPLY-write flood then a READ: `writes` back-to-back
 /// `WRITE(NOREPLY)` to `addr` with distinct values (the last is `value`),
 /// followed by a READ that must read `value` back. Exercises the silent-write
@@ -287,7 +325,7 @@ pub fn dump_stamps(c: u32, stamps: &[BStamp], bit_ticks: u32) {
 /// [`burst_measure`] with a per-cycle `observe` callback for verbose/dump.
 ///
 /// The value schedule is owned here so the stale-detection invariant holds:
-/// adjacent cycles carry distinct values (`(index % 1000) + 1`), and the warmup
+/// adjacent cycles carry distinct values (`(index % BURST_VALUES) + 1`), and the warmup
 /// uses a sentinel `0` that no cycle emits -- so a stale read-back is never
 /// masked by an equal-valued neighbour.
 pub fn burst_measure_observed(
@@ -314,7 +352,7 @@ pub fn burst_measure_observed(
         other: 0,
     };
     for index in 0..count {
-        let value = (index % 1000) as i32 + 1;
+        let value = (index % BURST_VALUES as u32) as i32 + 1;
         let cycle = build(value);
         let (stamps, outcome) = run_cycle(w, &cycle, paced, settle_ms, bit_ticks, hz_per_us)?;
         match &outcome {
@@ -377,4 +415,30 @@ fn run_cycle(
         Err(e) => CycleOutcome::Other(e),
     };
     Ok((stamps, outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sentinel and every value, `dip` counts below each included, sit
+    /// inside the rails; rails too narrow for the schedule are refused.
+    #[test]
+    fn burst_values_stay_inside_the_goal_rails() {
+        let rails = 532..=3526;
+        let base = burst_goal_base(&rails, 7).unwrap();
+        assert!(rails.contains(&(base - 7)));
+        assert!(rails.contains(&(base + BURST_VALUES)));
+        assert!(burst_goal_base(&(532..=1500), 0).is_err());
+    }
+
+    #[test]
+    fn flood_bursts_fit_one_link_record() {
+        for frame_len in [9, 10, 13, 168, 255] {
+            let per = frames_per_burst(frame_len);
+            assert!(per * (frame_len + 1) <= WIRE_BURST_STREAM_MAX);
+            assert!((per + 1) * (frame_len + 1) > WIRE_BURST_STREAM_MAX);
+        }
+        assert_eq!(frames_per_burst(11), 42);
+    }
 }

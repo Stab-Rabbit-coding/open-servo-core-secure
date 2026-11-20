@@ -1,14 +1,18 @@
 #![no_std]
 #![feature(sync_unsafe_cell)]
+#![feature(fn_align)]
 #![allow(unexpected_cfgs)]
+// Ord::clamp asserts min <= max, a panic path wherever the bounds are not
+// provably ordered; firmware clamps are max().min() (check-no-panic.sh).
+#![allow(clippy::manual_clamp)]
 
 pub use osc_servo_core::bp;
-pub use osc_servo_core::{BaudRate, ConfigDefaults};
+pub use osc_servo_core::{BaudRate, ConfigDefaults, FIRMWARE_VERSION};
 
 pub mod cfg;
-pub mod control;
 pub mod hal;
 pub mod log;
 pub mod prelude;
+pub mod probe;
 pub(crate) mod providers;
 pub mod runtime;

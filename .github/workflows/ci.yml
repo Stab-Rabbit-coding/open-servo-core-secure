@@ -33,11 +33,32 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
       - name: descriptor freshness
-        run: cargo run -p table-export > ../../descriptors/osc-servo.json && git diff --exit-code ../../descriptors
+        run: cargo run -p table-export -- ../../descriptors && git diff --exit-code ../../descriptors && test -z "$(git status --porcelain ../../descriptors)"
+      - name: descriptor version gate
+        working-directory: ${{ github.workspace }}
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          bash .github/check-descriptor-version.sh
       - name: cargo check --features mocks
         run: cargo check -p osc-servo-drivers --features mocks
       - name: cargo check --features bench
         run: cargo check -p osc-servo-drivers --features bench
+      - name: cargo check --features bench-telcost
+        run: cargo check -p osc-servo-drivers --features bench-telcost
+      - name: cargo test osc-host --features bench
+        run: cargo test -p osc-host --features bench
+      - name: cargo check osc-integration --features bench
+        run: cargo check -p osc-integration --features bench
+      - name: cargo clippy osc-servo-core --features experiment
+        run: cargo clippy -p osc-servo-core --tests --features experiment -- -D warnings
+      - name: cargo test osc-servo-core --features experiment
+        run: cargo test -p osc-servo-core --features experiment
+      - name: cargo clippy osc-servo-core --features loop-margin
+        run: cargo clippy -p osc-servo-core --tests --features loop-margin -- -D warnings
+      - name: cargo test osc-servo-core --features loop-margin
+        run: cargo test -p osc-servo-core --features loop-margin
+      - name: cargo test osc-integration --features loop-margin (loop margins)
+        run: cargo test -p osc-integration --features loop-margin --test loop_margin
 
   ch32-build-test:
     name: build + test (firmware/servo-ch32)
@@ -64,6 +85,14 @@ jobs:
         run: cargo test --features ch32v006x8x6 --lib
       - name: cargo check --features bench
         run: cargo check --features ch32v006x8x6,bench
+      - name: cargo check --features bench-telcost
+        run: cargo check --features ch32v006x8x6,bench-telcost
+      - name: cargo check --features bench-window
+        run: cargo check --features ch32v006x8x6,bench-window
+      - name: cargo check --features experiment
+        run: cargo check --features ch32v006x8x6,experiment
+      - name: cargo check --features loop-margin
+        run: cargo check --features ch32v006x8x6,loop-margin
 
   osc-dev-v006-cross-build:
     name: cross-build (boards/osc-dev-v006)
@@ -91,6 +120,68 @@ jobs:
       - name: no soft div/mod/mul gate
         working-directory: ${{ github.workspace }}
         run: bash .github/check-soft-arith.sh
+      - name: no mem* calls gate
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-mem.sh
+      - name: no panic path gate
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-panic.sh
+      - name: hot callees 4-byte aligned gate
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/check-hot-align.sh
+      - name: cargo build --release (bench image)
+        run: CARGO_TARGET_DIR=target/bench cargo build --release -p osc-dev-v006-app --features osc-dev-v006-app/bench
+      - name: hot callees 4-byte aligned gate (bench image)
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/check-hot-align.sh firmware/boards/osc-dev-v006/target/bench/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no mem* calls gate (bench image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-mem.sh firmware/boards/osc-dev-v006/target/bench/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no panic path gate (bench image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-panic.sh firmware/boards/osc-dev-v006/target/bench/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: cargo build --release (window image)
+        run: CARGO_TARGET_DIR=target/window cargo build --release -p osc-dev-v006-app --features osc-dev-v006-app/bench-window
+      - name: no soft div/mod/mul gate (window image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-soft-arith.sh firmware/boards/osc-dev-v006/target/window/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no mem* calls gate (window image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-mem.sh firmware/boards/osc-dev-v006/target/window/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no panic path gate (window image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-panic.sh firmware/boards/osc-dev-v006/target/window/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: hot callees 4-byte aligned gate (window image)
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/check-hot-align.sh firmware/boards/osc-dev-v006/target/window/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: cargo build --release (experiment image)
+        run: CARGO_TARGET_DIR=target/experiment cargo build --release -p osc-dev-v006-app --features osc-dev-v006-app/experiment
+      - name: no soft div/mod/mul gate (experiment image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-soft-arith.sh firmware/boards/osc-dev-v006/target/experiment/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no mem* calls gate (experiment image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-mem.sh firmware/boards/osc-dev-v006/target/experiment/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no panic path gate (experiment image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-panic.sh firmware/boards/osc-dev-v006/target/experiment/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: hot callees 4-byte aligned gate (experiment image)
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/check-hot-align.sh firmware/boards/osc-dev-v006/target/experiment/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: cargo build --release (margin image)
+        run: CARGO_TARGET_DIR=target/margin cargo build --release -p osc-dev-v006-app --features osc-dev-v006-app/margin
+      - name: no soft div/mod/mul gate (margin image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-soft-arith.sh firmware/boards/osc-dev-v006/target/margin/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no mem* calls gate (margin image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-mem.sh firmware/boards/osc-dev-v006/target/margin/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: no panic path gate (margin image)
+        working-directory: ${{ github.workspace }}
+        run: bash .github/check-no-panic.sh firmware/boards/osc-dev-v006/target/margin/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
+      - name: hot callees 4-byte aligned gate (margin image)
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/check-hot-align.sh firmware/boards/osc-dev-v006/target/margin/riscv32ec_zmmul-unknown-none-elf/release/osc-dev-v006-app
 
   host-ch32-build-test:
     name: build + test (firmware/host-ch32)
@@ -115,6 +206,8 @@ jobs:
         run: cargo build
       - name: cargo test
         run: cargo test --lib
+      - name: cargo check --no-default-features (basic profile)
+        run: cargo check --no-default-features
 
   osc-adapter-wchlinke-cross-build:
     name: cross-build (boards/osc-adapter-wchlinke)
@@ -172,10 +265,11 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (nightly + clippy + rustfmt)
+      - name: Install Rust (nightly + clippy + rustfmt + wasm)
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: client
@@ -187,8 +281,36 @@ jobs:
         run: cargo clippy --tests -- -D warnings
       - name: cargo test (full stack over the fake adapter)
         run: cargo test --no-default-features --features fake-adapter
+      - name: cargo clippy (fake-adapter + bench)
+        run: cargo clippy --tests --no-default-features --features fake-adapter,bench -- -D warnings
+      - name: cargo test (full stack, wire instrument)
+        run: cargo test --no-default-features --features fake-adapter,bench
       - name: cargo build (nusb backend)
         run: cargo build
+      - name: cargo check (wasm32, no default features)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features
+      - name: cargo clippy (wasm32, no default features)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features -- -D warnings
+      - name: cargo check (wasm32, webusb backend)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features webusb
+      - name: cargo clippy (wasm32, webusb backend)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features webusb -- -D warnings
+      - name: cargo clippy (osc-client-web, wasm32)
+        run: cargo clippy --target wasm32-unknown-unknown -p osc-client-web -- -D warnings
+      - name: cargo test (osc-client-web helpers, native)
+        run: cargo test -p osc-client-web
+      # A pinned release tarball: the wasm-pack action's "latest" is an
+      # unauthenticated API lookup that falls back to v0.9.1 (binaryen
+      # version_78, MVP-only wasm-opt) when rate-limited, and its install
+      # renames across filesystems, which the runner image refuses (EXDEV).
+      - name: Install wasm-pack
+        run: |
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/wasm-pack"
+          wasm-pack --version
+      - name: wasm-pack build (osc-client-web, generated .d.ts must build)
+        working-directory: client/web
+        run: wasm-pack build --target web --out-dir pkg
 
   osc-cli:
     name: build (tools/osc)
@@ -208,8 +330,33 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --tests -- -D warnings
       - name: cargo build
         run: cargo build
       - name: cargo test
         run: cargo test
+
+  osc-ident:
+    name: build + test (ident)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ident
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (nightly + clippy + rustfmt + wasm)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ident
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --tests -- -D warnings
+      - name: cargo test
+        run: cargo test
+      - name: cargo check (wasm32, the lib must stay sans-io)
+        run: cargo check --target wasm32-unknown-unknown

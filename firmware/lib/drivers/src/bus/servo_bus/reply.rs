@@ -1,11 +1,13 @@
 //! The reply surface: `ReplyHandle` over disjoint bus fields and its builders.
 
 use osc_protocol::wire::ResultCode;
+use osc_servo_core::tel::{self, Chunks};
 use osc_servo_core::traits::{Reply, SendError, Status};
-use osc_servo_core::{BaudRate, BootMode};
+use osc_servo_core::{BaudRate, Reboot};
 
 use super::super::tx::TxEngine;
 use super::ServoBus;
+use crate::tel::TelPost;
 use crate::traits::bus::{CrcEngine, Providers, TxWire};
 
 /// Reply surface over disjoint `ServoBus` fields (driver-pattern sec 4.3): the
@@ -19,9 +21,12 @@ pub(super) struct ReplyHandle<'a, W: TxWire, C: CrcEngine> {
     pub(super) id: &'a mut u8,
     pub(super) pending_id: &'a mut Option<u8>,
     pub(super) pending_baud: &'a mut Option<BaudRate>,
-    pub(super) pending_reboot: &'a mut Option<BootMode>,
+    pub(super) pending_reboot: &'a mut Option<Reboot>,
     pub(super) pending_cal: &'a mut Option<(u16, u8)>,
     pub(super) response_deadline_us: &'a mut u16,
+    pub(super) tel: &'a mut Option<TelPost>,
+    /// The line's rate now (the rescue rate included): TEL admission's.
+    pub(super) rate: BaudRate,
     pub(super) staged: bool,
     /// sec 9.2: the request is a broadcast ENUM -- a reply staged through this
     /// handle is marked collision-tolerant, keyed off its own payload (the
@@ -51,6 +56,8 @@ impl<P: Providers> ServoBus<P> {
             pending_reboot: &mut self.pending_reboot,
             pending_cal: &mut self.clock.pending_cal,
             response_deadline_us: &mut self.response_deadline_us,
+            tel: &mut self.tel,
+            rate: self.rate,
             staged: false,
             tolerant: false,
         }
@@ -108,8 +115,35 @@ impl<W: TxWire, C: CrcEngine> Reply for ReplyHandle<'_, W, C> {
         *self.response_deadline_us = us;
     }
 
-    fn stage_reboot(&mut self, mode: BootMode) {
-        *self.pending_reboot = Some(mode);
+    /// The lane passes at the release of the ack in hand, or now when
+    /// none is: an aborted ack takes the burst with it. One copy behind
+    /// both commit sites: inlined, its body pushes the table's event walk
+    /// out of line and every committed write pays the call.
+    #[inline(never)]
+    #[rustc_align(4)]
+    fn tel_arm(&mut self, chunks: Chunks, count: u16) {
+        // sec 5.6: the line is the burst's until LAST, so a second arm in
+        // the body that lent it is void.
+        if self.tx.lent() {
+            return;
+        }
+        let count = if self.rate == tel::BAUD { count } else { 0 };
+        let Some(t) = self.tel.as_mut() else {
+            self.tx.keep();
+            return;
+        };
+        if !t.arm(chunks, count) {
+            self.tx.keep();
+            return;
+        }
+        self.tx.lend();
+        if self.tx.lent() {
+            t.start(*self.id);
+        }
+    }
+
+    fn stage_reboot(&mut self, reboot: Reboot) {
+        *self.pending_reboot = Some(reboot);
     }
 
     fn begin_clock_cal(&mut self, gap_us: u16, gaps: u8) {

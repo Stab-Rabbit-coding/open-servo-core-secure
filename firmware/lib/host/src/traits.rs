@@ -1,21 +1,30 @@
 //! Host transport interfaces, engine-owned (driver-pattern sec 5.1); chip
 //! providers implement them over real peripherals, tests over recording
 //! fakes. Deliberately absent (see the crate doc for the grid rationale):
-//! a break-event input (no LBD on the adapter target; all host RX is
-//! solicited, the framer walks the ring), a CRC engine (software CRC from
-//! osc-protocol -- the host has cycles to spare), and a separate monotonic
+//! a break wake (all host RX is solicited; breaks reach the framer as ring
+//! marks, never as an event), a CRC engine (software CRC from osc-protocol:
+//! the host has cycles to spare), and a separate monotonic
 //! (`Deadline::now` covers it).
 
 use osc_protocol::wire::BaudRate;
 
-/// Counted circular RX DMA ring, armed once. Contract: the ring never
-/// contains the host's own TX bytes (HDSEL no-echo or buffer mute -- the
-/// provider guarantees it, the framer assumes it). Ring length must be a
-/// power of two exceeding the largest legal frame (258) with polling margin.
+/// Counted circular RX DMA ring, armed once, plus the break marks: every
+/// received break, at the `written` count of its `0x00` ring byte, in a
+/// second counted circular buffer. Contract: neither ever contains the
+/// host's own TX (the provider mutes its receiver, the framer assumes it);
+/// a mark is published only after its byte has landed, so a reader that
+/// loads `marked` before `written` never sees a mark past `written`. Both
+/// lengths are powers of two; the byte ring exceeds the largest legal
+/// frame (258) with polling margin.
 pub trait RxRing {
     fn bytes(&self) -> &[u8];
-    /// Index where the next received byte lands.
-    fn cursor(&self) -> u16;
+    /// Bytes ever received, wrapping; the low bits index where the next
+    /// one lands. A running count, so a consumer that falls a whole ring
+    /// behind sees a lap instead of an empty ring.
+    fn written(&self) -> u32;
+    fn marks(&self) -> &[u32];
+    /// Marks ever published, wrapping, indexed like [`written`](Self::written).
+    fn marked(&self) -> u32;
 }
 
 /// One-shot compare on the host tick domain. The host is crystal-clocked --
@@ -35,7 +44,8 @@ pub trait Deadline {
 /// a `send` queued behind a break is legal, and blocking a character time
 /// inside the provider is acceptable.
 pub trait TxWire {
-    /// Claim the wire: push-pull drive (protocol sec 2 discipline).
+    /// Claim the wire for own TX. An echoing receiver is gated off here;
+    /// an open-drain bus end has no drive to switch.
     fn claim(&mut self);
     /// One law break: a 10-bit `0x00` character (protocol sec 3). Wire
     /// claimed. Never the off-law hardware SBK (~14 bits).
@@ -45,7 +55,9 @@ pub trait TxWire {
     /// Drive the line dominant and hold it (rescue pulse, protocol sec 9.1);
     /// ends at [`release`](Self::release). The engine times the pulse.
     fn hold_low(&mut self);
-    /// Release the wire: open-drain idle, TX off.
+    /// Release the wire: TX off, receiver back on, a held low ended. Legal
+    /// mid-span: the span is cut short, though the characters already in
+    /// the UART still leave.
     fn release(&mut self);
 }
 
@@ -53,9 +65,8 @@ pub trait TxWire {
 /// the sec 9.1 floor the rescue verb drops to.
 pub trait UsartBaud {
     fn apply(&mut self, baud: BaudRate);
-    /// Arbitrary rate, instrument-only: off-catalog divisors (a detuned
-    /// host is the clock-tracker's drift injector). The engine's own
-    /// timing state stays on the nearest catalog rate.
+    /// Any rate; the provider rounds its divisor. Carries the tinyboot
+    /// catalog rates and the instrument's off-catalog detunes alike.
     fn apply_raw(&mut self, bps: u32);
 }
 
@@ -70,6 +81,7 @@ pub trait UsartBaud {
 /// data-region edges are exact; break edges are not captured faithfully
 /// (phantoms inside the break span, break fall never present), so frames
 /// anchor on their byte-0 start fall and break geometry is law-derived.
+#[cfg(feature = "bench")]
 pub trait EdgeCapture {
     /// Pop up to `buf.len()` falling-edge ticks in capture order.
     fn drain_falls(&mut self, buf: &mut [u16]) -> usize;
@@ -87,7 +99,10 @@ pub trait Providers {
     type Deadline: Deadline;
     type Tx: TxWire;
     type Baud: UsartBaud;
-    type Edges: EdgeCapture;
+    /// `Default`: the capture organ is a handle to armed-at-boot rings,
+    /// so the engine constructs it rather than threading it through `new`.
+    #[cfg(feature = "bench")]
+    type Edges: EdgeCapture + Default;
 }
 
 /// Wrap-aware "`a` is at or after `b`" on the u32 tick domain.

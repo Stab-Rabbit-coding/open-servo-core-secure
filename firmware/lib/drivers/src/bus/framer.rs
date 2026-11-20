@@ -57,6 +57,19 @@ pub enum FramerOut {
     Frame(FrameSpan),
 }
 
+/// The frontier milestones a frame's header asks for. The composite decides
+/// (it owns addressing and the chain); the framer only schedules.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum FrameNeeds {
+    /// The covered checkpoint, then the frame end.
+    Covered,
+    /// The frame end only: nothing runs ahead of the verdict.
+    End,
+    /// No milestone: the frame resolves from the ring at the next wake, and
+    /// only the starve horizon is scheduled for it.
+    Nothing,
+}
+
 // sec 4.1: header = BREAK, ID, LEN, INST; the break byte is index 0 of the
 // frame, so the header is readable `HEADER_SPAN_BYTES` in.
 const HEADER_SPAN_BYTES: u16 = Header::SIZE as u16;
@@ -152,8 +165,6 @@ pub struct Framer {
     /// faults. Cleared when a candidate resolves as a whole valid frame.
     hunting: bool,
     frontier: Frontier,
-    /// Cursor at the last wire-fault service ([`Self::on_wire_fault`]).
-    fault_seen: u16,
     drops: u32,
 }
 
@@ -163,7 +174,6 @@ impl Framer {
             anchor: 0,
             hunting: false,
             frontier: Frontier::idle(),
-            fault_seen: 0,
             drops: 0,
         }
     }
@@ -178,25 +188,6 @@ impl Framer {
     pub fn resync(&mut self, cursor: u16) {
         self.anchor = cursor;
         self.frontier = Frontier::idle();
-        self.fault_seen = cursor;
-    }
-
-    /// USART FE/RX-error service -- a pure wake, in the strong sense (the
-    /// fault contract, osc-native sec 3.4): the event carries no position, no
-    /// time, and no identity, and NOTHING may be derived from it beyond "look
-    /// at the ring again". Latched flags re-fire and service lags behind the
-    /// wire, so any cursor sampled here describes the service, not the event
-    /// -- a fence built on it killed live frames under burst load (bench: hot
-    /// chains fell 95% -> 80%). The one thing this service computes is
-    /// freshness: `false` means no bytes ringed since the last service -- the
-    /// wake's evidence (if any) is still in flight, and the composite arms a
-    /// one-byte-time recheck.
-    pub fn on_wire_fault(&mut self, cursor: u16) -> bool {
-        if cursor == self.fault_seen {
-            return false;
-        }
-        self.fault_seen = cursor;
-        true
     }
 
     /// The composite rejected a resolved frame (CRC fail): the header that
@@ -209,6 +200,16 @@ impl Framer {
         self.hunting = true;
         self.anchor = ring_wrap(anchor as usize + 1, ring_len) as u16;
         self.frontier = Frontier::idle();
+    }
+
+    /// The composite knows a resolved frame's LEN is wrong (sec 6: a waited
+    /// status the GREAD rules out): a framing drop, counted once per episode,
+    /// then the hunt resumes one byte in as for a CRC reject.
+    pub fn on_frame_misframed(&mut self, anchor: u16, ring_len: usize) {
+        if !self.hunting {
+            self.drops = self.drops.wrapping_add(1);
+        }
+        self.on_frame_rejected(anchor, ring_len);
     }
 
     /// The composite verified a resolved frame: the ladder is trusted again;
@@ -232,11 +233,28 @@ impl Framer {
         self.hunting
     }
 
+    /// The next frame has begun: its break byte is ringed at the anchor
+    /// (position from the stream, with every earlier frame settled),
+    /// however many data bytes have ringed behind it.
+    pub fn break_ringed(&self, ring: &[u8], cursor: u16) -> bool {
+        let len = ring.len();
+        len != 0
+            && dist(cursor, self.anchor, len) != 0
+            && ring[self.anchor as usize] == BREAK_RING_BYTE
+    }
+
     /// One resolution step against the CURRENT ring state (data-first from
     /// the stream). The composite loops until `None`/`Wait`. `cursor` is the
     /// live DMA cursor read at call time -- progress truth, not a stale event
-    /// snapshot.
-    pub fn resolve(&mut self, ring: &[u8], cursor: u16, now: u32, tpb: u32) -> FramerOut {
+    /// snapshot. `needs` classifies a frontier frame from its header.
+    pub fn resolve(
+        &mut self,
+        ring: &[u8],
+        cursor: u16,
+        now: u32,
+        tpb: u32,
+        needs: impl FnOnce(&Header) -> FrameNeeds,
+    ) -> FramerOut {
         let len = ring.len();
         if len == 0 {
             return FramerOut::None; // defensive: no ring to resolve against
@@ -302,7 +320,15 @@ impl Framer {
             });
         }
         let missing = (footprint - received) as u32;
-        if !self.frontier.covered && missing <= COVERED_TAIL_BYTES {
+        let needs = needs(h);
+        if needs == FrameNeeds::Nothing {
+            // Aim past the horizon: `wait` caps every aim at it, so the
+            // horizon is this frame's only wake.
+            let aim = now.wrapping_add(STARVE_GIVEUP_BYTES.wrapping_mul(tpb));
+            return self.wait(aim, now, tpb, cursor, len);
+        }
+        let end_next = needs == FrameNeeds::End || self.frontier.covered;
+        if !end_next && missing <= COVERED_TAIL_BYTES {
             // Covered checkpoint: freeze the wire-end estimate here -- the
             // tightest projection this frame gets (missing <= 2, so the
             // ring-cadence error is under a byte-time) -- and hand the
@@ -321,9 +347,10 @@ impl Framer {
                 end_due,
             };
         }
-        // Aim at the next milestone: the covered point, or (once emitted)
-        // the frame end. Data-anchored: pure cadence, no epsilon.
-        let to_target = if self.frontier.covered {
+        // Aim at the next milestone: the covered point, or (once emitted,
+        // or for an end-only frame) the frame end. Data-anchored: pure
+        // cadence, no epsilon.
+        let to_target = if end_next {
             missing
         } else {
             missing - COVERED_TAIL_BYTES

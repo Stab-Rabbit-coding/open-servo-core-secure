@@ -5,13 +5,14 @@
 use osc_client::blocking::Client;
 use osc_client::nusb::NusbPipe;
 use osc_client::{Error, Id};
+use osc_servo_core::regions::control::addr::lifecycle::GOAL_POSITION;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = Client::connect(NusbPipe::open()?)?;
     let info = c.info();
     println!(
-        "INFO: link v{}, {} ticks/us",
-        info.version, info.ticks_per_us
+        "INFO: {} ticks/us, bus at {} bps",
+        info.ticks_per_us, info.bps
     );
 
     let mut fleet = Vec::new();
@@ -31,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if fleet.len() > 1 {
-        let chain = c.gread(&fleet, 392, 4)?; // GOAL_VELOCITY, V006 map
+        let chain = c.gread(&fleet, GOAL_POSITION, 4)?;
         println!(
             "chain: {} statuses, timeout_slot {:?}",
             chain.statuses.len(),

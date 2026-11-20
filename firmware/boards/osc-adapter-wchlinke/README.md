@@ -71,6 +71,31 @@ wlink-iap -f osc-adapter.bin          # flash the adapter APP
 adapter side that door is `osc bootloader` (the adapter does not implement
 the stock protocol). Verify with `osc info` (enumerates as `1209:0001`).
 
+## Bus wiring
+
+DATA is the header TX (PB10) and RX (PB11) pins tied together, plus GND:
+the adapter is full duplex and needs RX on the wire to hear replies and
+their breaks. The adapter only ever sinks the line (open-drain), so DATA
+needs a pull-up at the adapter end: 680 ohm to the header 3V3 on the bench
+pigtail. Keep the 3V3 rail on
+while a separately powered servo is on the bus: with the rail off the
+pull-up becomes a pull-down, and the servo reads a held low as a rescue.
+
+## Diagnostics
+
+`osc info` also prints what the adapter recorded about its last reset: the
+RCC reset cause (PIN/POR/SFT/IWDG), the main-loop phase the reset caught,
+and the last trapped exception (mcause/mepc/mtval, with a running count).
+The record lives in a reserved RAM word block that survives resets; a
+synchronous exception records itself and resets, and an independent
+watchdog (2 s nominal) resets a hung loop, so either way the dongle
+re-enumerates on its own instead of dropping off the bus.
+
+It also prints the adapter's uptime and its reset count since the last
+power-on (kept in the same block, zeroed by a POR). After a USB drop, an
+uptime shorter than the time since the drop means the adapter restarted;
+one longer means it kept running and the host lost the link.
+
 ## Recovery
 
 The loader is never erased by either direction, so a broken or interrupted

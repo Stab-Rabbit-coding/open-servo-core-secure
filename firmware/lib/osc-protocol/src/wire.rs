@@ -1,6 +1,8 @@
 //! osc-native wire primitives: ID, packed `INST` byte, and frame span math
 //! (`docs/osc-native-protocol.md` sec 3, sec 5, sec 9). Layout only -- no buffering.
 
+use crate::bytes::FrameBytes;
+
 /// Frame ID byte. `0x01..=0xF9` unicast, `0xFE` broadcast; `0x00`/`0xFF` and
 /// `0xFA..=0xFD` never address a servo on the wire (sec 3.1).
 #[repr(transparent)]
@@ -83,6 +85,17 @@ impl BaudRate {
         }
     }
 
+    /// `None` unless `hz` is a catalog rate exactly.
+    pub const fn from_hz(hz: u32) -> Option<Self> {
+        match hz {
+            500_000 => Some(BaudRate::B500000),
+            1_000_000 => Some(BaudRate::B1000000),
+            2_000_000 => Some(BaudRate::B2000000),
+            3_000_000 => Some(BaudRate::B3000000),
+            _ => None,
+        }
+    }
+
     pub const fn from_idx(idx: u8) -> Option<Self> {
         match idx {
             0 => Some(BaudRate::B500000),
@@ -124,7 +137,9 @@ impl Opcode {
     }
 }
 
-/// Status result code, `INST` bits [6:2] (sec 5.3). `9..=31` reserved/invalid.
+/// Status result code, `INST` bits [6:2] (sec 5.3). `12..=31` reserved/invalid.
+/// `Stream` marks a servo-initiated TEL burst frame (not a command ack), so
+/// parsers split the two without state.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResultCode {
@@ -137,19 +152,20 @@ pub enum ResultCode {
     Limit = 6,
     PredecessorSilent = 7,
     Hardware = 8,
+    Stream = 9,
     /// The frame carried no valid AUTH trailer and policy required one
     /// (`docs/security-architecture.md` sec 2.2). Covers a missing trailer, a
     /// bad tag, and a replayed sequence alike: the three are indistinguishable
     /// to a host that is behaving correctly, and separating them on the wire
     /// would tell an attacker which of their guesses was closer.
-    Unauthenticated = 9,
+    Unauthenticated = 10,
     /// Consecutive authentication failures tripped the lockout; effect-bearing
     /// frames are refused until a successful re-key (sec 2.7).
-    SecurityLockout = 10,
+    SecurityLockout = 11,
 }
 
 impl ResultCode {
-    /// `b` is the already-extracted 5-bit field; `9..=31` reject.
+    /// `b` is the already-extracted 5-bit field; `12..=31` reject.
     #[inline]
     pub const fn from_bits(b: u8) -> Option<ResultCode> {
         match b {
@@ -162,8 +178,9 @@ impl ResultCode {
             6 => Some(ResultCode::Limit),
             7 => Some(ResultCode::PredecessorSilent),
             8 => Some(ResultCode::Hardware),
-            9 => Some(ResultCode::Unauthenticated),
-            10 => Some(ResultCode::SecurityLockout),
+            9 => Some(ResultCode::Stream),
+            10 => Some(ResultCode::Unauthenticated),
+            11 => Some(ResultCode::SecurityLockout),
             _ => None,
         }
     }
@@ -340,7 +357,9 @@ impl Inst {
 pub const MAX_PAYLOAD: u8 = 252;
 
 /// sec 7 default: chain reclaim + host timeout, not a reply-time prescription.
-pub const DEFAULT_RESPONSE_DEADLINE_US: u16 = 60;
+/// Covers a servo's turnaround and the pauses inside its reply with the
+/// control kernel above the bus, up to the published capacity.
+pub const DEFAULT_RESPONSE_DEADLINE_US: u16 = 1000;
 
 /// sec 3.4: byte-times of ring silence that kill a parked partial frame -- the
 /// fallback death authority servo-side, and the host's post-garble pacing gap.
@@ -362,6 +381,35 @@ pub const UID_LEN: usize = 16;
 /// superimposed sub-bit-aligned read back as ONE clean frame instead of
 /// the collision garble the walk descends on.
 pub const ENUM_REPLY_SLOTS: u8 = 16;
+
+/// TEL burst payload flags byte (payload[1]) bit 0: LAST frame of the
+/// burst, the line frees after it. Rest reserved 0.
+pub const STREAM_FLAG_LAST: u8 = 1 << 0;
+
+/// True iff this frame ends a TEL burst: a `Stream` status whose payload
+/// flags byte carries the LAST bit.
+#[inline]
+pub fn stream_last(inst: Inst, payload: FrameBytes<'_>) -> bool {
+    inst.result() == Some(ResultCode::Stream)
+        && payload.u8_at(1).is_some_and(|f| f & STREAM_FLAG_LAST != 0)
+}
+
+/// sec 5.6 TEL frame payload: a `STREAM_HDR`-byte head (seq, flags, the
+/// first row's tick), then the rows, one per control tick, each the bytes
+/// of its chunks ([`crate::tel::Chunks`]). The row count is implicit in
+/// `LEN`; see [`crate::tel::StreamFrame`].
+pub const STREAM_HDR: usize = 4;
+
+/// The servo's batch: rows per frame, the burst's last frame fewer. Hosts
+/// take the count from `LEN`, never from this.
+pub const STREAM_SAMPLES_MAX: usize = 16;
+
+/// Bit-times per character on the wire: start, 8 data, stop (sec 3).
+pub const CHAR_BIT_TIMES: u32 = 10;
+
+/// The law break a trigger spins out: a bracketed 9-bit `0x00` through its
+/// stop bit (sec 3).
+pub const LAW_BREAK_BIT_TIMES: u32 = 11;
 
 /// TX-buffer alignment byte at offset 0 (sec 3.2): keeps the hardware CRC feed
 /// halfword-aligned and even; a CRC no-op (leading zero, init = 0). Not part
@@ -399,6 +447,16 @@ pub const fn covered_len(len: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baud_from_hz_takes_catalog_rates_only() {
+        for idx in 0..4 {
+            let rate = BaudRate::from_idx(idx).unwrap();
+            assert_eq!(BaudRate::from_hz(rate.as_hz()), Some(rate));
+        }
+        assert_eq!(BaudRate::from_hz(993_103), None);
+        assert_eq!(BaudRate::from_hz(0), None);
+    }
 
     #[test]
     fn id_classification() {
@@ -443,7 +501,8 @@ mod tests {
             Some(ResultCode::PredecessorSilent)
         );
         assert_eq!(ResultCode::from_bits(8), Some(ResultCode::Hardware));
-        assert_eq!(ResultCode::from_bits(9), None);
+        assert_eq!(ResultCode::from_bits(9), Some(ResultCode::Stream));
+        assert_eq!(ResultCode::from_bits(12), None);
         assert_eq!(ResultCode::from_bits(31), None);
     }
 
@@ -497,9 +556,9 @@ mod tests {
 
     #[test]
     fn security_result_codes_round_trip() {
-        assert_eq!(ResultCode::from_bits(9), Some(ResultCode::Unauthenticated));
-        assert_eq!(ResultCode::from_bits(10), Some(ResultCode::SecurityLockout));
-        assert_eq!(ResultCode::from_bits(11), None);
+        assert_eq!(ResultCode::from_bits(10), Some(ResultCode::Unauthenticated));
+        assert_eq!(ResultCode::from_bits(11), Some(ResultCode::SecurityLockout));
+        assert_eq!(ResultCode::from_bits(12), None);
         // They must survive the status packing/unpacking round trip.
         for rc in [ResultCode::Unauthenticated, ResultCode::SecurityLockout] {
             assert_eq!(Inst::status(rc, false).result(), Some(rc));
@@ -542,6 +601,25 @@ mod tests {
         assert_eq!(s.0, 0x80);
         assert!(!s.alert());
         assert_eq!(s.result(), Some(ResultCode::Ok));
+    }
+
+    #[test]
+    fn stream_last_detects_the_burst_end() {
+        let s = Inst::status(ResultCode::Stream, false);
+        assert!(stream_last(
+            s,
+            FrameBytes::from(&[0u8, STREAM_FLAG_LAST][..])
+        ));
+        assert!(!stream_last(s, FrameBytes::from(&[0u8, 0x02][..])));
+        assert!(!stream_last(s, FrameBytes::from(&[0u8][..])));
+        assert!(!stream_last(
+            Inst::status(ResultCode::Ok, false),
+            FrameBytes::from(&[0u8, STREAM_FLAG_LAST][..])
+        ));
+        assert!(!stream_last(
+            Inst::instruction(Opcode::Ping, 0),
+            FrameBytes::from(&[0u8, STREAM_FLAG_LAST][..])
+        ));
     }
 
     #[test]

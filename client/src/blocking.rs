@@ -4,15 +4,26 @@
 use std::time::Duration;
 
 use futures_lite::future::block_on;
+use osc_host::engine::TbExpect;
 use osc_protocol::wire::{BaudRate, Id, Inst};
 
-use crate::client::{Chain, Ping, Reply};
+use crate::boot::{
+    self, BootDevice, BootInfo, Chosen, Device, Image, Progress, Report, ResetFlags, Selected,
+    WriteFlags,
+};
+use crate::calib::{self, GearClass};
+use crate::client::{Chain, Ping, Reply, StreamReply, TbReply};
 use crate::common::{self, Health, Identity};
 use crate::cyclic::Cycle;
+use crate::data_state::{self, DataState};
+use crate::descriptor::Descriptor;
 use crate::error::Error;
 use crate::mgmt::{self, CalTrace, Found, Uid};
 use crate::pipe::Pipe;
-use crate::session::LinkInfo;
+use crate::pos_lut::{self, PosLut};
+use crate::session::{BusMode, LinkInfo};
+use crate::stamp::{self, Verdict};
+#[cfg(feature = "bench")]
 use crate::wire::EdgeDrain;
 
 pub struct Client<P: Pipe>(crate::Client<P>);
@@ -31,6 +42,10 @@ impl<P: Pipe> Client<P> {
         self.0.pipe_mut()
     }
 
+    pub fn into_pipe(self) -> P {
+        self.0.into_pipe()
+    }
+
     pub fn set_guard(&mut self, guard: Duration) {
         self.0.set_guard(guard);
     }
@@ -41,6 +56,16 @@ impl<P: Pipe> Client<P> {
 
     pub fn exchange(&mut self, id: Id, inst: Inst, payload: &[u8]) -> Result<Reply, Error> {
         block_on(self.0.exchange(id, inst, payload))
+    }
+
+    pub fn exchange_stream(
+        &mut self,
+        id: Id,
+        inst: Inst,
+        payload: &[u8],
+        window: Duration,
+    ) -> Result<StreamReply, Error> {
+        block_on(self.0.exchange_stream(id, inst, payload, window))
     }
 
     /// Quiet bus time (sec 8 pacing): wall time on hardware, sim time on
@@ -98,6 +123,22 @@ impl<P: Pipe> Client<P> {
         block_on(self.0.host_baud(rate))
     }
 
+    pub fn set_bus(&mut self, mode: BusMode, bps: u32) -> Result<(), Error> {
+        block_on(self.0.set_bus(mode, bps))
+    }
+
+    pub fn tb_exchange(
+        &mut self,
+        expect: TbExpect,
+        window: Duration,
+        cmd: u8,
+        addr: u32,
+        flags: u8,
+        data: &[u8],
+    ) -> Result<TbReply, Error> {
+        block_on(self.0.tb_exchange(expect, window, cmd, addr, flags, data))
+    }
+
     pub fn set_response_deadline(&mut self, us: u16) -> Result<(), Error> {
         block_on(self.0.set_response_deadline(us))
     }
@@ -120,34 +161,6 @@ impl<P: Pipe> Client<P> {
 
     pub fn enter_bootloader(&mut self) -> Result<(), Error> {
         block_on(self.0.enter_bootloader())
-    }
-
-    pub fn wire_send(&mut self, bytes: &[u8]) -> Result<u32, Error> {
-        block_on(self.0.wire_send(bytes))
-    }
-
-    pub fn wire_burst(&mut self, frames: &[&[u8]]) -> Result<u32, Error> {
-        block_on(self.0.wire_burst(frames))
-    }
-
-    pub fn wire_pulse_low(&mut self, us: u16) -> Result<u32, Error> {
-        block_on(self.0.wire_pulse_low(us))
-    }
-
-    pub fn wire_train(&mut self, announce: &[u8], gap_us: u16, breaks: u8) -> Result<u32, Error> {
-        block_on(self.0.wire_train(announce, gap_us, breaks))
-    }
-
-    pub fn wire_baud(&mut self, bps: u32) -> Result<u32, Error> {
-        block_on(self.0.wire_baud(bps))
-    }
-
-    pub fn drain_edges(&mut self) -> Result<EdgeDrain, Error> {
-        block_on(self.0.drain_edges())
-    }
-
-    pub fn reset_capture(&mut self) -> Result<(), Error> {
-        block_on(self.0.reset_capture())
     }
 
     pub fn discover(&mut self) -> Result<Vec<Found>, Error> {
@@ -178,6 +191,10 @@ impl<P: Pipe> Client<P> {
         block_on(mgmt::reboot(&mut self.0, id))
     }
 
+    pub fn reboot_bootloader(&mut self, id: Id, baud: BaudRate) -> Result<(), Error> {
+        block_on(mgmt::reboot_bootloader(&mut self.0, id, baud))
+    }
+
     pub fn factory(&mut self, id: Id) -> Result<(), Error> {
         block_on(mgmt::factory(&mut self.0, id))
     }
@@ -200,6 +217,82 @@ impl<P: Pipe> Client<P> {
         block_on(mgmt::cal_verify(&mut self.0, ids, trains, gap_us, gaps))
     }
 
+    pub fn boot_select(&mut self, seed: u8, prefix: &[u8], bits: u8) -> Result<Selected, Error> {
+        block_on(boot::select(&mut self.0, seed, prefix, bits))
+    }
+
+    pub fn boot_discover(&mut self) -> Result<Vec<Vec<u8>>, Error> {
+        block_on(boot::discover(&mut self.0))
+    }
+
+    pub fn boot_info(&mut self) -> Result<BootInfo, Error> {
+        block_on(boot::info(&mut self.0))
+    }
+
+    pub fn boot_erase(&mut self, addr: u32, byte_count: u16) -> Result<(), Error> {
+        block_on(boot::erase(&mut self.0, addr, byte_count))
+    }
+
+    pub fn boot_write(&mut self, addr: u32, data: &[u8], flags: WriteFlags) -> Result<(), Error> {
+        block_on(boot::write(&mut self.0, addr, data, flags))
+    }
+
+    pub fn boot_verify(&mut self, app_size: u32) -> Result<u16, Error> {
+        block_on(boot::verify(&mut self.0, app_size))
+    }
+
+    pub fn boot_reset(
+        &mut self,
+        flags: ResetFlags,
+        baud: Option<boot::BaudRate>,
+    ) -> Result<(), Error> {
+        block_on(boot::reset(&mut self.0, flags, baud))
+    }
+
+    pub fn boot_reset_all(&mut self) -> Result<(), Error> {
+        block_on(boot::reset_all(&mut self.0))
+    }
+
+    pub fn boot_install(
+        &mut self,
+        uid: &[u8],
+        image: &Image,
+        progress: impl FnMut(u32, u32),
+    ) -> Result<(), Error> {
+        block_on(boot::install(&mut self.0, uid, image, progress))
+    }
+
+    pub fn boot_apps(&mut self) -> Result<Vec<(BaudRate, Found)>, Error> {
+        block_on(boot::apps(&mut self.0))
+    }
+
+    pub fn boot_enter(&mut self, rate: BaudRate) -> Result<Vec<Found>, Error> {
+        block_on(boot::enter(&mut self.0, rate))
+    }
+
+    pub fn boot_list(&mut self) -> Result<Vec<BootDevice>, Error> {
+        block_on(boot::list(&mut self.0))
+    }
+
+    pub fn boot_confirm(
+        &mut self,
+        waiting: &[Found],
+        installed: &[Vec<u8>],
+        version: u16,
+    ) -> Result<Vec<Device>, Error> {
+        block_on(boot::confirm(&mut self.0, waiting, installed, version))
+    }
+
+    pub fn boot_update(
+        &mut self,
+        image: &Image,
+        chosen: &Chosen,
+        rate: BaudRate,
+        progress: impl FnMut(Progress<'_>),
+    ) -> Result<Report, Error> {
+        block_on(boot::update(&mut self.0, image, chosen, rate, progress))
+    }
+
     pub fn identity(&mut self, id: Id) -> Result<Identity, Error> {
         block_on(common::identity(&mut self.0, id))
     }
@@ -210,6 +303,68 @@ impl<P: Pipe> Client<P> {
 
     pub fn clear_counters(&mut self, id: Id) -> Result<(), Error> {
         block_on(common::clear_counters(&mut self.0, id))
+    }
+
+    pub fn sync_response_deadline(&mut self, ids: &[Id], us: u16) -> Result<Vec<(Id, u16)>, Error> {
+        block_on(common::sync_response_deadline(&mut self.0, ids, us))
+    }
+
+    pub fn read_span(&mut self, id: Id, lo: u16, hi: u16) -> Result<Vec<u8>, Error> {
+        block_on(self.0.read_span(id, lo, hi))
+    }
+
+    pub fn data_state(&mut self, id: Id, d: &Descriptor) -> Result<DataState, Error> {
+        block_on(data_state::read(&mut self.0, id, d))
+    }
+
+    pub fn gear_class(&mut self, id: Id, d: &Descriptor) -> Result<GearClass, Error> {
+        block_on(calib::gear_class(&mut self.0, id, d))
+    }
+
+    /// The stamp of the set the servo holds now.
+    pub fn plant_stamp(&mut self, id: Id, d: &Descriptor) -> Result<u16, Error> {
+        block_on(stamp::compute(&mut self.0, id, d))
+    }
+
+    pub fn stamp_verdict(&mut self, id: Id, d: &Descriptor) -> Result<Verdict, Error> {
+        block_on(stamp::verdict(&mut self.0, id, d))
+    }
+
+    /// Stamp the live set; the firmware verifies it only with torque off.
+    pub fn restamp(&mut self, id: Id, d: &Descriptor) -> Result<u16, Error> {
+        block_on(stamp::restamp(&mut self.0, id, d))
+    }
+
+    /// The position table as the servo holds it (every page FETCHed) and its
+    /// state.
+    pub fn pos_lut(&mut self, id: Id, d: &Descriptor) -> Result<PosLut, Error> {
+        block_on(pos_lut::read(&mut self.0, id, d))
+    }
+
+    pub fn pos_lut_state(&mut self, id: Id, d: &Descriptor) -> Result<u8, Error> {
+        block_on(pos_lut::state(&mut self.0, id, d))
+    }
+
+    /// STORE, COMMIT and verify a position table; torque must be off. Never
+    /// stamps.
+    pub fn write_pos_lut(
+        &mut self,
+        id: Id,
+        d: &Descriptor,
+        points: &[i16; pos_lut::INTERVALS],
+    ) -> Result<(), Error> {
+        block_on(pos_lut::write(&mut self.0, id, d, points))
+    }
+
+    /// Back to IDENTITY: an all-zero table STOREd and COMMITted.
+    pub fn clear_pos_lut(&mut self, id: Id, d: &Descriptor) -> Result<(), Error> {
+        block_on(pos_lut::clear(&mut self.0, id, d))
+    }
+
+    /// COMMIT the table the servo holds against the stops as they are now;
+    /// the `pos_lut_state` after. Torque must be off.
+    pub fn recommit_pos_lut(&mut self, id: Id, d: &Descriptor) -> Result<u8, Error> {
+        block_on(pos_lut::recommit(&mut self.0, id, d))
     }
 
     pub fn read_profile(&mut self, id: Id, slot: u8) -> Result<Vec<u8>, Error> {
@@ -224,5 +379,36 @@ impl<P: Pipe> Client<P> {
     /// telemetry chain.
     pub fn step(&mut self, cycle: &Cycle, payloads: &[&[u8]]) -> Result<Chain, Error> {
         block_on(cycle.step(&mut self.0, payloads))
+    }
+}
+
+#[cfg(feature = "bench")]
+impl<P: Pipe> Client<P> {
+    pub fn wire_send(&mut self, bytes: &[u8]) -> Result<u32, Error> {
+        block_on(self.0.wire_send(bytes))
+    }
+
+    pub fn wire_burst(&mut self, frames: &[&[u8]]) -> Result<u32, Error> {
+        block_on(self.0.wire_burst(frames))
+    }
+
+    pub fn wire_pulse_low(&mut self, us: u16) -> Result<u32, Error> {
+        block_on(self.0.wire_pulse_low(us))
+    }
+
+    pub fn wire_train(&mut self, announce: &[u8], gap_us: u16, breaks: u8) -> Result<u32, Error> {
+        block_on(self.0.wire_train(announce, gap_us, breaks))
+    }
+
+    pub fn wire_baud(&mut self, bps: u32) -> Result<(), Error> {
+        block_on(self.0.wire_baud(bps))
+    }
+
+    pub fn drain_edges(&mut self) -> Result<EdgeDrain, Error> {
+        block_on(self.0.drain_edges())
+    }
+
+    pub fn reset_capture(&mut self) -> Result<(), Error> {
+        block_on(self.0.reset_capture())
     }
 }

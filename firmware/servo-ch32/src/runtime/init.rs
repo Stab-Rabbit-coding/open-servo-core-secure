@@ -1,36 +1,51 @@
-use ch32_metapac::{ADC, adc::vals::Extsel, dma::vals::Dir};
-use osc_servo_core::ConfigDefaults;
-#[cfg(not(feature = "half-duplex"))]
-use osc_servo_drivers::Level;
+use ch32_metapac::{adc::vals::Extsel, dma::vals::Dir};
+use osc_servo_core::{CalibSense, CalibSenseExt, ConfigDefaults};
 
-use crate::control::sensors::scan::{ADC_DMA_BUF, ADC_DMA_BUF_LEN, ADC_SCAN_LEN, ADC_SENSOR_COUNT};
 use crate::hal::{
     adc, afio, delay_ms, dma, esig,
     gpio::{self, PinMode},
     opa, rcc, systick, timer, usart,
 };
+use crate::providers::break_stamps::BreakStamps;
+use crate::providers::break_wake::BreakWake;
 use crate::providers::config_store;
 use crate::providers::crc::Crc;
 use crate::providers::ring::RxRing;
+use crate::providers::sensors::scan::{self, ADC_DMA_BUF_LEN, ADC_SCAN_LEN, ADC_SENSOR_COUNT};
 use crate::runtime::Drivers;
 use crate::runtime::statics::SHARED;
 
-use crate::cfg::{AdcPins, AnalogChannel, BoardWiring, CurrentSenseConfig, Precomputed, chip};
+use crate::cfg::{
+    AdcPins, AnalogChannel, BoardWiring, Calibration, CurrentSenseConfig, Precomputed, chip,
+};
 
 const OPA_SETTLE_MS: u32 = 1;
-const VCAL_SAMPLE_TIME: adc::SampleTime = adc::SampleTime::CYCLES9;
 
-pub struct BringupResult {
-    pub shunt_bias_raw: u16,
-}
+/// Boot bias averaging: a power-of-two count so the mean is a shift, never a
+/// divide (the linker must stay free of __udivsi3).
+const BIAS_SHIFT: u32 = 4;
+const BIAS_SAMPLES: u32 = 1 << BIAS_SHIFT;
+
+/// Both terminal taps sit at the same bias with the driver parked; a wider
+/// split means a tap is not at rest (or a leg is missing) and the nominal
+/// stands in.
+const VMOTOR_BIAS_AGREE_COUNTS: u16 = 64;
+
+/// VB charges through Cb1 (0.82 ms) from a VDD that is still rising this
+/// soon after reset on a slow supply, so a pair is kept only once a re-read
+/// one step later agrees with it.
+const VMOTOR_BIAS_STEP_MS: u32 = 2;
+const VMOTOR_BIAS_STEPS: u32 = 32;
+const VMOTOR_BIAS_SETTLED_COUNTS: u16 = 1;
 
 pub fn bringup(
     wiring: &BoardWiring,
+    calibration: &Calibration,
     defaults: &ConfigDefaults,
     model: u16,
     hw_rev: u8,
     pre: &Precomputed,
-) -> BringupResult {
+) {
     enable_clocks_and_remaps(wiring);
     crate::log::debug!("clocks + remaps configured");
 
@@ -40,13 +55,37 @@ pub fn bringup(
     // Sole writer to CONFIG: pre-IRQ, pre-`Drivers::install`. Board defaults
     // first, then the saved image overlays them (protocol sec 9.4) -- `Drivers::install`
     // reads the effective comms block from the table.
-    SHARED.table.seed_config_defaults(defaults);
+    SHARED.table.seed_config_defaults(
+        defaults,
+        &pre.current_defaults,
+        pre.v_undervolt_counts,
+        pre.rail_fold_q8,
+    );
     SHARED.table.seed_identity(model, hw_rev);
     config_store::ConfigStore::boot_load();
+    // After boot_load: the calib overlay copies the whole region, so the RO
+    // board facts (tick_hz, window floors) must land last to win over a
+    // stale saved image.
+    SHARED.table.seed_calib_sense(
+        &calib_sense(wiring, calibration),
+        &calib_sense_ext(calibration, pre),
+        pre.pwm_arr,
+    );
     SHARED.seed_uid(esig::uid());
 
     bring_up_analog_chain(&wiring.current_sense);
     crate::log::debug!("opa settled");
+
+    // Bridge is quiet here: PWM starts at the end of bringup and DRV_EN was
+    // parked inactive in `configure_pins`, so the shunt carries no current
+    // and both motor terminals float at the divider bias.
+    SHARED
+        .table
+        .seed_current_bias(measure_current_bias(&wiring.current_sense));
+    SHARED.table.seed_vmotor_bias(measure_vmotor_bias(
+        &wiring.sensors,
+        pre.vmotor_bias_nom_counts,
+    ));
 
     // SysTick drives both `Monotonic` (LED blinker) and the transport
     // deadline compare. Initialize *after* `bring_up_analog_chain` because
@@ -55,20 +94,19 @@ pub fn bringup(
     // independent of any further `delay_ms` use.
     systick::init();
 
-    let shunt_bias_raw = wiring.current_sense.bias.quiescent_raw();
-    configure_adc_dma_scan(&wiring.sensors);
+    configure_adc_dma_scan(wiring);
     crate::log::debug!(
-        "adc/dma scan armed: scan_len={} buf_len={} shunt_bias_raw={}",
+        "adc/dma scan armed: scan_len={} buf_len={}",
         ADC_SCAN_LEN,
         ADC_DMA_BUF_LEN,
-        shunt_bias_raw,
     );
 
-    bring_up_bus(pre.usart_brr);
-    crate::log::debug!("bus usart + rx ring + crc engine armed");
+    bring_up_bus(pre.usart_brr, pre.break_reload);
+    crate::log::debug!("bus usart + rx ring + break stamps + break wake + crc engine armed");
 
     // Drivers::install runs after the bus peripherals are live: `ServoBus
-    // ::new` applies the table's effective baud to the already-configured BRR.
+    // ::new` applies the table's effective baud to the already-configured
+    // BRR and break-wake reload.
     // SAFETY: bringup-only, pre-IRQ; sole writer.
     unsafe { Drivers::install(wiring) };
     crate::log::debug!("drivers installed");
@@ -83,36 +121,68 @@ pub fn bringup(
 
     #[cfg(feature = "defmt")]
     super::diag::dump_init_regs();
-
-    BringupResult { shunt_bias_raw }
 }
 
-// Order must mirror the scan tail in `configure_adc_dma_scan`.
+// tick_hz stamps from the constant that programs TIM1, so the table can
+// never disagree with silicon; the cast must stay lossless.
+const _: () = assert!(chip::MOTOR_PWM_FREQ_HZ <= u16::MAX as u32);
+const _: () = assert!(
+    timer::pwm_dividers_from_hz(chip::MOTOR_PWM_FREQ_HZ).1 as u32
+        <= osc_servo_core::estimator::bemf::ARR_MAX
+);
+
+// The tick block carries the applied duty as i16 compare counts.
+const _: () =
+    assert!(crate::hal::timer::pwm_dividers_from_hz(chip::MOTOR_PWM_FREQ_HZ).1 <= i16::MAX as u16);
+
+fn calib_sense(wiring: &BoardWiring, cal: &Calibration) -> CalibSense {
+    CalibSense {
+        shunt_r_mohm: cal.shunt_r_mohm,
+        gain_milli: wiring.current_sense.gain_milli,
+        vmotor_div_top: cal.vmotor_divider.top_ohm.min(u16::MAX as u32) as u16,
+        vmotor_div_bot: cal.vmotor_divider.bot_ohm.min(u16::MAX as u32) as u16,
+        vdd_mv: cal.vdd_mv,
+        tick_hz: chip::MOTOR_PWM_FREQ_HZ as u16,
+        i_window_min_ticks: cal.i_window_min_ticks,
+        v_window_min_ticks: cal.v_window_min_ticks,
+    }
+}
+
+fn calib_sense_ext(cal: &Calibration, pre: &Precomputed) -> CalibSenseExt {
+    CalibSenseExt {
+        vbus_div_top_ohm: cal.vbus_divider.top_ohm.min(u16::MAX as u32) as u16,
+        vbus_div_bot_ohm: cal.vbus_divider.bot_ohm.min(u16::MAX as u32) as u16,
+        ntc_pullup_ohm: cal.ntc.pullup_ohm.min(u16::MAX as u32) as u16,
+        ntc_r25_ohm: cal.ntc.r25_ohm.min(u16::MAX as u32) as u16,
+        ntc_beta: cal.ntc.beta,
+        vmotor_bias_nom_counts: pre.vmotor_bias_nom_counts,
+        rail_drop_mv: cal.rail_drop_mv,
+        vmotor_bias_top_ohm: pre.vmotor_bias_top_ohm,
+        vmotor_bias_bot_ohm: pre.vmotor_bias_bot_ohm,
+    }
+}
+
+// Order mirrors the scan in `configure_adc_dma_scan` (the shunt and Vref aside).
 fn sensor_channels(s: &AdcPins) -> [AnalogChannel; ADC_SENSOR_COUNT] {
-    [s.pos, s.ntc, s.vbus, s.vmotor.0, s.vmotor.1]
+    [s.vmotor.0, s.vmotor.1, s.pos, s.vbus, s.ntc]
 }
 
 fn enable_clocks_and_remaps(w: &BoardWiring) {
-    let opa_pos_pin = chip::CURRENT_SENSE_OPA_INPUT.pos().pin();
+    let (opa_pos, opa_neg, opa_out) = w.current_sense.opa.pins();
 
     rcc::init_pll();
     rcc::enable_afio();
     rcc::enable_gpio(chip::STAT_LED_PIN.port_index());
-    rcc::enable_gpio(w.dbg.pin().port_index());
     rcc::enable_gpio(chip::MOTOR_IN1_PIN.port_index());
     rcc::enable_gpio(chip::MOTOR_IN2_PIN.port_index());
     rcc::enable_gpio(w.drv_en.pin.pin().port_index());
-    rcc::enable_gpio(opa_pos_pin.port_index());
-    if let Some(neg_pin) = chip::CURRENT_SENSE_OPA_INPUT.neg_pin() {
-        rcc::enable_gpio(neg_pin.port_index());
-    }
+    rcc::enable_gpio(opa_pos.port_index());
+    rcc::enable_gpio(opa_neg.port_index());
+    rcc::enable_gpio(opa_out.port_index());
     for ch in sensor_channels(&w.sensors) {
         rcc::enable_gpio(ch.pin().port_index());
     }
     rcc::enable_gpio(chip::BUS_USART_MAPPING.tx_pin().port_index());
-    rcc::enable_gpio(chip::BUS_LINE_PIN.port_index());
-    #[cfg(not(feature = "half-duplex"))]
-    rcc::enable_gpio(w.bus.tx_en.port_index());
     rcc::enable_tim1();
     rcc::enable_adc1();
     rcc::enable_dma1();
@@ -134,112 +204,143 @@ fn configure_pins(w: &BoardWiring) {
     gpio::configure(chip::MOTOR_IN1_PIN, PinMode::AF_PUSH_PULL);
     gpio::configure(chip::MOTOR_IN2_PIN, PinMode::AF_PUSH_PULL);
 
-    let opa_pos_pin = chip::CURRENT_SENSE_OPA_INPUT.pos().pin();
-    gpio::configure(opa_pos_pin, PinMode::ANALOG);
-    if let Some(neg_pin) = chip::CURRENT_SENSE_OPA_INPUT.neg_pin() {
-        gpio::configure(neg_pin, PinMode::ANALOG);
-    }
+    // Output pin included: the loop closes through the external network, so
+    // the pad is driven by the amplifier and read by the ADC, never by GPIO.
+    let (opa_pos, opa_neg, opa_out) = w.current_sense.opa.pins();
+    gpio::configure(opa_pos, PinMode::ANALOG);
+    gpio::configure(opa_neg, PinMode::ANALOG);
+    gpio::configure(opa_out, PinMode::ANALOG);
     for ch in sensor_channels(&w.sensors) {
         gpio::configure(ch.pin(), PinMode::ANALOG);
     }
 
-    configure_bus_pins(w);
-}
-
-#[cfg(feature = "half-duplex")]
-fn configure_bus_pins(_w: &BoardWiring) {
-    // PC0 idle: AF open-drain -- released, the external bus pull-up holds
-    // mark (spike break_framing `pc0_drive`; a bare wire with no pull-up
-    // floats low and trips rescue). TxWire flips to AF push-pull for the
-    // TX window so data edges never ride the pull-up (transport sec 2, F8).
+    // PC0 is AF open-drain for good: the servo only ever pulls low, and the
+    // host pull-up and the board keeper hold mark (transport sec 2; a bare
+    // wire with no pull-up floats low and trips rescue). PC1 is not the
+    // bus's: HDSEL ties RX to the TX pin internally.
     gpio::configure(chip::BUS_USART_MAPPING.tx_pin(), PinMode::AF_OPEN_DRAIN);
-    // The dedicated RX pin (PC1) is left unconfigured -- HDSEL ties RX to
-    // the TX pin internally and ignores it. On a buffer-populated board
-    // running this direct wire (bypassed rev B), the board's TX_EN
-    // pull-down is what holds the buffer released -- no firmware involved.
-}
-
-#[cfg(not(feature = "half-duplex"))]
-fn configure_bus_pins(w: &BoardWiring) {
-    // TX drives only the 74LVC2G241's buffer input, never the shared
-    // wire, so it stays AF push-pull for good -- the buffer's tri-state
-    // (TX_EN) is the drive discipline (transport sec 2; F8 applies to the wire side
-    // of the buffer).
-    gpio::configure(chip::BUS_USART_MAPPING.tx_pin(), PinMode::AF_PUSH_PULL);
-    // RX listens through the receive buffer; the internal pull-up idles
-    // it at mark alongside the board pull-up and covers an open RX
-    // jumper.
-    gpio::configure(chip::BUS_USART_MAPPING.rx_pin(), PinMode::INPUT_PULL_UP);
-    // TX_EN low = listening (matches the board pull-down's boot state);
-    // TxWire raises it for the TX window.
-    gpio::configure(w.bus.tx_en, PinMode::OUTPUT_PUSH_PULL);
-    gpio::set_level(w.bus.tx_en, Level::Low);
 }
 
 fn bring_up_analog_chain(cs: &CurrentSenseConfig) {
-    opa::init(&opa::Config {
-        input: chip::CURRENT_SENSE_OPA_INPUT,
-        gain: cs.gain,
-        bias: cs.bias,
-        output: chip::CURRENT_SENSE_OPA_OUTPUT,
-    });
+    opa::init(&cs.opa);
     delay_ms(OPA_SETTLE_MS);
 }
 
-fn configure_adc_dma_scan(sensors: &AdcPins) {
-    adc::set_sample_time(adc::Channel::OpaOut, chip::ADC_SAMPLE_TIME);
-    adc::set_sample_time(sensors.pos.channel(), chip::ADC_SAMPLE_TIME);
-    adc::set_sample_time(sensors.ntc.channel(), chip::ADC_SAMPLE_TIME);
-    adc::set_sample_time(sensors.vmotor.0.channel(), chip::ADC_SAMPLE_TIME);
-    adc::set_sample_time(sensors.vmotor.1.channel(), chip::ADC_SAMPLE_TIME);
-    adc::set_sample_time(adc::Channel::Vcal, VCAL_SAMPLE_TIME);
-    adc::set_low_power(false);
+/// `BIAS_SAMPLES` polled conversions of `ch`, averaged; `None` when EOC
+/// never arrives (a converter that never signals must not stall bringup).
+/// Leaves the ADC powered down so `configure_adc_dma_scan` still sees the
+/// off->on ADON transition it needs; every other register it touches is
+/// rewritten there.
+fn measure_rest(ch: adc::Channel, t: adc::SampleTime) -> Option<u16> {
+    adc::set_sample_time(ch, t);
+    adc::set_low_power(true);
+    adc::set_scan_mode(false);
+    adc::set_dma(false);
+    // Arm the software trigger before ADON so EXTTRIG is already live when
+    // the first `convert_once` pulses SWSTART.
+    adc::set_external_trigger(adc::Extsel::SWSTART);
+    adc::enable();
 
-    let seq = [
-        adc::Channel::OpaOut,
-        sensors.pos.channel(),
-        sensors.ntc.channel(),
+    let mut sum: u32 = 0;
+    let mut taken: u32 = 0;
+    while taken < BIAS_SAMPLES {
+        let Some(counts) = adc::convert_once(ch) else {
+            break;
+        };
+        sum += counts as u32;
+        taken += 1;
+    }
+    adc::disable();
+
+    if taken == BIAS_SAMPLES {
+        Some((sum >> BIAS_SHIFT) as u16)
+    } else {
+        crate::log::debug!("rest measure: adc timeout after {} samples", taken);
+        None
+    }
+}
+
+/// Zero-current output of the sense chain. Zero on timeout leaves current
+/// uncorrected rather than wrong.
+fn measure_current_bias(cs: &CurrentSenseConfig) -> u16 {
+    measure_rest(cs.current_channel().channel(), chip::ADC_SHUNT_SAMPLE_TIME).unwrap_or(0)
+}
+
+/// Terminal-divider bias: with the driver parked both terminals float, so
+/// each tap reads the bias directly. The taps must agree within
+/// `VMOTOR_BIAS_AGREE_COUNTS` and the pair must have settled, else the
+/// board nominal stands in.
+fn measure_vmotor_bias(s: &AdcPins, nominal: u16) -> u16 {
+    settled_bias(
+        || {
+            let a = measure_rest(s.vmotor.0.channel(), chip::ADC_TERMINAL_SAMPLE_TIME)?;
+            let b = measure_rest(s.vmotor.1.channel(), chip::ADC_TERMINAL_SAMPLE_TIME)?;
+            (a.abs_diff(b) <= VMOTOR_BIAS_AGREE_COUNTS).then(|| ((a as u32 + b as u32) >> 1) as u16)
+        },
+        || delay_ms(VMOTOR_BIAS_STEP_MS),
+        nominal,
+    )
+}
+
+/// The first `read` that agrees with the one a `wait` before it.
+fn settled_bias(
+    mut read: impl FnMut() -> Option<u16>,
+    mut wait: impl FnMut(),
+    nominal: u16,
+) -> u16 {
+    let mut last = read();
+    for _ in 0..VMOTOR_BIAS_STEPS {
+        wait();
+        let next = read();
+        if let (Some(p), Some(n)) = (last, next)
+            && p.abs_diff(n) <= VMOTOR_BIAS_SETTLED_COUNTS
+        {
+            return n;
+        }
+        last = next;
+    }
+    crate::log::debug!("vmotor bias: unsettled, nominal {}", nominal);
+    nominal
+}
+
+fn configure_adc_dma_scan(w: &BoardWiring) {
+    let sensors = &w.sensors;
+    let current = w.current_sense.current_channel().channel();
+
+    adc::set_sample_time(current, chip::ADC_SHUNT_SAMPLE_TIME);
+    adc::set_sample_time(sensors.pos.channel(), chip::ADC_RESERVOIR_SAMPLE_TIME);
+    adc::set_sample_time(sensors.vmotor.0.channel(), chip::ADC_TERMINAL_SAMPLE_TIME);
+    adc::set_sample_time(sensors.vmotor.1.channel(), chip::ADC_TERMINAL_SAMPLE_TIME);
+    adc::set_sample_time(adc::Channel::Vref, chip::ADC_VREF_SAMPLE_TIME);
+    adc::set_sample_time(sensors.vbus.channel(), chip::ADC_RESERVOIR_SAMPLE_TIME);
+    adc::set_sample_time(sensors.ntc.channel(), chip::ADC_RESERVOIR_SAMPLE_TIME);
+    adc::set_low_power(true);
+
+    scan::seed_seq([
         sensors.vmotor.0.channel(),
         sensors.vmotor.1.channel(),
-        adc::Channel::Vcal,
-    ];
-    adc::set_sequence(&seq);
+        current,
+        sensors.pos.channel(),
+        adc::Channel::Vref,
+        sensors.vbus.channel(),
+        sensors.ntc.channel(),
+    ]);
     adc::set_scan_mode(true);
     adc::set_dma(true);
     adc::set_external_trigger(Extsel::TIM1_TRGO);
+    adc::set_injected(sensors.vmotor.1.channel(), current, chip::LOW_TAP_TRIGGER);
+    adc::set_jeoc_irq(true);
     adc::enable();
 
-    let dma_cfg = dma::Config {
-        dir: Dir::FROMPERIPHERAL,
-        circ: true,
-        pinc: false,
-        minc: true,
-        size: dma::Size::BITS16,
-        htie: false,
-        tcie: true,
-        // HIGH, not VERYHIGH: RX (CH5) alone owns the top so an inbound byte's
-        // drain outranks everything (see the ladder in `hal::dma`). ADC is the
-        // lowest-numbered HIGH channel, so it still wins every HIGH tie and
-        // only ever yields to the sparse RX drain.
-        pl: dma::Pl::HIGH,
-    };
-    let paddr = ADC.rdatar().as_ptr() as u32;
-    let maddr = ADC_DMA_BUF.get() as u32;
-    dma::configure(
-        dma::Channel::CH1,
-        &dma_cfg,
-        paddr,
-        maddr,
-        ADC_DMA_BUF_LEN as u16,
-    );
-    dma::enable(dma::Channel::CH1);
+    scan::arm_dma();
 }
 
-/// osc-native transport bring-up: USART1 (single-wire HDSEL on the direct
-/// wire, plain full duplex behind the 74LVC2G241 on the buffered wire), the
-/// circular RX ring on DMA1_CH5 (armed once), and the SPI-CRC engine. TX arms
-/// (DMA1_CH4) are configured per-arm by `TxWire`, so no channel init here.
-fn bring_up_bus(brr: u32) {
+/// osc-native transport bring-up: USART1 (single-wire HDSEL), the circular
+/// RX ring on DMA1_CH5 (armed once), the break stamps on DMA1_CH2 (armed
+/// once, ahead of the detector that requests them), the TIM2 break wake on
+/// the bus pin, and the SPI-CRC engine. TX arms (DMA1_CH4) are configured
+/// per-arm by `TxWire`, so no channel init here.
+fn bring_up_bus(brr: u32, break_reload: u16) {
     let regs = chip::BUS_USART_MAPPING.regs();
 
     // Arm the RX ring before UE/DMAR come up so the channel is live the
@@ -252,9 +353,9 @@ fn bring_up_bus(brr: u32) {
         size: dma::Size::BITS8,
         htie: false,
         tcie: false,
-        // VERYHIGH, alone at the top of the ladder (see `hal::dma`): an inbound
-        // byte's drain preempts every other channel per-beat, so it always
-        // lands in the ring before the break IRQ reads the cursor.
+        // VERYHIGH, at the top of the ladder (see `hal::dma`): an inbound
+        // byte's drain waits at most one beat, so it lands in the ring
+        // before any transport ISR reads the cursor.
         pl: dma::Pl::VERYHIGH,
     };
     dma::configure(
@@ -266,8 +367,12 @@ fn bring_up_bus(brr: u32) {
     );
     dma::enable(dma::Channel::CH5);
 
-    // Wire mode, TE/RE, BRR, UE, then RX-DMA + error IRQ. No IDLE IRQ.
-    usart::init_bus(regs, brr, cfg!(feature = "half-duplex"));
+    // Wire mode, TE/RE, BRR, UE, then RX-DMA. No receive IRQ.
+    usart::init_bus(regs, brr);
+
+    BreakStamps::init();
+    // The only receive wake (protocol sec 3.4).
+    BreakWake::init(break_reload);
 
     // One-shot SPI-CRC engine setup (clock-gate + config; held live).
     Crc::init();
@@ -276,14 +381,56 @@ fn bring_up_bus(brr: u32) {
 fn start_center_aligned_pwm(psc: u16, arr: u16) {
     timer::init_center_aligned_pwm(psc, arr);
     // Start both channels active-high; the control loop owns CCP per-cycle
-    // from the first tick for direction / decay-mode control.
+    // from the first tick for direction control.
     timer::configure_pwm_channel(chip::MOTOR_IN1_CH, timer::Polarity::ActiveHigh);
     timer::configure_pwm_channel(chip::MOTOR_IN2_CH, timer::Polarity::ActiveHigh);
     timer::set_duty(chip::MOTOR_IN1_CH, 0);
     timer::set_duty(chip::MOTOR_IN2_CH, 0);
+    timer::configure_compare_trigger(
+        chip::LOW_TAP_TRIGGER_CH,
+        arr.saturating_sub(scan::INJECTED_LEAD_TICKS),
+    );
     timer::set_repetition(0);
     timer::set_trgo_update();
     timer::enable_main_output();
     timer::force_update_event();
     timer::start();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// VB still charging at boot (a 4.5 V supply ramp read 740 against a
+    /// parked 771): the first pair is not kept, the settled one is.
+    #[test]
+    fn a_charging_bias_is_read_once_it_settles() {
+        let mut seq = [740u16, 763, 769, 771, 771].into_iter();
+        let mut waits = 0;
+        let got = settled_bias(|| seq.next(), || waits += 1, 773);
+        assert_eq!(got, 771);
+        assert_eq!(waits, 4);
+    }
+
+    #[test]
+    fn a_settled_bias_costs_one_step() {
+        let mut waits = 0;
+        assert_eq!(settled_bias(|| Some(770), || waits += 1, 773), 770);
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    fn a_bias_that_never_settles_or_never_reads_falls_back_to_nominal() {
+        let mut v = 600u16;
+        let rising = settled_bias(
+            || {
+                v += 2;
+                Some(v)
+            },
+            || {},
+            773,
+        );
+        assert_eq!(rising, 773);
+        assert_eq!(settled_bias(|| None, || {}, 773), 773);
+    }
 }

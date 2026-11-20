@@ -1,52 +1,69 @@
 //! Host-visible register state as a flat 1024-byte map. Sections carve
 //! contiguous byte ranges; every address in `[0, 1024)` reads back (reserved
-//! and skip bytes read as zero). Writes to non-writable bytes fail with
-//! `AccessError`; addresses past the map end fail with `DataRange`.
+//! and skip bytes read as stored: an overlaid image may carry other bytes
+//! there; SAVE writes the CONFIG and CALIB ones as zero). Writes to
+//! non-writable bytes fail with `AccessError`; addresses past the map end
+//! fail with `DataRange`.
 //!
-//!   CONFIG    0x000..0x080  (128 B) -- persistent via MGMT SAVE
-//!   CALIB     0x080..0x180  (256 B) -- persistence deferred (unused today)
-//!   CONTROL   0x180..0x200  (128 B) -- RW volatile
-//!   TELEMETRY 0x200..0x280  (128 B) -- RO from host
-//!   PROFILE   0x280..0x2C0  ( 64 B) -- read-profile span words (sec 5.2)
-//!   (reserved 0x2C0..0x400  320 B)
+//!   CONFIG    0x000..0x080  (128 B) - persistent via MGMT SAVE
+//!   CALIB     0x080..0x180  (256 B) - persistent via MGMT SAVE, own image
+//!   CONTROL   0x180..0x200  (128 B) - RW volatile
+//!   TELEMETRY 0x200..0x280  (128 B) - RO from host
+//!   PROFILE   0x280..0x2C0  ( 64 B) - read-profile span words (sec 5.2)
+//!   BURST     0x2C0..0x3C0  (256 B) - RO paged shunt-capture readback
+//!   TELEMETRY-EXT 0x3C0..0x400 (64 B) - RO from host: health, the taps'
+//!                                       floor, the winding estimate, the
+//!                                       velocity reference
 //!
 //! Owners go through `RegionStorage::with`/`with_mut` on the storage cell.
 //! Cross-domain readers that must avoid forming `&T` (aliasing-sensitive
 //! paths) use raw-pointer reads via `RegionStorageRaw::region_ptr`.
 
+pub mod burst;
 pub mod calib;
 pub mod config;
 pub mod control;
 pub(crate) mod hooks;
 pub mod profile;
 pub mod telemetry;
+pub mod telemetry_ext;
 
-pub use calib::{BemfCalibBlock, CalibRegs, PotLutBlock};
-pub use config::{
-    BaudRate, ConfigCalibration, ConfigCommon, ConfigControlPosition, ConfigPosLimits, ConfigRegs,
-    ConfigStall, ConfigThermal, StallResponse,
+pub use burst::{BurstRegs, BurstWindow};
+pub use calib::{
+    CalibGear, CalibKinematics, CalibMotor, CalibMotorExt, CalibPot, CalibRegs, CalibSense,
+    CalibSenseExt, CalibStamp, CalibThermal,
 };
-pub use control::{BootMode, ControlLifecycle, ControlRegs, ControlStreaming, ControlSystem, Mode};
+pub use config::{
+    BaudRate, ConfigCommon, ConfigFaultCfg, ConfigFusion, ConfigLimits, ConfigLoopCurrent,
+    ConfigLoopPosition, ConfigLoopVelocity, ConfigPosPhys, ConfigPosSoft, ConfigRegs,
+    ConfigThermal, StallResponse,
+};
+pub use control::{ControlBurst, ControlLifecycle, ControlRegs, Mode};
 pub use profile::{PROFILE_SLOTS, ProfileRegs, ProfileSlots, SPANS_PER_SLOT};
 pub use telemetry::{
-    TelemetryCommon, TelemetryConverted, TelemetryIntermediaries, TelemetryMode, TelemetryRaw,
-    TelemetryRegs,
+    TelemetryCommon, TelemetryEstimates, TelemetryMode, TelemetryRefs, TelemetryRegs, TelemetryTick,
 };
+pub use telemetry_ext::TelemetryExtRegs;
 
-use crate::regions::config::ConfigDefaults;
+use crate::regions::config::{ConfigDefaults, CurrentDefaults};
 use control_table::{RegionStorage, Table};
+use osc_protocol::table;
 
 pub const CONFIG_REGION_SIZE: u16 = 128;
 pub const CALIB_REGION_SIZE: u16 = 256;
 pub const CONTROL_REGION_SIZE: u16 = 128;
 pub const TELEMETRY_REGION_SIZE: u16 = 128;
 pub const PROFILE_REGION_SIZE: u16 = 64;
+pub const BURST_REGION_SIZE: u16 = 256;
+pub const TELEMETRY_EXT_REGION_SIZE: u16 = 64;
 
 pub const CONFIG_BASE_ADDR: u16 = 0x000;
 pub const CALIB_BASE_ADDR: u16 = 0x080;
 pub const CONTROL_BASE_ADDR: u16 = 0x180;
 pub const TELEMETRY_BASE_ADDR: u16 = 0x200;
 pub const PROFILE_BASE_ADDR: u16 = 0x280;
+pub const BURST_BASE_ADDR: u16 = 0x2C0;
+pub const TELEMETRY_EXT_BASE_ADDR: u16 = 0x3C0;
 
 #[repr(C)]
 #[derive(Table)]
@@ -57,39 +74,74 @@ pub struct ControlTable {
     pub control: ControlRegs,
     pub telemetry: TelemetryRegs,
     pub profile: ProfileRegs,
-    #[ct_table(skip)]
-    _rsvd: [u8; 320],
+    pub burst: BurstRegs,
+    pub telemetry_ext: TelemetryExtRegs,
 }
 
 impl ControlTableCell {
     /// Soft limits init to physical limits per control-table doc.
     /// Caller must be sole writer (install-time, pre-IRQ).
-    pub fn seed_config_defaults(&self, defaults: &ConfigDefaults) {
+    /// `v_undervolt_counts` is `config::DEFAULT_V_UNDERVOLT_MV` through the
+    /// board's terminal divider (`config::vmotor_counts`), `rail_fold_q8`
+    /// `config::DEFAULT_RAIL_SOURCE_MOHM` through both chains
+    /// (`config::rail_fold_q8`).
+    pub fn seed_config_defaults(
+        &self,
+        defaults: &ConfigDefaults,
+        current: &CurrentDefaults,
+        v_undervolt_counts: u16,
+        rail_fold_q8: u16,
+    ) {
         crate::log::debug!(
-            "seed CONFIG: phys=[{}, {}] urad  vdd_mv={}  id={}  baud_idx={}",
-            defaults.pos_min_phys_urad,
-            defaults.pos_max_phys_urad,
-            defaults.vdd_mv,
+            "seed CONFIG: phys=[{}, {}] counts  id={}  baud_idx={}",
+            defaults.pos_min_phys_counts,
+            defaults.pos_max_phys_counts,
             defaults.id,
             defaults.baud.as_idx(),
         );
         // SAFETY: install-time, pre-IRQ, sole writer.
         self.with_mut(|t| {
             let cfg = &mut t.config;
-            cfg.pos_limits.pos_min_phys_urad = defaults.pos_min_phys_urad;
-            cfg.pos_limits.pos_max_phys_urad = defaults.pos_max_phys_urad;
-            cfg.pos_limits.pos_min_soft_urad = defaults.pos_min_phys_urad;
-            cfg.pos_limits.pos_max_soft_urad = defaults.pos_max_phys_urad;
-            cfg.calibration.vdd_mv = defaults.vdd_mv;
+            cfg.pos_phys.pos_min_phys_counts = defaults.pos_min_phys_counts;
+            cfg.pos_phys.pos_max_phys_counts = defaults.pos_max_phys_counts;
+            cfg.pos_soft.pos_min_soft_counts = defaults.pos_min_phys_counts;
+            cfg.pos_soft.pos_max_soft_counts = defaults.pos_max_phys_counts;
             cfg.common.id = defaults.id;
             cfg.common.baud_rate_idx = defaults.baud.as_idx();
             cfg.common.response_deadline_us = defaults.response_deadline_us;
+            // Core-owned safe defaults; gains stay at their zero seed so
+            // every loop boots inert. Enum defaults are discriminant 0. The
+            // current cap and the speed ceiling stay 0, unset: no compiled
+            // value is right for an unknown motor, so every closed mode is
+            // refused until calibration writes them.
+            cfg.loop_current.duty_max_q15 = config::DEFAULT_DUTY_MAX_Q15;
+            cfg.loop_position.accel_limit_q88 = config::DEFAULT_ACCEL_LIMIT_Q88;
+            cfg.loop_position.pos_deadband_counts = config::DEFAULT_POS_DEADBAND_COUNTS;
+            cfg.fusion.l1_q016 = config::DEFAULT_L1_Q016;
+            cfg.fusion.l2_q88 = config::DEFAULT_L2_Q88;
+            cfg.fusion.l3_q88 = config::DEFAULT_L3_Q88;
+            cfg.limits.drive_polarity = config::DEFAULT_DRIVE_POLARITY;
+            cfg.limits.stall_omega_max_cps = config::DEFAULT_STALL_OMEGA_MAX_CPS;
+            cfg.limits.stall_time_ticks = config::DEFAULT_STALL_TIME_TICKS;
+            cfg.limits.i_cont_counts = current.i_cont_counts;
+            cfg.limits.stall_release_counts = current.stall_release_counts;
+            cfg.limits.stall_tau_trip_counts = config::STALL_TAU_TRIP_OFF;
+            cfg.limits.oc_trip_counts = current.oc_trip_counts;
+            cfg.limits.oc_trip_ticks = config::DEFAULT_OC_TRIP_TICKS;
+            cfg.limits.thermal_tau_s = config::DEFAULT_THERMAL_TAU_S;
+            cfg.thermal.cutoff_cc = config::DEFAULT_CUTOFF_CC;
+            cfg.thermal.v_undervolt_counts = v_undervolt_counts;
+            cfg.fault_cfg.pos_error_counts = config::DEFAULT_POS_ERROR_COUNTS;
+            cfg.fault_cfg.pos_error_time_ticks = config::DEFAULT_POS_ERROR_TIME_TICKS;
+            cfg.fault_cfg.sensor_delta_max = config::DEFAULT_SENSOR_DELTA_MAX;
+            cfg.fault_cfg.sensor_bad_count = config::DEFAULT_SENSOR_BAD_COUNT;
+            cfg.fault_cfg.rail_fold_q8 = rail_fold_q8;
         });
     }
 
-    /// Stamp the RO identity block (protocol sec 5.4). `firmware_version` is
-    /// not a caller argument: it is the compiled-in `crate::FIRMWARE_VERSION`
-    /// fact of this build, so a board cannot claim a version it is not running.
+    /// Stamp the RO identity block (protocol sec 5.4). `firmware_version` and
+    /// the TEL row facts are not caller arguments: they are compiled-in facts
+    /// of this build, so a board cannot claim what it is not running.
     /// Caller must be sole writer (install-time, pre-IRQ).
     pub fn seed_identity(&self, model: u16, hw_rev: u8) {
         // SAFETY: install-time, pre-IRQ, sole writer.
@@ -98,16 +150,55 @@ impl ControlTableCell {
             common.model_number = model;
             common.hardware_revision = hw_rev;
             common.firmware_version = crate::FIRMWARE_VERSION;
+            common.capability_flags = table::CAP_TEL_ROWS;
+            #[cfg(feature = "experiment")]
+            {
+                common.capability_flags |= table::CAP_EXPERIMENT;
+            }
+            common.tel_row_bytes_max = crate::tel::ROW_BYTES_MAX as u8;
+            common.tel_chunks_max = crate::tel::CHUNKS_MAX as u8;
         });
+    }
+
+    /// Stamp the RO sense primitives the host converts raw counts with
+    /// (protocol sec 5.5) -- board facts, not host-writable state.
+    /// Caller must be sole writer (install-time, pre-IRQ).
+    pub fn seed_calib_sense(&self, sense: &CalibSense, ext: &CalibSenseExt, pwm_period_ticks: u16) {
+        // SAFETY: install-time, pre-IRQ, sole writer.
+        self.with_mut(|t| {
+            t.calib.sense = *sense;
+            t.calib.sense_ext = *ext;
+            t.calib.pwm.pwm_period_ticks = pwm_period_ticks;
+        });
+    }
+
+    /// Stamp the boot-measured zero-current output of the sense chain, in raw
+    /// ADC counts: the seed the kernel's bias tracker starts from.
+    /// Caller must be sole writer (install-time, pre-IRQ).
+    pub fn seed_current_bias(&self, counts: u16) {
+        crate::log::debug!("seed current bias: {} counts", counts);
+        // SAFETY: install-time, pre-IRQ, sole writer.
+        self.with_mut(|t| t.telemetry.refs.current_bias_counts = counts);
+    }
+
+    /// Stamp the boot-measured motor-terminal divider bias (both terminals
+    /// high-impedance, driver disabled), in raw ADC counts.
+    /// Caller must be sole writer (install-time, pre-IRQ).
+    pub fn seed_vmotor_bias(&self, counts: u16) {
+        crate::log::debug!("seed vmotor bias: {} counts", counts);
+        // SAFETY: install-time, pre-IRQ, sole writer.
+        self.with_mut(|t| t.telemetry.refs.vmotor_bias_counts = counts);
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use osc_protocol::table;
+mod within_tests;
 
+#[cfg(test)]
+mod tests {
     use super::ControlTable;
     use super::config::addr as config_addr;
+    use super::table;
     use super::telemetry::addr as telemetry_addr;
     use control_table::RegionStorage;
     use control_table::descriptor::{EnumVariant, FieldKind};
@@ -120,6 +211,13 @@ mod tests {
             assert_eq!(t.config.common.model_number, 0x0101);
             assert_eq!(t.config.common.hardware_revision, 3);
             assert_eq!(t.config.common.firmware_version, crate::FIRMWARE_VERSION);
+            assert_ne!(t.config.common.capability_flags & table::CAP_TEL_ROWS, 0);
+            assert_eq!(
+                t.config.common.capability_flags & table::CAP_EXPERIMENT != 0,
+                cfg!(feature = "experiment")
+            );
+            assert_eq!(t.config.common.tel_row_bytes_max, 12);
+            assert_eq!(t.config.common.tel_chunks_max, 2);
         });
     }
 
@@ -141,6 +239,11 @@ mod tests {
             config_addr::common::CAPABILITY_FLAGS,
             table::CAPABILITY_FLAGS
         );
+        assert_eq!(
+            config_addr::common::TEL_ROW_BYTES_MAX,
+            table::TEL_ROW_BYTES_MAX
+        );
+        assert_eq!(config_addr::common::TEL_CHUNKS_MAX, table::TEL_CHUNKS_MAX);
         assert_eq!(config_addr::common::ID, table::ID);
         assert_eq!(config_addr::common::BAUD_RATE_IDX, table::BAUD_RATE_IDX);
         assert_eq!(
@@ -148,7 +251,7 @@ mod tests {
             table::RESPONSE_DEADLINE_US
         );
         assert_eq!(
-            config_addr::pos_limits::POS_MIN_PHYS_URAD,
+            config_addr::pos_phys::POS_MIN_PHYS_COUNTS,
             table::CONFIG_COMMON_END
         );
 
@@ -167,6 +270,19 @@ mod tests {
             telemetry_addr::mode::MODE_ACTIVE,
             table::TELEMETRY_COMMON_END
         );
+    }
+
+    /// The commit stores each naturally aligned unit whole
+    /// (`control_table` `copy_units`), so a field the kernel reads during a
+    /// commit is whole only if it is naturally aligned in memory.
+    #[test]
+    fn every_multibyte_field_is_naturally_aligned() {
+        assert_eq!(core::mem::align_of::<ControlTable>(), 4);
+        for d in ControlTable::FIELDS {
+            if matches!(d.width, 2 | 4) {
+                assert_eq!(d.addr % d.width, 0, "{} at {:#x}", d.name, d.addr);
+            }
+        }
     }
 
     /// Pins the exported field descriptors against the protocol consts: names
@@ -210,25 +326,296 @@ mod tests {
             by("stall_response").kind,
             FieldKind::Enum(&[
                 EnumVariant {
-                    name: "Disable",
+                    name: "Fault",
                     value: 0
                 },
                 EnumVariant {
-                    name: "Comply",
+                    name: "Yield",
                     value: 1
                 },
             ])
         );
 
-        // goal_position's bounds are register-RHS (soft limits); they must not
+        // goal_position's bounds are register-RHS (phys limits); they must not
         // export as scalar bounds.
         let goal = by("goal_position");
         assert!(goal.writable);
         assert_eq!((goal.min, goal.max), (None, None));
 
-        let lut = by("lut");
-        assert_eq!(lut.kind, FieldKind::Bytes);
-        assert_eq!(lut.width, 220);
+        // The burst page is a byte blob, not a scalar: a host reads it as
+        // 120 LE u16 codes, and no field rule may be inferred from it.
+        let samples = by("samples");
+        assert_eq!(samples.addr, super::BURST_BASE_ADDR + 2);
+        assert_eq!(samples.kind, FieldKind::Bytes);
+        assert_eq!(samples.width, 2 * super::burst::PAGE_SAMPLES as u16);
+        assert!(!samples.writable);
+        for name in [
+            "page_echo",
+            "state",
+            "samples_len",
+            "step_index",
+            "restore_dir",
+            "chans_echo",
+            "frame_len",
+        ] {
+            assert!(!by(name).writable, "{name} must stay RO");
+        }
+
+        // The arm surface is the writable half of the pair.
+        let duty = by("duty_q15");
+        assert!(duty.writable);
+        assert_eq!(duty.kind, FieldKind::Int);
+        // Register-RHS abs bound (duty_max_q15): no scalar bounds export.
+        assert_eq!((duty.min, duty.max), (None, None));
+        assert!(by("arm").writable);
+        assert!(by("page").writable);
+
+        // The extras mask: a scalar with an immediate ceiling, so the bound
+        // exports and a host can read it off the descriptor.
+        let chans = by("chans");
+        assert!(chans.writable);
+        assert_eq!(chans.kind, FieldKind::UInt);
+        assert_eq!(chans.width, 1);
+        assert_eq!(
+            (chans.min, chans.max),
+            (None, Some(super::burst::chans::ALL as i32))
+        );
+    }
+
+    /// Pins the CALIB layout: the kernel's blocks at the region front, then
+    /// the rest of the host-written blocks contiguous through the stamp, the
+    /// RO board facts behind them; the gear class took the first reserved
+    /// byte after those, so nothing before it moved.
+    #[test]
+    fn calib_layout_keeps_the_host_written_blocks_contiguous() {
+        use super::calib::addr::{
+            gear, kinematics, motor, motor_ext, pot, pwm, sense, sense_ext, stamp, thermal,
+        };
+        assert_eq!(motor::R_Q12, super::CALIB_BASE_ADDR);
+        assert_eq!(motor::KE_VPC_Q, 0x08A);
+        assert_eq!(motor::R_BRUSH_Q12, 0x08C);
+        assert_eq!(motor::BRUSH_CPS, 0x08E);
+        assert_eq!(motor::G_WINDOW_Q016, 0x090);
+        assert_eq!(thermal::TH_RISE_Q016, 0x094);
+        assert_eq!(thermal::NTC_K2_Q24, 0x09E);
+        assert_eq!(motor_ext::KE_UVS_PER_RAD, 0x0A0);
+        assert_eq!(pot::RAW_MIN, 0x0A4);
+        assert_eq!(kinematics::GEAR_RATIO_CENTI, 0x0AC);
+        assert_eq!(stamp::PLANT_STAMP, 0x0AE);
+        assert_eq!(sense::SHUNT_R_MOHM, 0x0B0);
+        assert_eq!(sense_ext::RAIL_DROP_MV, 0x0CC);
+        assert_eq!(sense_ext::VMOTOR_BIAS_TOP_OHM, 0x0CE);
+        assert_eq!(sense_ext::VMOTOR_BIAS_BOT_OHM, 0x0D0);
+        assert_eq!(pwm::PWM_PERIOD_TICKS, 0x0D2);
+        assert_eq!(gear::GEAR_CLASS, 0x0D4);
+        let f = ControlTable::FIELDS;
+        let rw = |lo: u16, hi: u16| {
+            f.iter()
+                .filter(|d| d.addr >= lo && d.addr < hi)
+                .all(|d| d.writable)
+        };
+        assert!(rw(motor::R_Q12, stamp::PLANT_STAMP + 2));
+        assert!(!rw(sense::SHUNT_R_MOHM, pwm::PWM_PERIOD_TICKS + 2));
+        assert!(rw(gear::GEAR_CLASS, gear::GEAR_CLASS + 1));
+    }
+
+    /// The ADC wide-code map takes the reserved bytes right behind the gear
+    /// class, one byte per slot, host-written, outside the plant stamp; the
+    /// rest of the tail stays reserved, so the region keeps its size.
+    #[test]
+    fn calib_adc_appends_after_gear() {
+        use super::calib::addr::{adc, gear};
+        use crate::adc::ADC_WIDE_SLOTS;
+        assert_eq!(gear::GEAR_CLASS, 0x0D4);
+        assert_eq!(adc::ADC_WIDE_MID_Q4, 0x0D5);
+        let f = ControlTable::FIELDS;
+        let w = f.iter().find(|d| d.name == "adc_wide_mid_q4").unwrap();
+        assert_eq!(w.addr, 0x0D5);
+        assert_eq!(w.width, ADC_WIDE_SLOTS as u16);
+        assert_eq!(w.kind, FieldKind::Bytes);
+        assert!(w.writable);
+        assert!(!crate::stamp::COVERED_NAMES.contains(&"adc_wide_mid_q4"));
+        let calib_end = super::CALIB_BASE_ADDR + super::CALIB_REGION_SIZE;
+        assert!(
+            f.iter()
+                .filter(|d| d.name != w.name)
+                .all(|d| d.addr + d.width <= w.addr || d.addr >= calib_end),
+            "the rest of the tail stays reserved"
+        );
+    }
+
+    /// The burst block is an ABI pin: it stays put behind the two reserved
+    /// bytes `boot_mode` left, two-byte aligned without repr(C) inserting
+    /// invisible padding.
+    #[test]
+    fn control_burst_stays_behind_the_reserved_system_bytes() {
+        use super::control::addr::burst;
+        assert_eq!(burst::DUTY_Q15, 0x196);
+        assert_eq!(burst::ARM, 0x198);
+        assert_eq!(burst::PAGE, 0x199);
+        assert_eq!(burst::CHANS, 0x19A);
+    }
+
+    /// The position table window appends after the burst block: page, command
+    /// and points contiguous so one WRITE carries a page, the state RO behind
+    /// them, the points a writable byte blob with no scalar rule.
+    #[test]
+    fn control_pos_lut_window_appends_after_burst() {
+        use super::control::addr::pos_lut;
+        use crate::pos_lut::{PAGE_POINTS, PAGES, cmd};
+        assert_eq!(pos_lut::POS_LUT_PAGE, 0x19C);
+        assert_eq!(pos_lut::POS_LUT_CMD, 0x19D);
+        assert_eq!(pos_lut::POS_LUT_POINTS, 0x19E);
+        assert_eq!(pos_lut::POS_LUT_STATE, 0x1DE);
+        let f = ControlTable::FIELDS;
+        let by = |n: &str| f.iter().find(|d| d.name == n).unwrap();
+        let page = by("pos_lut_page");
+        assert!(page.writable);
+        assert_eq!(page.max, Some(PAGES as i32 - 1));
+        let cmd = by("pos_lut_cmd");
+        assert!(cmd.writable);
+        assert_eq!(cmd.max, Some(cmd::MAX as i32));
+        let points = by("pos_lut_points");
+        assert!(points.writable);
+        assert_eq!(points.kind, FieldKind::Bytes);
+        assert_eq!(points.width, 2 * PAGE_POINTS as u16);
+        assert!(!by("pos_lut_state").writable);
+    }
+
+    /// The TEL arm appends after the position table window out of the
+    /// reserved tail, past the deleted ident switch's byte: chunks then
+    /// count, so one WRITE sets the row and arms; every earlier address and
+    /// the region size stay put, and a write to the old switch is refused.
+    /// The loop-margin stimulus's two fields follow the count, the last
+    /// CONTROL fields.
+    #[test]
+    fn control_tel_arm_appends_after_pos_lut() {
+        use super::control::addr::{inject, pos_lut, tel};
+        assert_eq!(pos_lut::POS_LUT_STATE, 0x1DE);
+        assert_eq!(
+            [
+                tel::CHUNK0_ADDR,
+                tel::CHUNK0_LEN,
+                tel::CHUNK1_ADDR,
+                tel::CHUNK1_LEN,
+                tel::TEL_COUNT
+            ],
+            [0x1E2, 0x1E4, 0x1E6, 0x1E8, 0x1EA]
+        );
+        assert_eq!(
+            core::mem::size_of::<super::ControlRegs>(),
+            super::CONTROL_REGION_SIZE as usize
+        );
+        let f = ControlTable::FIELDS;
+        let by = |n: &str| f.iter().find(|d| d.name == n).unwrap();
+        assert!(f.iter().all(|d| d.addr != 0x1E0 && d.name != "ident_agg"));
+        for name in [
+            "chunk0_addr",
+            "chunk0_len",
+            "chunk1_addr",
+            "chunk1_len",
+            "tel_count",
+            "inject_accel_q88",
+            "inject_half_periods",
+        ] {
+            assert!(by(name).writable, "{name}");
+        }
+        assert_eq!(
+            [inject::INJECT_ACCEL_Q88, inject::INJECT_HALF_PERIODS],
+            [0x1EC, 0x1EE]
+        );
+        assert!(
+            f.iter()
+                .all(|d| d.addr <= inject::INJECT_HALF_PERIODS || d.addr >= 0x200)
+        );
+    }
+
+    /// TELEMETRY behind the sec 5.4 common block and the mode bytes: the
+    /// tick block first, 4-aligned, the ADC's two scans at its front in
+    /// slot order, the published shunt and taps behind them, then the
+    /// medium-rate blocks; health, the taps' floor and the estimate in
+    /// TELEMETRY-EXT. The common row sets are each at most two chunks of
+    /// 12 B: the ident four (pos, then duty to vdiff), the default six (pos,
+    /// then current_raw to current_trough), the R/L set (vbus_raw to duty).
+    #[test]
+    fn telemetry_lands_the_scans_at_the_tick_block_front() {
+        use super::telemetry::addr::{estimates, limits, refs, tick};
+        use super::telemetry_ext::addr::{health, inject, limits_ext, therm};
+        assert_eq!(
+            [tick::POS, tick::VREF_RAW, tick::VBUS_RAW, tick::NTC_RAW],
+            [0x224 + 20, 0x23A, 0x23C, 0x23E]
+        );
+        assert_eq!(
+            [tick::CURRENT_RAW, tick::VMOTOR_A, tick::VMOTOR_B],
+            [0x240, 0x242, 0x244]
+        );
+        assert_eq!(
+            [
+                tick::DUTY_TICKS,
+                tick::CURRENT_TROUGH,
+                tick::I_TICK_COUNTS,
+                tick::VDIFF_COUNTS
+            ],
+            [0x246, 0x248, 0x24A, 0x24C]
+        );
+        assert_eq!(
+            [
+                tick::VMOTOR_A_TROUGH,
+                tick::VMOTOR_B_TROUGH,
+                tick::TICK_FLAGS
+            ],
+            [0x24E, 0x250, 0x252]
+        );
+        assert_eq!(tick::SAMPLE_TICK, 0x254);
+        assert_eq!(estimates::THETA_HAT_Q16, 0x258);
+        assert_eq!(estimates::R_HAT_Q12, 0x26A);
+        assert_eq!(refs::CURRENT_BIAS_COUNTS, 0x26C);
+        assert_eq!(refs::ENC_B, 0x272);
+        assert_eq!(limits::LIMIT_FLAGS, 0x27C);
+        assert_eq!(limits::WINDOW_FLOOR_Q15, 0x27E);
+        assert_eq!(super::TELEMETRY_EXT_BASE_ADDR, 0x3C0);
+        assert_eq!(health::TICK_LOAD_MEAN_Q15, 0x3C0);
+        assert_eq!(health::WRITE_LATE_COUNT, 0x3C8);
+        assert_eq!(health::STACK_FREE_MIN, 0x3CA);
+        assert_eq!(limits_ext::WINDOW_V_FLOOR_Q15, 0x3CC);
+        assert_eq!([therm::T_NTC_CC, therm::THERM_FLAGS], [0x3D0, 0x3D2]);
+        assert_eq!(inject::OMEGA_REF_CPS, 0x3D4);
+        assert_eq!(
+            core::mem::size_of::<super::TelemetryRegs>(),
+            super::TELEMETRY_REGION_SIZE as usize
+        );
+        let f = ControlTable::FIELDS;
+        let by = |n: &str| f.iter().find(|d| d.name == n).unwrap();
+        for name in [
+            "tick_over_count",
+            "tick_lost_count",
+            "tel_drop_count",
+            "write_late_count",
+        ] {
+            assert!(by(name).writable, "{name} is host-clearable");
+        }
+        for name in [
+            "tick_load_mean_q15",
+            "stack_free_min",
+            "pos",
+            "tick_flags",
+            "omega_ref_cps",
+        ] {
+            assert!(!by(name).writable, "{name} must stay RO");
+        }
+    }
+
+    /// Pins the BURST section to its base and its one-READ geometry.
+    #[test]
+    fn burst_region_is_one_read_wide() {
+        use super::burst::{self, addr::window};
+        assert_eq!(super::BURST_BASE_ADDR, 0x2C0);
+        assert_eq!(window::PAGE_ECHO, super::BURST_BASE_ADDR);
+        assert_eq!(window::SAMPLES_LEN, 0x3B2);
+        assert_eq!(window::RESTORE_DIR, 0x3BB);
+        assert_eq!(window::CHANS_ECHO, 0x3BC);
+        assert_eq!(window::FRAME_LEN, 0x3BD);
+        assert_eq!(burst::BURST_LEN, burst::PAGES * burst::PAGE_SAMPLES);
     }
 
     /// Pins the profile region to its protocol sec 5.4 address pin and its
@@ -247,5 +634,52 @@ mod tests {
             profile::span_word(0x208, 63),
             table::profile_span_word(0x208, 63)
         );
+    }
+
+    /// The validate walk starts each rule array at its chunk's `*_FROM` entry
+    /// and stops at the first rule past the write: over every write the table
+    /// can hold, it must visit exactly the rules a full scan finds overlapping,
+    /// in the same order.
+    #[test]
+    fn rule_walk_visits_exactly_the_overlapping_rules() {
+        use control_table::RegisterMap;
+        use control_table::map::for_each_rule;
+        use heapless::Vec;
+        type C = crate::ControlTableCell;
+        let allowed = <C as RegisterMap>::ALLOWED_RULES;
+        let cmp = <C as RegisterMap>::CMP_RULES;
+        assert!(!allowed.is_empty() && !cmp.is_empty());
+        for lo in 0..C::SIZE {
+            for hi in lo + 1..=C::SIZE {
+                let mut got_a: Vec<(u16, *const u8), 32> = Vec::new();
+                let mut got_c: Vec<(u16, u16, u32), 32> = Vec::new();
+                let walked = for_each_rule::<C>(
+                    lo,
+                    hi,
+                    |r| {
+                        got_a.push((r.addr, r.allowed.as_ptr())).unwrap();
+                        Ok(())
+                    },
+                    |r| {
+                        got_c.push((r.addr, r.spec, r.val)).unwrap();
+                        Ok(())
+                    },
+                );
+                assert!(walked.is_ok());
+                let want_a = allowed
+                    .iter()
+                    .filter(|r| (lo..hi).contains(&(r.addr as usize)))
+                    .map(|r| (r.addr, r.allowed.as_ptr()));
+                let want_c = cmp
+                    .iter()
+                    .filter(|r| (r.addr as usize) < hi && r.end() > lo)
+                    .map(|r| (r.addr, r.spec, r.val));
+                assert!(
+                    got_a.iter().copied().eq(want_a),
+                    "allowed [{lo:#x}, {hi:#x})"
+                );
+                assert!(got_c.iter().copied().eq(want_c), "cmp [{lo:#x}, {hi:#x})");
+            }
+        }
     }
 }

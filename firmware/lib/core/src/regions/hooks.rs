@@ -10,21 +10,40 @@
 //! stays an internal concern of the table layer.
 
 use crate::regions::config::BaudRate;
+use crate::tel::Chunks;
 use crate::traits::Reply;
 
 pub(crate) trait ControlTableHookEvents {
     fn on_id_write(&mut self, value: u8);
     fn on_baud_rate_idx_write(&mut self, value: u8);
     fn on_response_deadline_us_write(&mut self, value: u16);
+    fn on_tel_count_write(&mut self, value: u16);
 }
 
 pub(crate) struct ControlTableHooks<'a, R: Reply + ?Sized> {
     reply: &'a mut R,
+    /// The commit's last `tel_count`, armed at [`Self::finish`].
+    tel_count: Option<u16>,
 }
 
 impl<'a, R: Reply + ?Sized> ControlTableHooks<'a, R> {
     pub(crate) fn new(reply: &'a mut R) -> Self {
-        Self { reply }
+        Self {
+            reply,
+            tel_count: None,
+        }
+    }
+
+    /// After the commit's events, outside any table borrow: a `tel_count`
+    /// write arms with the post-commit `chunks`, read only then; a refused
+    /// arm zeroes `tel_count` in the bus (`Reply::tel_arm`).
+    pub(crate) fn finish(self, chunks: impl FnOnce() -> Chunks) {
+        if let Some(value) = self.tel_count {
+            let chunks = chunks();
+            // No row cannot arm; count 0 carries the disarm.
+            let count = if chunks.valid() { value } else { 0 };
+            self.reply.tel_arm(chunks, count);
+        }
     }
 }
 
@@ -41,5 +60,8 @@ impl<R: Reply + ?Sized> ControlTableHookEvents for ControlTableHooks<'_, R> {
     }
     fn on_response_deadline_us_write(&mut self, value: u16) {
         self.reply.set_response_deadline(value);
+    }
+    fn on_tel_count_write(&mut self, value: u16) {
+        self.tel_count = Some(value);
     }
 }

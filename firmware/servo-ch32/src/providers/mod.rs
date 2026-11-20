@@ -3,11 +3,15 @@
 //! primitives. Consumers depend on providers only via their trait surface;
 //! this folder is the only place that talks to both layers.
 
+pub mod break_stamps;
+pub mod break_wake;
 pub mod config_store;
 pub mod crc;
 pub mod deadline;
 pub mod digital_out;
 pub mod monotonic;
+pub mod motor;
 pub mod ring;
+pub mod sensors;
 pub mod tx_wire;
 pub mod usart_baud;
