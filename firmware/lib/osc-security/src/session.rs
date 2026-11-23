@@ -399,21 +399,30 @@ mod tests {
     fn an_untagged_effect_frame_is_missing_not_passing() {
         let mut c = secured();
         let inst = Inst::instruction(Opcode::Commit, 0);
-        assert_eq!(c.verify(inst, true, &[0xFE, 0x03, inst.0]), AuthVerdict::Missing);
+        assert_eq!(
+            c.verify(inst, true, &[0xFE, 0x03, inst.0]),
+            AuthVerdict::Missing
+        );
     }
 
     #[test]
     fn an_untagged_read_passes_under_the_default_policy() {
         let mut c = secured();
         let inst = Inst::instruction(Opcode::Read, 0);
-        assert_eq!(c.verify(inst, false, &[0x05, 0x07, inst.0]), AuthVerdict::Pass);
+        assert_eq!(
+            c.verify(inst, false, &[0x05, 0x07, inst.0]),
+            AuthVerdict::Pass
+        );
     }
 
     #[test]
     fn held_writes_need_no_trailer() {
         let mut c = secured();
         let inst = Inst::instruction(Opcode::Gwrite, Inst::FLAG_HOLD);
-        assert_eq!(c.verify(inst, true, &[0xFE, 0x07, inst.0]), AuthVerdict::Pass);
+        assert_eq!(
+            c.verify(inst, true, &[0xFE, 0x07, inst.0]),
+            AuthVerdict::Pass
+        );
     }
 
     #[test]
@@ -485,7 +494,10 @@ mod tests {
         // Effects refused, reads still answered so the host sees the alert.
         assert_eq!(c.verify(inst, false, &bad[..n]), AuthVerdict::LockedOut);
         let read = Inst::instruction(Opcode::Read, 0);
-        assert_eq!(c.verify(read, false, &[0x05, 0x07, read.0]), AuthVerdict::Pass);
+        assert_eq!(
+            c.verify(read, false, &[0x05, 0x07, read.0]),
+            AuthVerdict::Pass
+        );
     }
 
     #[test]
@@ -495,7 +507,10 @@ mod tests {
         let mut c = secured();
         let inst = Inst::instruction(Opcode::Commit, 0);
         for _ in 0..10 {
-            assert_eq!(c.verify(inst, true, &[0xFE, 0x03, inst.0]), AuthVerdict::Missing);
+            assert_eq!(
+                c.verify(inst, true, &[0xFE, 0x03, inst.0]),
+                AuthVerdict::Missing
+            );
         }
         assert_eq!(c.state(), SecurityState::Secured);
     }
@@ -542,7 +557,11 @@ mod tests {
     #[test]
     fn status_frames_never_fold() {
         let mut c = secured();
-        c.fold(Inst::status(ResultCode::Ok, false), &[0x05, 0x03, 0x80], &[]);
+        c.fold(
+            Inst::status(ResultCode::Ok, false),
+            &[0x05, 0x03, 0x80],
+            &[],
+        );
         assert_eq!(c.stream_frames(), 0);
     }
 

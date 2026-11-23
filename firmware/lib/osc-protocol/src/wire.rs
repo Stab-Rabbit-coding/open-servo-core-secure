@@ -519,10 +519,22 @@ mod tests {
 
     #[test]
     fn only_the_sec_ops_need_a_quiet_window() {
-        for op in [MgmtOp::Enum, MgmtOp::Assign, MgmtOp::Save, MgmtOp::Reboot, MgmtOp::Factory, MgmtOp::Cal] {
+        for op in [
+            MgmtOp::Enum,
+            MgmtOp::Assign,
+            MgmtOp::Save,
+            MgmtOp::Reboot,
+            MgmtOp::Factory,
+            MgmtOp::Cal,
+        ] {
             assert!(!op.needs_quiet_window(), "{op:?}");
         }
-        for op in [MgmtOp::SecInit, MgmtOp::SecKey, MgmtOp::SecAttest, MgmtOp::SecRekey] {
+        for op in [
+            MgmtOp::SecInit,
+            MgmtOp::SecKey,
+            MgmtOp::SecAttest,
+            MgmtOp::SecRekey,
+        ] {
             assert!(op.needs_quiet_window(), "{op:?}");
         }
     }

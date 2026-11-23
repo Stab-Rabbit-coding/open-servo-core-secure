@@ -91,8 +91,7 @@ impl<P: Providers> ServoBus<P> {
             // outside the hot-loop envelope; refuse it if policy wanted a tag
             // or it claimed to carry one, rather than silently skipping the
             // gate -- a size limit must never become an authentication bypass.
-            let unguarded =
-                !self.security.policy().requires_tag(inst) && !inst.authenticated();
+            let unguarded = !self.security.policy().requires_tag(inst) && !inst.authenticated();
             if !unguarded {
                 sec_probe(|p| p.oversize = p.oversize.wrapping_add(1));
             }
@@ -156,6 +155,11 @@ mod tests {
         // Documented as an invariant here because the code path is only
         // reachable with a full-size frame: a frame that claims AUTH must
         // never pass merely because it was too big to check.
-        assert!(AUTH_SPAN_MAX >= 46 + 5, "hot-loop GWRITE + trailer must fit");
+        const {
+            assert!(
+                AUTH_SPAN_MAX >= 46 + 5,
+                "hot-loop GWRITE + trailer must fit"
+            );
+        }
     }
 }

@@ -182,7 +182,10 @@ mod tests {
             assert!(Policy::FLIGHT.requires_tag(i), "{op:?}");
         }
         // HOLD must not exempt COMMIT/MGMT the way it exempts writes.
-        assert!(Policy::effect_bearing(inst(Opcode::Commit, Inst::FLAG_HOLD)));
+        assert!(Policy::effect_bearing(inst(
+            Opcode::Commit,
+            Inst::FLAG_HOLD
+        )));
         assert!(Policy::effect_bearing(inst(Opcode::Mgmt, Inst::FLAG_HOLD)));
     }
 
@@ -192,7 +195,10 @@ mod tests {
         // digest, so folding the COMMIT frame in first would make the host's
         // tag uncomputable. Regression-pins the ordering bug.
         assert!(!Policy::folds_into_stream(inst(Opcode::Commit, 0)));
-        assert!(!Policy::folds_into_stream(inst(Opcode::Commit, Inst::FLAG_AUTH)));
+        assert!(!Policy::folds_into_stream(inst(
+            Opcode::Commit,
+            Inst::FLAG_AUTH
+        )));
     }
 
     #[test]
@@ -203,7 +209,10 @@ mod tests {
     #[test]
     fn both_held_and_unheld_writes_fold() {
         for op in [Opcode::Write, Opcode::Gwrite] {
-            assert!(Policy::folds_into_stream(inst(op, Inst::FLAG_HOLD)), "{op:?} held");
+            assert!(
+                Policy::folds_into_stream(inst(op, Inst::FLAG_HOLD)),
+                "{op:?} held"
+            );
             assert!(Policy::folds_into_stream(inst(op, 0)), "{op:?} unheld");
         }
     }
@@ -232,7 +241,10 @@ mod tests {
     #[test]
     fn status_frames_never_fold() {
         use osc_protocol::wire::ResultCode;
-        assert!(!Policy::folds_into_stream(Inst::status(ResultCode::Ok, false)));
+        assert!(!Policy::folds_into_stream(Inst::status(
+            ResultCode::Ok,
+            false
+        )));
     }
 
     #[test]
