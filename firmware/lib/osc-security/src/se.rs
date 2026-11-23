@@ -107,7 +107,10 @@ mod tests {
         let mut se = AbsentSe;
         assert_eq!(se.hmac(b"x", &mut [0; 32]), Err(SeError::NotPresent));
         assert_eq!(se.random(&mut [0; 4]), Err(SeError::NotPresent));
-        assert_eq!(se.sign(&[0; 32], &mut [0; SIGNATURE_LEN]), Err(SeError::NotPresent));
+        assert_eq!(
+            se.sign(&[0; 32], &mut [0; SIGNATURE_LEN]),
+            Err(SeError::NotPresent)
+        );
         assert_eq!(se.serial(&mut [0; SERIAL_LEN]), Err(SeError::NotPresent));
         assert_eq!(se.counter_increment(), Err(SeError::NotPresent));
     }

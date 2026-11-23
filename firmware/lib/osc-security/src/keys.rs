@@ -109,10 +109,7 @@ pub fn unicast_kdf_message(
 
 /// Build the message for the group-key wrapping pad:
 /// `label ‖ epoch ‖ host_nonce`.
-pub fn wrap_kdf_message(
-    epoch: Epoch,
-    host_nonce: &[u8; NONCE_LEN],
-) -> [u8; 5 + 2 + NONCE_LEN] {
+pub fn wrap_kdf_message(epoch: Epoch, host_nonce: &[u8; NONCE_LEN]) -> [u8; 5 + 2 + NONCE_LEN] {
     let mut m = [0u8; 5 + 2 + NONCE_LEN];
     m[..5].copy_from_slice(label::WRAP);
     m[5..7].copy_from_slice(&epoch.to_le_bytes());
@@ -122,10 +119,7 @@ pub fn wrap_kdf_message(
 
 /// Build the message for the group-key delivery tag:
 /// `label ‖ epoch ‖ wrapped`.
-pub fn wrap_tag_message(
-    epoch: Epoch,
-    wrapped: &[u8; WRAP_LEN],
-) -> [u8; 5 + 2 + WRAP_LEN] {
+pub fn wrap_tag_message(epoch: Epoch, wrapped: &[u8; WRAP_LEN]) -> [u8; 5 + 2 + WRAP_LEN] {
     let mut m = [0u8; 5 + 2 + WRAP_LEN];
     m[..5].copy_from_slice(label::WRAP_TAG);
     m[5..7].copy_from_slice(&epoch.to_le_bytes());
@@ -188,7 +182,10 @@ mod tests {
     #[test]
     fn label_prefixes_separate_the_domains() {
         let n = [0x5Au8; NONCE_LEN];
-        assert_ne!(&unicast_kdf_message(Epoch(7), &n, &n)[..5], &wrap_kdf_message(Epoch(7), &n)[..5]);
+        assert_ne!(
+            &unicast_kdf_message(Epoch(7), &n, &n)[..5],
+            &wrap_kdf_message(Epoch(7), &n)[..5]
+        );
     }
 
     #[test]
@@ -199,7 +196,10 @@ mod tests {
             group: MacKey::ZERO,
             epoch: Epoch(1),
         };
-        assert!(!half.is_ready(), "a half-derived session must not be usable");
+        assert!(
+            !half.is_ready(),
+            "a half-derived session must not be usable"
+        );
     }
 
     // `MacKey` has no `Debug` on purpose (key material must not be

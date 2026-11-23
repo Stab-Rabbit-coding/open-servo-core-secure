@@ -154,6 +154,94 @@ verification*, and a `TODO.md` item is opened against it.
   the SG90 board (§0.3.1).
 - **Status:** *requires verification* — section numbers not yet extracted.
 
+### REF-SE-008 — Analog Devices DS2478 data sheet
+
+- **Designation:** 19-101425, Rev 0, 1/22
+- **Title:** *DeepCover Automotive Secure Coprocessor*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment. The owner supplied the product-page link `https://www.analog.com/en/products/DS2478.html`; it is unvalidated.
+- **Local copy:** `hardware/datasheets/analog-devices/DS2478.pdf`
+- **Applied:** *Features*, *Electrical Characteristics* (supply, current, crypto timing), *Package Information*, *Detailed Description*, *Ordering Information*. Companion to REF-SE-009 and REF-SE-010; redundant on a servo board.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
+### REF-SE-009 — Analog Devices DS28C40 data sheet
+
+- **Designation:** 19-100551, Rev 1, 1/21
+- **Title:** *DeepCover Automotive I²C Authenticator*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment.
+- **Local copy:** `hardware/datasheets/analog-devices/DS28C40.pdf`
+- **Applied:** *Benefits and Features*, *Electrical Characteristics*, *Package Information*, *Detailed Description*, *Ordering Information*. Leading I²C candidate; the datasheet prints a "Request Security User Guide" link.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
+### REF-SE-010 — Analog Devices DS28E40 data sheet
+
+- **Designation:** 19-100901, Rev 1, 1/21
+- **Title:** *Deep Cover Automotive 1-Wire Authenticator*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment.
+- **Local copy:** `hardware/datasheets/analog-devices/DS28E40.pdf`
+- **Applied:** *Benefits and Features*, *Electrical Characteristics*, *Package Information*, *Detailed Description*, *Ordering Information*. Leading single-wire candidate; prints a "Request Security User Guide" link.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
+### REF-SE-011 — Analog Devices DS28E35 data sheet
+
+- **Designation:** 219-0028, Rev 6, 11/21
+- **Title:** *DeepCover Secure Authenticator with 1-Wire ECDSA and 1Kb User EEPROM*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment.
+- **Local copy:** `hardware/datasheets/analog-devices/DS28E35.pdf`
+- **Applied:** *Features*, *Ordering Information*. Abridged datasheet; the full datasheet is by request. Identity plane and a 17-bit decrement counter only.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
+### REF-SE-012 — Analog Devices DS28E16 data sheet
+
+- **Designation:** 19-100438, Rev 2, 1/20
+- **Title:** *1-Wire Secure SHA-3 Authenticator*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment.
+- **Local copy:** `hardware/datasheets/analog-devices/DS28E16.pdf`
+- **Applied:** *Benefits and Features*, *Package Information*, *Electrical Characteristics*, *Ordering Information*. SHA-3 only; prints a "Request Security User Guide" link.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
+### REF-SE-013 — Analog Devices DS28C22 data sheet
+
+- **Designation:** 219-0029, Rev 2, 7/13
+- **Title:** *DeepCover Secure Memory with I²C SHA-256 and 3Kb User EEPROM*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment.
+- **Local copy:** `hardware/datasheets/analog-devices/DS28C22.pdf`
+- **Applied:** *General Description*, *Benefits and Features*. Abridged datasheet; symmetric only.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
+### REF-SE-014 — Analog Devices DS28E10 data sheet
+
+- **Designation:** 219-0009, Rev 2, 4/11
+- **Title:** *1-Wire SHA-1 Authenticator*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment.
+- **Local copy:** `hardware/datasheets/analog-devices/DS28E10.pdf`
+- **Applied:** *General Description*, *Features*. Rejected: SHA-1, 28 bytes of OTP.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
+### REF-SE-015 — Analog Devices DS2475 data sheet
+
+- **Designation:** 219-0043, Rev 0, 6/14
+- **Title:** *DeepCover ECDSA Host Processor with 1-Wire Master*
+- **URL:** *requires verification* — the manufacturer site refuses automated
+  clients, so no link has been validated from the build environment.
+- **Local copy:** `hardware/datasheets/analog-devices/DS2475.pdf`
+- **Applied:** *General Description*, *Benefits and Features*. Rejected for the servo side: host-side signature verifier.
+- **Cited from:** `docs/se-candidates-adi.md`
+- **Status:** candidate record only. Not selected; not cited from code.
+
 ---
 
 ## Cryptographic algorithms

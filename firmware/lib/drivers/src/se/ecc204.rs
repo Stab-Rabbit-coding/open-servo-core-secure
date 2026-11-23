@@ -28,7 +28,7 @@
 //!
 //! `TODO.md` §7.4 tracks this.
 
-use osc_security::se::{SeError, SeResult, SecureElement, SERIAL_LEN, SIGNATURE_LEN};
+use osc_security::se::{SERIAL_LEN, SIGNATURE_LEN, SeError, SeResult, SecureElement};
 
 use super::swi::SwiUart;
 
@@ -307,8 +307,10 @@ mod tests {
         // The architecture's central claim, asserted so a future edit that
         // "optimises" these numbers has to confront it.
         const FRAME_TURNAROUND_US: u32 = 30;
-        assert!(exec_ms::SHA * 1000 / FRAME_TURNAROUND_US > 2_000);
-        assert!(exec_ms::SIGN * 1000 / FRAME_TURNAROUND_US > 15_000);
+        const {
+            assert!(exec_ms::SHA * 1000 / FRAME_TURNAROUND_US > 2_000);
+            assert!(exec_ms::SIGN * 1000 / FRAME_TURNAROUND_US > 15_000);
+        }
     }
 
     #[test]

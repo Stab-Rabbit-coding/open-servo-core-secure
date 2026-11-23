@@ -312,7 +312,7 @@ impl<P: Providers> ServoBus<P> {
     /// checked first: it is free (the hardware engine has already finished)
     /// and it is the more probable failure, so a garbled frame never reaches
     /// the MAC at all.
-        #[cfg_attr(target_arch = "riscv32", inline(never))]
+    #[cfg_attr(target_arch = "riscv32", inline(never))]
     #[rustc_align(4)]
     fn verify<D: Dispatch>(&mut self, p: Pending, d: &mut D) {
         if !self.crc_verify(p.anchor, p.footprint) {

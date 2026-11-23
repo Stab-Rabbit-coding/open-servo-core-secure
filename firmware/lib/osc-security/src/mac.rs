@@ -200,14 +200,12 @@ impl HalfSipHasher {
             self.tail_len = 0;
         }
 
-        // Whole words. `chunks_exact` keeps the remainder for the tail below.
-        let mut it = rest.chunks_exact(4);
-        for w in &mut it {
-            let m = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-            self.absorb_word(m);
+        // Whole words. `as_chunks` returns the remainder for the tail below.
+        let (words, rem) = rest.as_chunks::<4>();
+        for w in words {
+            self.absorb_word(u32::from_le_bytes(*w));
         }
 
-        let rem = it.remainder();
         if !rem.is_empty() {
             self.tail[..rem.len()].copy_from_slice(rem);
             self.tail_len = rem.len() as u8;

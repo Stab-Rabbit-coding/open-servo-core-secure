@@ -83,6 +83,7 @@ open-servo-core-secure/
 │   ├── osc-native-protocol.md
 │   ├── osc-servo-transport.md
 │   ├── security-architecture.md
+│   ├── se-candidates-adi.md
 │   ├── sg90-motor-encoder-upgrade.md
 │   ├── sg90-pot-encoder-upgrade.md
 │   └── testing.md
@@ -770,6 +771,8 @@ open-servo-core-secure/
 │   │       ├── servo-dev-board.kicad_pro
 │   │       ├── servo-dev-board.kicad_sch
 │   │       └── sym-lib-table
+│   ├── datasheets/
+│   │   └── analog-devices/  *(8 vendor PDFs: DS2475, DS2478, DS28C22, DS28C40, DS28E10, DS28E16, DS28E35, DS28E40; REF-SE-008 to REF-SE-015)*
 │   ├── shared.3dshapes/  *(70 generated files, not enumerated)*
 │   ├── shared.pretty/  *(39 generated + `ECC204_UDFN-8-1EP_L2.0-W3.0-P0.50-EP0.61x1.3mm.kicad_mod` hand-authored from REF-SE-001 §6.1, not individually enumerated)*
 │   ├── tools/
