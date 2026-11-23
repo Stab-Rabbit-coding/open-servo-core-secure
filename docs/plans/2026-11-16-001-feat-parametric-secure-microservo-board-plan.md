@@ -160,10 +160,17 @@ check, not a new design.
   | MCU, easier assembly | TI `MSPM0G3507SRHBR` | 32-VQFN, 0.157 × 0.157 in (4.0 × 4.0 mm) | Same die. Fits only if U2 shows a width above 0.236 in (6 mm). |
   | MCU, bare-bones | TI `MSPM0C1104SRUKR`, `MSPM0C1104SDYYR` | 20-WQFN 0.118 × 0.118 in (3.0 × 3.0 mm); 16-SOT 0.165 × 0.126 in (4.2 × 3.2 mm) | 16 KB flash and 1 KB SRAM sit below the 4 KB floor at which KTD3 rejects the L110x, against a firmware budget of 8 KB. Rejected unless U3 shows the firmware fits 1 KB. The comment's "XRCE-DDS framer" is not this project's protocol (osc-native). |
   | Secure element, primary | Microchip `ATECC608B-MAHDA-T` | 8-UDFN, 0.079 × 0.118 in (2.0 × 3.0 mm), I²C | Openness of its full command set requires verification (R4). Adds an I²C bus and board area. |
-  | Secure element, bare-bones | Microchip `ECC204-RBVCZ-T` | 3-lead contact, SWI | **Conflict.** KTD3 rejects the ECC204: command set published only under NDA (`TODO.md` §7.1, §7.4). Needs an owner ruling: reinstate with a recorded waiver, or drop. |
+  | Secure element, bare-bones | Microchip `ECC204-RBVCZ-T` | 3-lead contact, SWI. The comment gives about 0.098 × 0.051 in (2.5 × 1.3 mm); REF-SE-001 lists 0.098 × 0.256 in (2.5 × 6.5 mm), longer than the 0.236 in (6 mm) minimum envelope. | **Conflict.** KTD3 rejects the ECC204: command set published only under NDA (`TODO.md` §7.1, §7.4). Needs an owner ruling: reinstate with a recorded waiver, or drop. |
   | Transceiver A (CAN-FD) | TI `TCAN1044AVDRBRQ1` | 8-VSON, 0.118 × 0.118 in (3.0 × 3.0 mm) | **Conflict.** R6 fixes the bus as single-wire osc-native (break-framed half-duplex UART, `docs/osc-servo-transport.md`). The comment's part needs 5 V `VCC`; R5 requires 3.5–8.4 V supply, so it also needs a regulator. |
   | Transceiver B, B2 (RS-485) | TI `THVD1426DRLR`, `THVD1420DRLR` | 8-SOT, 0.083 × 0.063 in (2.1 × 1.6 mm) | **Conflict** with R6, as above. Direction control and bus idle state differ from the single-wire bus. |
   | Transceiver C (TTL) | none; 0 Ω links on `TX`/`RX` | — | Closest to the existing bus. Fits R6 if the single-wire buffer and TVS of KTD5 are kept. |
+
+  Further candidates, the Analog Devices DeepCover authenticators of 0.118 × 0.118 in
+  (3 × 3 mm) or smaller, are scored in `docs/se-candidates-adi.md`. The DS28C40 (I²C) and
+  DS28E40 (single-wire) are the only ones covering both the identity and session planes, and
+  both add ECDSA verify and ECDH. Neither lists a lifecycle counter, and both gate their
+  command documentation behind a "Request Security User Guide" step (REF-SE-009,
+  REF-SE-010).
 
   Not in the comment and still owed by U1/U3: bridge, LDO, bus TVS replacement and bus buffer
   (KTD5). A US-domiciled maker is necessary but not sufficient under the sourcing rule, which

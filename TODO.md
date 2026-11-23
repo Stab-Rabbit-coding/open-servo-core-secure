@@ -524,6 +524,21 @@ measurements exist for every profile the board claims; stop before ordering boar
 - [ ] **(BLOCKER for U3)** Rule on the 2026-11-19 BOM comment: the `ECC204`
       contradicts KTD3 (NDA-only command set), and the CAN-FD / RS-485
       transceivers contradict R6 (single-wire bus). See plan KTD3a.
+- [ ] **(BLOCKER for U3, owner action)** Request the DS28C40 and DS28E40
+      Security User Guides from Analog Devices and record whether release is
+      under NDA (`docs/se-candidates-adi.md` finding 4). Until then no ADI part
+      passes or fails R4.
+- [ ] **(BLOCKER for U3)** Decide the lifecycle-counter approach. The ECC204
+      counter binds save, factory-reset and firmware-update grants
+      (`docs/security-architecture.md` §0.5, §5.3); the DS28C40 and DS28E40
+      list none. Options in `docs/se-candidates-adi.md` finding 3.
+- [ ] Read package heights for the DS28C40 and DS28E40 3 × 3 mm TDFN from
+      outline drawing 21-100346 (cited by REF-SE-008) and the matching
+      drawing for REF-SE-009 and REF-SE-010; none is in the datasheet text.
+- [ ] Resolve standby-current units (mA table versus µA graph) for the
+      DS28C40, DS28E40 and DS2478.
+- [ ] Correct the BOM comment's ECC204 3-lead-contact size (2.5 × 1.3 mm
+      against REF-SE-001's 2.5 × 6.5 mm).
 - [ ] Confirm that a gutted servo body (motor, gears, pot, case) is outside the
       sourcing rule, which then applies to the swap board only (plan, Assumptions).
 
