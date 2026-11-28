@@ -179,25 +179,34 @@ impl HalfSipHasher {
         self.v0 ^= m;
     }
 
+    /// Append one byte to the in-progress word, absorbing it when it fills.
+    ///
+    /// The tail index is masked to the array, so there is no bounds check and
+    /// no panic path; and a one-byte store is never a `memcpy` call
+    /// (`.github/check-no-mem.sh`, `.github/check-no-panic.sh`).
+    #[inline(always)]
+    fn push_byte(&mut self, byte: u8) {
+        self.tail[(self.tail_len & 3) as usize] = byte;
+        self.tail_len += 1;
+        if self.tail_len == 4 {
+            let m = u32::from_le_bytes(self.tail);
+            self.absorb_word(m);
+            self.tail_len = 0;
+        }
+    }
+
     /// Absorb `data`. May be called any number of times with any chunking.
     pub fn update(&mut self, data: &[u8]) {
         self.total = self.total.wrapping_add(data.len() as u32);
         let mut rest = data;
 
-        // Top up a partial word first.
-        if self.tail_len != 0 {
-            let want = 4 - self.tail_len as usize;
-            let take = want.min(rest.len());
-            self.tail[self.tail_len as usize..self.tail_len as usize + take]
-                .copy_from_slice(&rest[..take]);
-            self.tail_len += take as u8;
-            rest = &rest[take..];
-            if self.tail_len < 4 {
+        // Top up a partial word first, a byte at a time.
+        while self.tail_len != 0 {
+            let Some((&byte, tail)) = rest.split_first() else {
                 return;
-            }
-            let m = u32::from_le_bytes(self.tail);
-            self.absorb_word(m);
-            self.tail_len = 0;
+            };
+            rest = tail;
+            self.push_byte(byte);
         }
 
         // Whole words. `as_chunks` returns the remainder for the tail below.
@@ -206,9 +215,9 @@ impl HalfSipHasher {
             self.absorb_word(u32::from_le_bytes(*w));
         }
 
-        if !rem.is_empty() {
-            self.tail[..rem.len()].copy_from_slice(rem);
-            self.tail_len = rem.len() as u8;
+        // `tail_len` is zero here, so these fill the tail from its start.
+        for &byte in rem {
+            self.push_byte(byte);
         }
     }
 
@@ -218,8 +227,10 @@ impl HalfSipHasher {
         // The final block is the 0..3 leftover bytes in the low positions with
         // the message length in the top byte.
         let mut b: u32 = (self.total & 0xff) << 24;
-        for (i, &byte) in self.tail[..self.tail_len as usize].iter().enumerate() {
-            b |= (byte as u32) << (8 * i);
+        for (i, &byte) in self.tail.iter().enumerate() {
+            if i < self.tail_len as usize {
+                b |= (byte as u32) << (8 * i);
+            }
         }
 
         self.v3 ^= b;

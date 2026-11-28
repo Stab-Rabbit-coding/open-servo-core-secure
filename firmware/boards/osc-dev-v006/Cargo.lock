@@ -411,6 +411,13 @@ name = "osc-protocol"
 version = "0.0.0"
 
 [[package]]
+name = "osc-security"
+version = "0.0.0"
+dependencies = [
+ "osc-protocol",
+]
+
+[[package]]
 name = "osc-servo-ch32"
 version = "0.0.0"
 dependencies = [
@@ -448,6 +455,7 @@ dependencies = [
  "heapless",
  "osc-log",
  "osc-protocol",
+ "osc-security",
  "osc-servo-core",
 ]
 

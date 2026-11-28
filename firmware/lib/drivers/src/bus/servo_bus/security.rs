@@ -60,10 +60,18 @@ impl<P: Providers> ServoBus<P> {
         }
         let (start, covered) = covered_span(anchor, footprint, len);
         let end = start + covered;
+        // `get` rather than indexing: the firmware has no panic path
+        // (`.github/check-no-panic.sh`). The ranges are always inside the ring
+        // -- a frame never exceeds it -- and were one ever not, folding nothing
+        // makes the COMMIT tag fail and the cycle revert, the fail-safe side.
+        let empty: &[u8] = &[];
         let (seg_a, seg_b) = if end <= len {
-            (&ring[start..end], &ring[..0])
+            (ring.get(start..end).unwrap_or(empty), empty)
         } else {
-            (&ring[start..len], &ring[..end - len])
+            (
+                ring.get(start..).unwrap_or(empty),
+                ring.get(..end - len).unwrap_or(empty),
+            )
         };
         let folded = (seg_a.len() + seg_b.len()) as u32;
         self.security.fold(inst, seg_a, seg_b);
@@ -102,12 +110,20 @@ impl<P: Providers> ServoBus<P> {
         // bounded by the trailer plus a small payload in the hot loop, so this
         // copy is affordable in a way it would not be for the CRC (which must
         // cover the full 252-byte payload at zero CPU).
-        let mut buf = [0u8; AUTH_SPAN_MAX];
+        //
+        // The buffer is left uninitialised and only the covered bytes are
+        // written: zero-filling 96 bytes first compiles to a `memset` call,
+        // which the no-mem* gate forbids on a runtime path
+        // (`.github/check-no-mem.sh`).
+        let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); AUTH_SPAN_MAX];
         for (i, slot) in buf[..covered].iter_mut().enumerate() {
-            *slot = ring[(start + i) % len];
+            slot.write(ring[(start + i) % len]);
         }
+        // SAFETY: `covered <= AUTH_SPAN_MAX` (checked above), and the loop just
+        // wrote each of the first `covered` elements.
+        let span = unsafe { core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), covered) };
 
-        let verdict = self.security.verify(inst, broadcast, &buf[..covered]);
+        let verdict = self.security.verify(inst, broadcast, span);
         sec_probe(|p| {
             p.verdicts = p.verdicts.wrapping_add(1);
             match verdict {
